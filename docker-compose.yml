@@ -1,0 +1,25 @@
+services:
+  euas:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - euas_data:/app/data
+      - euas_uploads:/app/uploads
+    environment:
+      EUAS_DB_PATH: /app/data/euas.db
+      EUAS_ENV: production
+      EUAS_VERSION: 3.9.0
+      EUAS_SESSION_HOURS: 12
+      EUAS_MAX_UPLOAD_MB: 25
+      EUAS_AUTOMATION_INTERVAL_MINUTES: 0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+volumes:
+  euas_data:
+  euas_uploads:

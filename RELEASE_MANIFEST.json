@@ -1,0 +1,52 @@
+{
+  "product": "Elsewedy Utilities Application Suite (EUAS)",
+  "version": "3.9.0",
+  "tagline": "One Platform. Every Asset. Every Operation.",
+  "developers": [
+    "Omar",
+    "Seif"
+  ],
+  "release_date": "2026-08-19",
+  "architecture": {
+    "frontend": "Responsive HTML5/JavaScript/CSS PWA",
+    "backend": "FastAPI",
+    "reference_database": "SQLite",
+    "production_target": "PostgreSQL + shared enterprise services"
+  },
+  "metrics": {
+    "api_routes": 161,
+    "relational_tables": 61,
+    "explicit_indexes": 38,
+    "schema_version": 9,
+    "automated_tests": 10
+  },
+  "v3_9_capabilities": [
+    "asset-linked telemetry channels",
+    "timestamped telemetry ingestion",
+    "warning/critical threshold evaluation",
+    "operational alarm lifecycle",
+    "alarm-to-corrective-work-order linkage",
+    "operations intelligence KPIs",
+    "telemetry/alarm search metrics and CSV exports"
+  ],
+  "release_gate": {
+    "python_compile": "PASS",
+    "frontend_js_syntax": "PASS",
+    "service_worker_syntax": "PASS",
+    "integrated_pytest": "PASS \u2014 10 passed",
+    "fresh_uvicorn_http_smoke": "PASS \u2014 version=3.9.0",
+    "backup_restore": "PASS \u2014 schema 9 / integrity ok",
+    "telemetry_restore": "PASS \u2014 3 channels / 12 readings / 1 alarm",
+    "clean_room_zip_pytest": "PASS \u2014 10 passed",
+    "clean_room_zip_http_smoke": "PASS \u2014 version=3.9.0",
+    "clean_room_backup_restore": "PASS \u2014 schema 9 / integrity ok / telemetry 3 channels, 12 readings, 1 alarm",
+    "archive_runtime_artifacts": "NONE"
+  },
+  "demo_scenario": {
+    "site": "New Cairo Substation",
+    "asset": "TR-001 \u2014 33/11 kV Power Transformer",
+    "work_order": "WO-10025 \u2014 Investigate Transformer Oil Temperature",
+    "telemetry": "TEL-TR001-OIL-TEMP \u2014 transformer oil temperature",
+    "alarm": "ALM-50001 \u2014 TR-001 warning oil temperature"
+  }
+}

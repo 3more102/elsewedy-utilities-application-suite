@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: euas
+      POSTGRES_USER: euas
+      POSTGRES_PASSWORD: ${EUAS_POSTGRES_PASSWORD:-change-this-password}
+    volumes:
+      - euas_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U euas -d euas"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  euas:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      EUAS_DATABASE_URL: postgresql://euas:${EUAS_POSTGRES_PASSWORD:-change-this-password}@postgres:5432/euas
+      EUAS_ENV: production
+      EUAS_VERSION: 3.9.0
+      EUAS_SESSION_HOURS: 12
+      EUAS_MAX_UPLOAD_MB: 25
+      EUAS_AUTOMATION_INTERVAL_MINUTES: 0
+    volumes:
+      - euas_uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  euas_postgres:
+  euas_uploads:
