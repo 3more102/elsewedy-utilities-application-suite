@@ -25,7 +25,7 @@ services:
     environment:
       EUAS_DATABASE_URL: postgresql://euas:${EUAS_POSTGRES_PASSWORD:-change-this-password}@postgres:5432/euas
       EUAS_ENV: production
-      EUAS_VERSION: 3.9.0
+      EUAS_VERSION: 4.2.0
       EUAS_SESSION_HOURS: 12
       EUAS_MAX_UPLOAD_MB: 25
       EUAS_AUTOMATION_INTERVAL_MINUTES: 0

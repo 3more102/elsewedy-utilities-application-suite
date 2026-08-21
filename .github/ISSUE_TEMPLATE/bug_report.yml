@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible EUAS defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an EUAS defect. Do not include passwords, tokens, private utility data, or other secrets.
+  - type: input
+    id: version
+    attributes:
+      label: EUAS version
+      placeholder: "3.9.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: module
+    attributes:
+      label: Module
+      options:
+        - Assets
+        - Work Management
+        - Preventive Maintenance / Planning
+        - Inventory / Procurement
+        - Utility Operations / Telemetry
+        - Field Service / Dispatch
+        - Inspections / HSE
+        - GIS / Locations
+        - Analytics
+        - Administration / Security
+        - Deployment / Database
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the minimum reproducible sequence.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: shell

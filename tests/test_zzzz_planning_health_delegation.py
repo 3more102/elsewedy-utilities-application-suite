@@ -59,7 +59,7 @@ def test_health_forecast_and_approval_delegation():
 
         queue=client.get('/api/approvals',headers=planner,params={'status':'Pending'}).json()
         ap=next(x for x in queue if x['record_id']==wid and x['record_type']=='work_order')
-        decision=client.post(f"/api/approvals/{ap['id']}/decision",headers=planner,json={'decision':'approve','comments':'Approved under active delegation'})
+        decision=client.post(f"/api/approvals/{ap['id']}/decision",headers=planner,json={'decision':'approve','comments':'Approved under active delegation','current_password':'Planner@2026','signer_intent':f"I approve {ap['record_code']}"})
         assert decision.status_code==200,decision.text
         assert decision.json()['status']=='Approved'
 

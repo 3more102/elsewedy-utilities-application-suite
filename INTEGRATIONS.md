@@ -78,3 +78,19 @@ Receivers should compare signatures in constant time and reject replayed event I
 - `sla.policy_updated`
 
 The outbox is intentionally generic so additional utility/SCADA/GIS integration events can be added without changing delivery infrastructure.
+
+## v4.0 machine-to-machine telemetry authentication
+
+SCADA/API gateways can authenticate to `POST /api/telemetry/ingest` with a `telemetry:write` integration key:
+
+```http
+X-EUAS-Integration-Key: euas_<secret>
+```
+
+Admins create keys through `POST /api/integrations/api-keys` or the Utility Command Center. The plaintext secret is returned once. EUAS persists only its SHA-256 digest, plus an administrative key number, display name, expiry, last-used time and active/revoked state.
+
+The endpoint also supports batch `idempotency_key` and per-reading `external_id` values so an edge gateway can safely retry delivery without duplicating persisted telemetry.
+
+A runnable stdlib client is included at `scripts/scada_gateway_demo.py`.
+
+This reference build does not provide native OPC-UA/Modbus/DNP3/IEC 61850 drivers. Those are expected to normalize source data at the edge and call the EUAS API.

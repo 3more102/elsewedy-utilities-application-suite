@@ -1,47 +1,74 @@
-# EUAS v3.9.0 — QA / Verification Report
+# EUAS v4.4.0 — QA / Verification Report
 
-**Release:** 3.9.0  
-**Schema:** 9
+**Release:** 4.4.0  
+**Schema:** 14  
+**Focus:** Credential-verified Approval Center signatures and tamper-evident decision evidence
 
-## Verified gates
+## Verification summary
 
-| Gate | Result |
+| Check | Result |
 |---|---|
-| Python compile | PASS |
-| Frontend JavaScript syntax | PASS |
-| Service Worker syntax | PASS |
-| Integrated pytest regression | PASS — 10 tests |
-| Fresh SQLite initialization | PASS — schema 9 |
-| Fresh Uvicorn HTTP smoke | PASS — version 3.9.0 |
-| Telemetry channels/readings seed | PASS — 3 / 12 |
-| Operational alarm seed | PASS — 1 active warning |
-| Telemetry normal → Warning → Critical | PASS |
-| Alarm acknowledgement | PASS |
-| Alarm → corrective Work Order | PASS |
-| Return-to-normal auto-clear | PASS |
-| Channel deactivation ingestion guard | PASS |
-| Backup → restore | PASS — integrity ok / schema 9 |
-| Telemetry backup persistence | PASS — 3 channels / 12 readings / 1 alarm |
+| Python source compilation | **PASS** |
+| Frontend JavaScript syntax (`node --check`) | **PASS** |
+| Service-worker JavaScript syntax (`node --check`) | **PASS** |
+| Integrated pytest regression suite | **PASS — 22 tests** |
+| Fresh Uvicorn HTTP smoke | **PASS — version 4.4.0** |
+| Fresh SQLite initialization | **PASS — schema 14** |
+| v4.3.0 → v4.4.0 SQLite schema upgrade | **PASS — 13 → 14** |
+| SQLite integrity check after upgrade | **PASS — ok** |
+| Approval current-password re-authentication | **PASS** |
+| Exact signer-intent binding | **PASS** |
+| Signature evidence persistence + record snapshot | **PASS** |
+| Approval-signature chain verification | **PASS** |
+| Deliberate evidence tamper detection | **PASS** |
+| Delegated-authority evidence capture | **PASS** |
+| Signature metrics + protected CSV export | **PASS** |
+| Release metadata/source-count consistency | **PASS** |
 
-## Measured release size
+## Release metrics
 
-- 161 functional `/api/*` endpoints
-- 61 relational tables
-- 38 explicit application indexes
-- Schema version 9
-- 10 automated regression tests
+- **195 application HTTP routes** total
+- **194 routes under `/api/`**
+- **71 relational tables**
+- **55 explicit application indexes**
+- **Schema version 14**
+- **22 automated regression tests**
 
-## Scope / limitations
+## v4.4 approval-signature verification
 
-SQLite is the fully exercised reference runtime. The PostgreSQL adapter contract remains present, but no live PostgreSQL server was available in the build environment. Telemetry ingestion is an authenticated EUAS API boundary; live OPC-UA/Modbus/IEC 61850/vendor-SCADA protocol integration is not claimed in this release. Docker configuration is present but a Docker daemon was not available for an image build.
+Regression coverage verifies:
 
-## Clean-room release verification
+1. A pending approval remains unchanged when the signer omits electronic-signature intent.
+2. An incorrect signer-intent statement is rejected.
+3. An incorrect current password is rejected with no workflow mutation.
+4. A valid authorized signer can approve after successful current-password re-authentication.
+5. A successful decision returns `SIG-*` evidence with a 64-character SHA-256 hash.
+6. The evidence payload records approval metadata, signer identity/role, decision, intent, comments, timestamp and the post-decision business-record snapshot.
+7. Approval list results expose evidence metadata for electronically signed decisions.
+8. Signature evidence can be read only by users with approval/evidence visibility.
+9. The global approval-signature evidence chain verifies from its first row through its head hash.
+10. A direct database modification to a duplicated evidence column is detected as a payload/column mismatch.
+11. Restoring the original value restores successful chain verification.
+12. Approval decisions exercised through active delegation store `delegated_authority=1`.
+13. Prometheus-style metrics expose signed-approval count and signature-chain validity.
+14. The management CSV export contains the evidence identifier, signer, intent and chain hashes.
+15. `Approval Signatures` is present as a protected retention-policy data class.
+16. The v4.4 service-worker shell uses `euas-shell-v4.4.0`.
+17. The release manifest, README badges, source-measured route/table/index counts and test count agree.
 
-The candidate release ZIP was extracted into an independent directory and verified from the extracted package itself:
+## Upgrade verification
 
-- `pytest -q`: **10 passed**
-- `python scripts/smoke_test.py`: **PASS — version=3.9.0**
-- Backup → restore: **PASS**
-- Restored SQLite `integrity_check`: **ok**
-- Restored schema: **9**
-- Restored telemetry evidence: **3 channels / 12 readings / 1 operational alarm**
+A clean v4.3.0 database was initialized at schema 13 and then opened by v4.4.0. Verification confirmed:
+
+- schema migration recorded version **14**;
+- `approval_signature_evidence` was created;
+- protected `Approval Signatures` retention policy was inserted;
+- the existing **6 seeded assets** remained present;
+- the existing approval-request count was preserved;
+- `PRAGMA integrity_check = ok` after the upgrade.
+
+Previously decided v4.3 approvals are intentionally **not** backfilled with fabricated electronic signatures. Only decisions made under the v4.4 signature contract produce evidence.
+
+## Compliance boundary
+
+v4.4.0 provides application-level electronic approval evidence and tamper detection. It does **not** claim PKI digital signatures, eIDAS qualified signatures, FDA 21 CFR Part 11 certification, trusted timestamping, legal non-repudiation, hardware-backed signing keys or WORM storage. Regulated deployments require deployment-specific identity, infrastructure, validation and governance controls beyond this reference build.

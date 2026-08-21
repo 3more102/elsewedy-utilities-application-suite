@@ -2,7 +2,7 @@
 
 ## Automation engine
 
-EUAS v3.9.0 includes an auditable automation engine for recurring operational controls. Each run is recorded in `job_runs` with a unique run number, trigger source, actor, business date, completion status and JSON summary.
+EUAS v4.4.0 includes an auditable automation engine for recurring operational controls. Each run is recorded in `job_runs` with a unique run number, trigger source, actor, business date, completion status and JSON summary.
 
 A run evaluates:
 
@@ -163,3 +163,19 @@ A valid result includes the number of records checked and the current head hash.
 ## v3.6 planning operations
 
 Automation runs persist current asset-health snapshots, emit alerts for Critical health bands, and deactivate approval delegations whose effective end time has passed. The 90-day maintenance forecast is calculated on demand and can be exported as CSV.
+
+## v4.0 control-room automation
+
+Automation now also:
+
+- expires ended alarm-suppression windows;
+- detects telemetry channels with no recent data and emits de-duplicated stale-telemetry notifications;
+- correlates legacy/unassigned active alarms into operational incidents;
+- continues to process durable outbox delivery after the control-room checks.
+
+The Utility Command Center should be treated as the first operational triage surface: correlated incident → alarm evidence → outage context → technician dispatch → corrective work.
+
+
+## Field synchronization operations
+
+Supervisors can inspect synchronization evidence through `/api/exports/field-sync.csv`; platform metrics expose pending, conflicting and recently applied field operations. A rising `euas_field_sync_conflicts` count should trigger review of field connectivity, dispatch overlap and server-side edits made while technicians are offline. Conflict resolution is intentionally explicit rather than automatic last-write-wins.

@@ -1,6 +1,27 @@
 # Elsewedy Utilities Application Suite — EUAS
 
-**One Platform. Every Asset. Every Operation.**
+<p align="center">
+  <strong>One Platform. Every Asset. Every Operation.</strong><br>
+  <sub>Enterprise Asset, Maintenance, Utility Operations & Field Service Platform</sub>
+</p>
+
+<p align="center">
+  <a href="https://github.com/3more102/elsewedy-utilities-application-suite/actions/workflows/ci.yml"><img alt="EUAS CI" src="https://github.com/3more102/elsewedy-utilities-application-suite/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Version" src="https://img.shields.io/badge/version-4.4.0-0A6EBD">
+  <img alt="Schema" src="https://img.shields.io/badge/schema-v14-334155">
+  <img alt="API Endpoints" src="https://img.shields.io/badge/API_endpoints-195-2563EB">
+  <img alt="Tests" src="https://img.shields.io/badge/regression_tests-22-16A34A">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB">
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#core-capabilities">Capabilities</a> ·
+  <a href="COMMAND_CENTER.md">Command Center</a> ·
+  <a href="ARCHITECTURE.md">Architecture</a> ·
+  <a href="ROADMAP.md">Roadmap</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
 **Developed by Omar & Seif**
 
@@ -26,9 +47,73 @@ EUAS is an original enterprise asset, maintenance, utility operations and field-
 
 ![EUAS Login](docs/screenshots/01-login.png)
 
-The screenshots are representative management-demo captures from the EUAS v3.x interface. v3.9.0 adds SCADA-style telemetry ingestion, threshold evaluation and operational alarm response on top of the v3.8 execution-coordination layer.
+The screenshots are representative management-demo captures from the EUAS interface. **v4.4.0** adds credential-verified electronic approval signatures and tamper-evident decision evidence on top of the v4.3 offline field synchronization release.
 
 ---
+
+## v4.4 Approval Signature Evidence
+
+- Approval/rejection requires current-password re-authentication for the acting signer
+- Explicit signer-intent statement bound to the approval record code
+- Decision-time record snapshot preserved inside canonical evidence payload
+- Global SHA-256 evidence chain with previous-hash linkage and verifier
+- Direct versus delegated approval authority recorded in the evidence
+- Approval Center displays signed decisions and evidence details
+- Governance dashboard verifies both audit and approval-signature chains
+- Protected CSV evidence export and Prometheus-style signature metrics
+- Approval-signature retention class is protected by policy metadata
+
+This is application-level **electronic approval evidence**, not a PKI digital signature, qualified e-signature, WORM store, or a claim of regulatory certification. See [APPROVAL_SIGNATURES.md](APPROVAL_SIGNATURES.md).
+
+## v4.3 Offline Field Synchronization
+
+- Authenticated field bootstrap snapshots with deterministic entity hashes
+- Durable user-scoped browser queue for offline technician changes
+- Idempotent operation IDs so reconnect retries never duplicate a mutation
+- Conflict-safe work transitions, checklist updates, asset readings/condition and dispatch transitions
+- Append-only offline field notes
+- Safe ordered-batch rebase for sequential offline edits created from one snapshot
+- Explicit **Keep Server** / **Retry Mine** conflict resolution with current-hash verification
+- Session-expiry-bounded offline reopen using the last authenticated field snapshot
+- Field sync metrics and protected CSV evidence export
+
+Inventory issue and file upload remain online-only because they require current server authority. Closed-app OS background sync is still a roadmap item. See [FIELD_SYNC.md](FIELD_SYNC.md).
+
+## v4.2 Topology-Aware Root-Cause Correlation
+
+- Directed asset-topology registry (`TPL-*`) with upstream → downstream operational dependencies
+- Cycle prevention for active topology links
+- Alarm incidents can grow across directly connected assets within the existing 30-minute correlation window
+- Multi-hop incidents form incrementally as adjacent alarmed assets join the same incident
+- Explainable deterministic root-cause candidate based on upstream reachability, alarm onset and severity
+- Incident evidence stores correlation mode, root-cause score, reason and topology hop count
+- Incident-generated corrective work targets the current root-cause candidate instead of only the first alarmed asset
+- Command Center topology view, topology KPIs, Prometheus metrics and protected CSV exports
+- Browser runtime fix for v4.1 actionable/shelved Command Center queue bindings
+
+The root-cause result is an **operator decision-support candidate**, not an ML diagnosis. The reasoning remains transparent and traceable. See [COMMAND_CENTER.md](COMMAND_CENTER.md).
+
+## v4.1 Governed Alarm Shelving
+
+- Four-eyes approval for temporary alarm shelves
+- Critical-alarm duration cap and automatic expiry
+- Actionable versus shelved operator queues without changing alarm lifecycle state
+- Audit/outbox evidence, metrics and CSV export
+
+## v4.0 Utility Command Center
+
+- Utility Command Center combining incidents, alarms, outages, field dispatch and telemetry quality
+- Idempotent telemetry batches (`TIB-*`) and per-reading external IDs
+- Good / Uncertain / Bad data-quality handling; non-good readings are retained but do not drive threshold alarms
+- Time-bounded alarm suppression windows (`SUP-*`) for maintenance, testing and commissioning
+- Deterministic asset/time-window alarm correlation into operational incidents (`INC-*`)
+- Incident acknowledgement, automatic resolution when member alarms clear, and one-click corrective-work generation
+- Bucketed telemetry series and 24-hour data-quality KPIs
+- `telemetry:write` integration API keys for SCADA/API gateways; plaintext shown once, digest stored, expiry/revoke/last-use supported
+- Command-center metrics and CSV evidence for incidents, suppressions and ingestion batches
+- `scripts/scada_gateway_demo.py` for authenticated M2M telemetry demonstration
+
+See [COMMAND_CENTER.md](COMMAND_CENTER.md) for the current control-room, shelving and topology-correlation model.
 
 ## v3.9 Utility Operations Intelligence
 
@@ -129,7 +214,7 @@ This data is connected across Dashboard → GIS → Asset → Work → Field Ser
 └──────────────────────────────────────────────────────────┘
 ```
 
-EUAS defaults to **SQLite** so the delivered application is immediately runnable with zero external infrastructure. EUAS also implements a **PostgreSQL runtime adapter** selected with `EUAS_DATABASE_URL`, plus a PostgreSQL Docker Compose deployment. SQLite is fully regression-tested in this build; the PostgreSQL SQL-translation contract is unit-tested, while a live PostgreSQL server was not available in the build sandbox. See [DATABASE.md](DATABASE.md). Operational automation, observability and backup procedures are documented in [OPERATIONS.md](OPERATIONS.md). SLA/event integration is documented in [INTEGRATIONS.md](INTEGRATIONS.md). Governance and evidence controls are documented in [GOVERNANCE.md](GOVERNANCE.md). Planning, asset-health scoring, workforce capacity, parts readiness and approval delegation are documented in [PLANNING.md](PLANNING.md) and [WORKFORCE_RELIABILITY.md](WORKFORCE_RELIABILITY.md).
+EUAS defaults to **SQLite** so the delivered application is immediately runnable with zero external infrastructure. EUAS also implements a **PostgreSQL runtime adapter** selected with `EUAS_DATABASE_URL`, plus a PostgreSQL Docker Compose deployment. SQLite is fully regression-tested in this build; the PostgreSQL SQL-translation contract is unit-tested, while a live PostgreSQL server was not available in the build sandbox. See [DATABASE.md](DATABASE.md). Operational automation, observability and backup procedures are documented in [OPERATIONS.md](OPERATIONS.md). SLA/event integration is documented in [INTEGRATIONS.md](INTEGRATIONS.md). Governance and evidence controls are documented in [GOVERNANCE.md](GOVERNANCE.md). Planning, asset-health scoring, workforce capacity, parts readiness and approval delegation are documented in [PLANNING.md](PLANNING.md) and [WORKFORCE_RELIABILITY.md](WORKFORCE_RELIABILITY.md). The current operational correlation, topology, shelving, suppression and M2M ingestion layer is documented in [COMMAND_CENTER.md](COMMAND_CENTER.md).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the deeper design.
 
@@ -151,7 +236,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the deeper design.
 | Container | Docker + Docker Compose |
 | API docs | OpenAPI / Swagger at `/api/docs` |
 
-The project contains **61 relational tables**, **38 explicit performance indexes** and **161 functional API endpoints** in v3.9.0.
+The project contains **71 relational tables**, **55 explicit performance indexes** and **195 application HTTP routes** in v4.4.0 (194 under `/api/` plus the application root).
 
 ---
 
@@ -361,7 +446,7 @@ Copy `.env.example` if you want a custom local configuration.
 | `EUAS_HOST` | documented host preference | `127.0.0.1` |
 | `EUAS_PORT` | documented port preference | `8000` |
 | `EUAS_ENV` | deployment environment label | `development` |
-| `EUAS_VERSION` | reported application version | `3.9.0` |
+| `EUAS_VERSION` | reported application version | `4.4.0` |
 | `EUAS_SESSION_HOURS` | server-side session lifetime | `12` |
 | `EUAS_MAX_UPLOAD_MB` | maximum uploaded document size | `25` |
 | `EUAS_AUTOMATION_INTERVAL_MINUTES` | optional single-node scheduler interval; `0` disables | `0` |

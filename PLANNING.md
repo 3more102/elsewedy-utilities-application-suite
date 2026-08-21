@@ -1,6 +1,6 @@
 # EUAS Maintenance Planning & Asset Health
 
-EUAS v3.9.0 extends the planning layer that connects asset risk, planned maintenance and available field capacity.
+EUAS v4.4.0 extends the planning layer that connects asset risk, planned maintenance and available field capacity.
 
 ## Asset Health Engine
 

@@ -1,52 +1,39 @@
 {
-  "product": "Elsewedy Utilities Application Suite (EUAS)",
-  "version": "3.9.0",
-  "tagline": "One Platform. Every Asset. Every Operation.",
-  "developers": [
-    "Omar",
-    "Seif"
-  ],
-  "release_date": "2026-08-19",
-  "architecture": {
-    "frontend": "Responsive HTML5/JavaScript/CSS PWA",
-    "backend": "FastAPI",
-    "reference_database": "SQLite",
-    "production_target": "PostgreSQL + shared enterprise services"
-  },
-  "metrics": {
-    "api_routes": 161,
-    "relational_tables": 61,
-    "explicit_indexes": 38,
-    "schema_version": 9,
-    "automated_tests": 10
-  },
-  "v3_9_capabilities": [
-    "asset-linked telemetry channels",
-    "timestamped telemetry ingestion",
-    "warning/critical threshold evaluation",
-    "operational alarm lifecycle",
-    "alarm-to-corrective-work-order linkage",
-    "operations intelligence KPIs",
-    "telemetry/alarm search metrics and CSV exports"
-  ],
-  "release_gate": {
+  "application": "Elsewedy Utilities Application Suite (EUAS)",
+  "version": "4.4.0",
+  "release_focus": "Credential-verified approval signatures with tamper-evident decision evidence",
+  "schema_version": 14,
+  "api_endpoints": 195,
+  "api_routes_under_api": 194,
+  "relational_tables": 71,
+  "explicit_indexes": 55,
+  "automated_tests": 22,
+  "verification": {
+    "pytest": "PASS — 22 tests",
+    "fresh_uvicorn_http_smoke": "PASS — version=4.4.0",
     "python_compile": "PASS",
     "frontend_js_syntax": "PASS",
-    "service_worker_syntax": "PASS",
-    "integrated_pytest": "PASS \u2014 10 passed",
-    "fresh_uvicorn_http_smoke": "PASS \u2014 version=3.9.0",
-    "backup_restore": "PASS \u2014 schema 9 / integrity ok",
-    "telemetry_restore": "PASS \u2014 3 channels / 12 readings / 1 alarm",
-    "clean_room_zip_pytest": "PASS \u2014 10 passed",
-    "clean_room_zip_http_smoke": "PASS \u2014 version=3.9.0",
-    "clean_room_backup_restore": "PASS \u2014 schema 9 / integrity ok / telemetry 3 channels, 12 readings, 1 alarm",
-    "archive_runtime_artifacts": "NONE"
+    "service_worker_js_syntax": "PASS",
+    "sqlite_v43_to_v44_upgrade": "PASS — schema 13 → 14",
+    "sqlite_integrity_after_upgrade": "PASS — ok",
+    "approval_reauthentication": "PASS",
+    "approval_intent_binding": "PASS",
+    "approval_signature_chain": "PASS",
+    "approval_signature_tamper_detection": "PASS",
+    "delegated_authority_evidence": "PASS",
+    "release_metadata_consistency": "PASS"
   },
-  "demo_scenario": {
-    "site": "New Cairo Substation",
-    "asset": "TR-001 \u2014 33/11 kV Power Transformer",
-    "work_order": "WO-10025 \u2014 Investigate Transformer Oil Temperature",
-    "telemetry": "TEL-TR001-OIL-TEMP \u2014 transformer oil temperature",
-    "alarm": "ALM-50001 \u2014 TR-001 warning oil temperature"
-  }
+  "features": [
+    "current-password re-authentication for Approval Center decisions",
+    "explicit signer intent bound to business record code",
+    "decision-time target-record snapshot",
+    "hash-chained approval signature evidence",
+    "direct and delegated authority capture",
+    "signature evidence detail and chain verification APIs",
+    "Approval Center signed-decision UI",
+    "governance signature-chain status",
+    "approval-signature metrics and protected CSV export",
+    "protected approval-signature retention policy metadata"
+  ],
+  "compliance_boundary": "Application-level electronic approval evidence only; PKI digital signatures, qualified e-signatures, regulatory certification, trusted timestamping, legal non-repudiation and WORM storage are not claimed in v4.4.0."
 }
