@@ -8,7 +8,7 @@ EUAS is organized around a unified operational data model rather than disconnect
 
 ### Client layer
 
-The EUAS SPA is a dependency-light responsive interface. It provides the application launchpad, navigation, forms, tables, filters, charts, dialogs, notifications, global search and field-optimized views. The manifest/service worker make the shell installable as a PWA; transactional offline synchronization is intentionally reserved for the enterprise hardening phase.
+The EUAS SPA is a dependency-light responsive interface. It provides the application launchpad, navigation, forms, tables, filters, charts, dialogs, notifications, global search and field-optimized views. The manifest/service worker make the shell installable as a PWA. v4.3 adds authenticated offline field snapshots, a durable browser operation queue, idempotent replay and explicit server-side conflict resolution for supported technician mutations; closed-app OS background synchronization remains a roadmap item.
 
 ### API / domain layer
 
@@ -32,7 +32,7 @@ The UI never directly edits the database.
 
 ### Persistence layer
 
-EUAS v3.9.0 uses a database adapter with two modes: SQLite for the zero-configuration reference deployment and PostgreSQL when `EUAS_DATABASE_URL` is supplied. Both modes share the same service/API boundary, relational business identifiers and workflow model. SQLite uses foreign keys/WAL/indexes; the PostgreSQL adapter translates bind syntax and reference DDL while preserving transactions and generated identifiers.
+EUAS v4.4.0 uses a database adapter with two modes: SQLite for the zero-configuration reference deployment and PostgreSQL when `EUAS_DATABASE_URL` is supplied. Both modes share the same service/API boundary, relational business identifiers and workflow model. SQLite uses foreign keys/WAL/indexes; the PostgreSQL adapter translates bind syntax and reference DDL while preserving transactions and generated identifiers.
 
 ## 3. Module Boundaries
 
@@ -163,7 +163,7 @@ EUAS adds a governance layer that remains transactional and queryable rather tha
 
 ## Planning and asset-health layer
 
-EUAS v3.9.0 introduces two service-level calculations above the core transactional model. The asset-health service computes a transparent score from asset condition/criticality plus operational evidence such as priority work, overdue work, failed inspections and SLA breaches. Snapshots are persisted separately in `asset_health_snapshots`, keeping the asset master free of derived scoring state.
+EUAS includes two service-level calculations above the core transactional model. The asset-health service computes a transparent score from asset condition/criticality plus operational evidence such as priority work, overdue work, failed inspections and SLA breaches. Snapshots are persisted separately in `asset_health_snapshots`, keeping the asset master free of derived scoring state.
 
 The maintenance-planning service converts PM due dates and unresolved work into weekly demand buckets and compares estimated labor demand to active-technician capacity. The reference deployment uses a simple 40-hour-per-technician capacity assumption; production deployments should substitute craft calendars, shifts, leave, site rosters and skill constraints.
 
@@ -177,8 +177,58 @@ The planning service now derives weekly capacity from normalized workforce profi
 
 ## Execution Coordination — v3.8.0
 
-EUAS v3.9.0 adds an execution-coordination layer between work planning and technician completion. `inventory_reservations` secures material for a specific work order before issue; generic inventory ISSUE/TRANSFER transactions are prevented from consuming reserved units. Reservation issue records flow through the normal inventory transaction, work-order material and maintenance-cost ledgers.
+EUAS includes an execution-coordination layer between work planning and technician completion. `inventory_reservations` secures material for a specific work order before issue; generic inventory ISSUE/TRANSFER transactions are prevented from consuming reserved units. Reservation issue records flow through the normal inventory transaction, work-order material and maintenance-cost ledgers.
 
 `dispatch_assignments` models Dispatched → Accepted → En Route → On Site → Completed/Cancelled. Only one active dispatch is allowed for a technician at a time. Arrival can start an assigned work order and records the SLA response milestone, while dispatch completion deliberately does not close the maintenance work itself.
 
 `asset_outages` records forced/planned operational unavailability with explicit start/end timestamps, cause, impact and lost-capacity context. Reliability calculations use overlapping forced-outage duration when outage evidence exists and retain the older work-order-hours calculation only as a legacy fallback for assets without outage history.
+
+## v4.0 Utility Command Center architecture
+
+The v4.0 operations path introduces an explicit control-room coordination layer:
+
+```text
+SCADA / historian / edge gateway
+        │
+        │ HTTPS + X-EUAS-Integration-Key
+        ▼
+Telemetry Ingest API
+  ├─ batch idempotency
+  ├─ reading external-id de-duplication
+  ├─ quality classification
+  └─ time-series persistence
+        │
+        ├─ Good quality ──► threshold engine ──► suppression check
+        │                                      │
+        │                                      ├─ suppressed evidence only
+        │                                      └─ operational alarm
+        │                                               │
+        │                                               ▼
+        │                                      incident correlation
+        │                                               │
+        ▼                                               ▼
+Telemetry trends / quality KPIs              Utility Command Center
+                                                ├─ acknowledge
+                                                ├─ incident → corrective WO
+                                                ├─ outage context
+                                                └─ technician dispatch context
+```
+
+This separates protocol adaptation from EUAS business logic. Native industrial protocols belong in an edge/integration adapter; EUAS receives normalized authenticated readings. The correlation engine is deliberately deterministic (same asset or configured topology neighbor + active correlation window) so an operator can explain why alarms were grouped.
+
+Integration keys are stored only as SHA-256 digests. Human sessions and machine principals therefore use different authentication paths while converging on the same transaction, audit and event-outbox layers.
+
+
+## v4.3 offline field synchronization
+
+Field clients obtain an authenticated snapshot from `/api/field/sync/bootstrap`. Mutable field entities carry deterministic hashes over their workflow-relevant state. Offline operations are queued with unique operation IDs and later submitted to `/api/field/sync/push`. The server stores every operation before deciding Applied, Conflict or Rejected, and replay of the same operation ID is idempotent.
+
+For mutable records, a stale base hash creates an explicit conflict instead of last-write-wins. Ordered edits to the same entity inside one push can rebase only when the first operation proves the original base hash was current at batch arrival. Conflict retry requires a fresh expected server hash, preventing a second race from being silently overwritten. See `FIELD_SYNC.md`.
+
+## v4.2 topology-aware incident correlation
+
+EUAS now maintains a directed operational graph separate from the asset parent/child hierarchy. A topology link means that an upstream asset operationally feeds, supplies, drives, contains or otherwise supports a downstream asset. The graph is intentionally configurable because physical asset hierarchy and operational dependency are not always the same.
+
+When a new threshold alarm opens, the correlation service first preserves same-asset grouping and then looks for an open incident containing a directly connected topology neighbor at the same site inside the 30-minute correlation window. Incidents can therefore grow across multiple hops incrementally as adjacent alarmed assets join. This avoids automatically collapsing unrelated sibling assets simply because they share a distant common ancestor.
+
+For a multi-asset incident, EUAS ranks alarmed assets deterministically using directed upstream reachability, first alarm onset and severity. It stores the selected candidate, score, reason and hop evidence on the incident. Corrective work generated from the incident targets that candidate. This is explainable root-cause **decision support**, not ML inference and not proof of physical causation.

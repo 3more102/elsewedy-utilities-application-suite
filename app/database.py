@@ -154,6 +154,16 @@ def _ensure_schema_columns(conn):
     cols=_table_columns(conn,'audit_logs')
     if 'prev_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT DEFAULT ''")
     if 'audit_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN audit_hash TEXT DEFAULT ''")
+    reading_cols=_table_columns(conn,'telemetry_readings')
+    if 'external_id' not in reading_cols: conn.execute('ALTER TABLE telemetry_readings ADD COLUMN external_id TEXT')
+    if 'batch_id' not in reading_cols: conn.execute('ALTER TABLE telemetry_readings ADD COLUMN batch_id INTEGER REFERENCES telemetry_ingest_batches(id) ON DELETE SET NULL')
+    incident_cols=_table_columns(conn,'alarm_incidents')
+    if incident_cols:
+        if 'root_cause_asset_id' not in incident_cols: conn.execute('ALTER TABLE alarm_incidents ADD COLUMN root_cause_asset_id INTEGER REFERENCES assets(id)')
+        if 'correlation_mode' not in incident_cols: conn.execute("ALTER TABLE alarm_incidents ADD COLUMN correlation_mode TEXT NOT NULL DEFAULT 'Asset'")
+        if 'root_cause_score' not in incident_cols: conn.execute('ALTER TABLE alarm_incidents ADD COLUMN root_cause_score REAL NOT NULL DEFAULT 0')
+        if 'root_cause_reason' not in incident_cols: conn.execute("ALTER TABLE alarm_incidents ADD COLUMN root_cause_reason TEXT DEFAULT ''")
+        if 'topology_hops' not in incident_cols: conn.execute('ALTER TABLE alarm_incidents ADD COLUMN topology_hops INTEGER NOT NULL DEFAULT 0')
 
 def _backfill_audit_chain(conn):
     prev=''
@@ -214,6 +224,16 @@ def init_db(hash_password):
         );
         CREATE INDEX IF NOT EXISTS idx_assets_no ON assets(asset_no);
         CREATE INDEX IF NOT EXISTS idx_assets_location ON assets(location_id);
+        CREATE TABLE IF NOT EXISTS asset_topology_links(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, link_no TEXT UNIQUE NOT NULL,
+          upstream_asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+          downstream_asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+          relation_type TEXT NOT NULL DEFAULT 'Feeds', active INTEGER NOT NULL DEFAULT 1, notes TEXT DEFAULT '',
+          created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL,
+          CHECK(upstream_asset_id <> downstream_asset_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_asset_topology_upstream ON asset_topology_links(upstream_asset_id,active);
+        CREATE INDEX IF NOT EXISTS idx_asset_topology_downstream ON asset_topology_links(downstream_asset_id,active);
         CREATE TABLE IF NOT EXISTS meters(
           id INTEGER PRIMARY KEY AUTOINCREMENT, meter_code TEXT UNIQUE NOT NULL, asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
           meter_type TEXT NOT NULL, unit TEXT NOT NULL, current_reading REAL DEFAULT 0
@@ -338,6 +358,15 @@ def init_db(hash_password):
           decided_at TEXT, decided_by INTEGER REFERENCES users(id), comments TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_approvals_queue ON approval_requests(status,assigned_role,assigned_user_id,requested_at);
+        CREATE TABLE IF NOT EXISTS approval_signature_evidence(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, evidence_no TEXT UNIQUE NOT NULL, approval_id INTEGER UNIQUE NOT NULL REFERENCES approval_requests(id),
+          approval_no TEXT NOT NULL, module TEXT NOT NULL, record_type TEXT NOT NULL, record_id INTEGER NOT NULL, record_code TEXT NOT NULL,
+          decision TEXT NOT NULL, signer_user_id INTEGER NOT NULL REFERENCES users(id), signer_username TEXT NOT NULL, signer_name TEXT NOT NULL, signer_role TEXT NOT NULL,
+          delegated_authority INTEGER NOT NULL DEFAULT 0, credential_verified INTEGER NOT NULL DEFAULT 1, intent_statement TEXT NOT NULL, comments TEXT DEFAULT '',
+          signed_at TEXT NOT NULL, payload_json TEXT NOT NULL, prev_hash TEXT DEFAULT '', evidence_hash TEXT UNIQUE NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_signature_signer ON approval_signature_evidence(signer_user_id,signed_at);
+        CREATE INDEX IF NOT EXISTS idx_approval_signature_time ON approval_signature_evidence(signed_at,decision);
         CREATE TABLE IF NOT EXISTS workflow_events(
           id INTEGER PRIMARY KEY AUTOINCREMENT, module TEXT NOT NULL, record_type TEXT NOT NULL, record_id INTEGER NOT NULL, record_code TEXT NOT NULL,
           event TEXT NOT NULL, from_status TEXT DEFAULT '', to_status TEXT DEFAULT '', actor_id INTEGER NOT NULL REFERENCES users(id),
@@ -466,6 +495,19 @@ def init_db(hash_password):
         );
         CREATE INDEX IF NOT EXISTS idx_dispatch_technician ON dispatch_assignments(technician_user_id,status,dispatched_at);
         CREATE INDEX IF NOT EXISTS idx_dispatch_work ON dispatch_assignments(work_order_id,status);
+        CREATE TABLE IF NOT EXISTS field_sync_clients(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT UNIQUE NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          device_name TEXT DEFAULT '', created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, last_pull_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_field_sync_clients_user ON field_sync_clients(user_id,last_seen_at);
+        CREATE TABLE IF NOT EXISTS field_sync_operations(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT UNIQUE NOT NULL, client_id TEXT NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          entity_type TEXT NOT NULL, entity_id INTEGER NOT NULL, operation_type TEXT NOT NULL, base_hash TEXT DEFAULT '', payload_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'Pending', result_json TEXT DEFAULT '', conflict_json TEXT DEFAULT '', client_created_at TEXT, submitted_at TEXT NOT NULL,
+          applied_at TEXT, resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_field_sync_operations_client ON field_sync_operations(client_id,status,submitted_at);
+        CREATE INDEX IF NOT EXISTS idx_field_sync_operations_user ON field_sync_operations(user_id,status,submitted_at);
         CREATE TABLE IF NOT EXISTS telemetry_channels(
           id INTEGER PRIMARY KEY AUTOINCREMENT, channel_code TEXT UNIQUE NOT NULL,
           asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE, name TEXT NOT NULL,
@@ -476,12 +518,35 @@ def init_db(hash_password):
         );
         CREATE INDEX IF NOT EXISTS idx_telemetry_channels_asset ON telemetry_channels(asset_id,active);
         CREATE INDEX IF NOT EXISTS idx_telemetry_channels_metric ON telemetry_channels(metric_type,active);
+        CREATE TABLE IF NOT EXISTS integration_api_keys(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, key_no TEXT UNIQUE NOT NULL, name TEXT NOT NULL, key_hash TEXT UNIQUE NOT NULL,
+          scope TEXT NOT NULL DEFAULT 'telemetry:write', active INTEGER NOT NULL DEFAULT 1, created_by INTEGER NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL, last_used_at TEXT, expires_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_integration_api_keys_active ON integration_api_keys(active,scope,expires_at);
+        CREATE TABLE IF NOT EXISTS telemetry_ingest_batches(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, batch_no TEXT UNIQUE NOT NULL, source_system TEXT NOT NULL DEFAULT 'API',
+          idempotency_key TEXT UNIQUE, received_count INTEGER NOT NULL DEFAULT 0, accepted_count INTEGER NOT NULL DEFAULT 0,
+          duplicate_count INTEGER NOT NULL DEFAULT 0, bad_quality_count INTEGER NOT NULL DEFAULT 0,
+          alarms_opened INTEGER NOT NULL DEFAULT 0, alarms_updated INTEGER NOT NULL DEFAULT 0, alarms_cleared INTEGER NOT NULL DEFAULT 0,
+          suppressed_count INTEGER NOT NULL DEFAULT 0, ingested_by INTEGER REFERENCES users(id), started_at TEXT NOT NULL, completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_telemetry_batches_time ON telemetry_ingest_batches(started_at,source_system);
         CREATE TABLE IF NOT EXISTS telemetry_readings(
           id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER NOT NULL REFERENCES telemetry_channels(id) ON DELETE CASCADE,
           value REAL NOT NULL, quality TEXT NOT NULL DEFAULT 'Good', source TEXT NOT NULL DEFAULT 'Manual',
-          captured_at TEXT NOT NULL, ingested_at TEXT NOT NULL, ingested_by INTEGER REFERENCES users(id)
+          captured_at TEXT NOT NULL, ingested_at TEXT NOT NULL, ingested_by INTEGER REFERENCES users(id),
+          external_id TEXT, batch_id INTEGER REFERENCES telemetry_ingest_batches(id) ON DELETE SET NULL
         );
         CREATE INDEX IF NOT EXISTS idx_telemetry_readings_channel_time ON telemetry_readings(channel_id,captured_at);
+        CREATE TABLE IF NOT EXISTS alarm_suppressions(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, suppression_no TEXT UNIQUE NOT NULL, site_id INTEGER REFERENCES sites(id),
+          asset_id INTEGER REFERENCES assets(id), channel_id INTEGER REFERENCES telemetry_channels(id), reason TEXT NOT NULL,
+          start_at TEXT NOT NULL, end_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+          created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alarm_suppressions_window ON alarm_suppressions(active,start_at,end_at);
+        CREATE INDEX IF NOT EXISTS idx_alarm_suppressions_scope ON alarm_suppressions(site_id,asset_id,channel_id,active);
         CREATE TABLE IF NOT EXISTS operational_alarms(
           id INTEGER PRIMARY KEY AUTOINCREMENT, alarm_no TEXT UNIQUE NOT NULL,
           channel_id INTEGER NOT NULL REFERENCES telemetry_channels(id), asset_id INTEGER NOT NULL REFERENCES assets(id), site_id INTEGER REFERENCES sites(id),
@@ -492,6 +557,33 @@ def init_db(hash_password):
         );
         CREATE INDEX IF NOT EXISTS idx_operational_alarms_status ON operational_alarms(status,severity,opened_at);
         CREATE INDEX IF NOT EXISTS idx_operational_alarms_asset ON operational_alarms(asset_id,status,opened_at);
+        CREATE TABLE IF NOT EXISTS alarm_shelves(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, shelf_no TEXT UNIQUE NOT NULL, alarm_id INTEGER NOT NULL REFERENCES operational_alarms(id) ON DELETE CASCADE,
+          reason TEXT NOT NULL, duration_minutes INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'Pending',
+          requested_by INTEGER NOT NULL REFERENCES users(id), requested_at TEXT NOT NULL, approved_by INTEGER REFERENCES users(id), approved_at TEXT,
+          start_at TEXT, end_at TEXT, rejected_by INTEGER REFERENCES users(id), rejected_at TEXT, decision_comments TEXT DEFAULT '',
+          revoked_by INTEGER REFERENCES users(id), revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_alarm_shelves_alarm_status ON alarm_shelves(alarm_id,status,end_at);
+        CREATE INDEX IF NOT EXISTS idx_alarm_shelves_status_end ON alarm_shelves(status,end_at);
+        CREATE TABLE IF NOT EXISTS alarm_incidents(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, incident_no TEXT UNIQUE NOT NULL, correlation_key TEXT NOT NULL,
+          site_id INTEGER REFERENCES sites(id), asset_id INTEGER REFERENCES assets(id), title TEXT NOT NULL, severity TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'Open', opened_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+          acknowledged_at TEXT, acknowledged_by INTEGER REFERENCES users(id), resolved_at TEXT, resolved_by INTEGER REFERENCES users(id),
+          work_order_id INTEGER REFERENCES work_orders(id), alarm_count INTEGER NOT NULL DEFAULT 0,
+          root_cause_asset_id INTEGER REFERENCES assets(id), correlation_mode TEXT NOT NULL DEFAULT 'Asset',
+          root_cause_score REAL NOT NULL DEFAULT 0, root_cause_reason TEXT DEFAULT '', topology_hops INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alarm_incidents_status ON alarm_incidents(status,severity,last_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_alarm_incidents_asset ON alarm_incidents(asset_id,status,last_seen_at);
+        CREATE TABLE IF NOT EXISTS alarm_incident_members(
+          incident_id INTEGER NOT NULL REFERENCES alarm_incidents(id) ON DELETE CASCADE,
+          alarm_id INTEGER NOT NULL REFERENCES operational_alarms(id) ON DELETE CASCADE, added_at TEXT NOT NULL,
+          PRIMARY KEY(incident_id,alarm_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_alarm_incident_members_alarm ON alarm_incident_members(alarm_id);
         CREATE TABLE IF NOT EXISTS schema_migrations(
           version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
         );
@@ -503,6 +595,7 @@ def init_db(hash_password):
         CREATE INDEX IF NOT EXISTS idx_audit_chain ON audit_logs(id,audit_hash);
         ''')
         _ensure_schema_columns(conn)
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_readings_external ON telemetry_readings(channel_id,external_id) WHERE external_id IS NOT NULL')
         _backfill_audit_chain(conn)
         conn.execute('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)',(SCHEMA_VERSION,now()))
 
@@ -533,6 +626,8 @@ def init_db(hash_password):
             conn.executemany('INSERT INTO retention_policies(policy_code,data_class,retention_days,protected,active,updated_at) VALUES(?,?,?,?,1,?)',[
               ('RET-AUDIT','Audit Trail',2555,1,now()),('RET-WORK','Work Management',3650,1,now()),
               ('RET-DOCS','Documents',3650,0,now()),('RET-NOTIFY','Notifications',365,0,now()),('RET-EVENTS','Integration Events',730,0,now())])
+        conn.execute('INSERT OR IGNORE INTO retention_policies(policy_code,data_class,retention_days,protected,active,updated_at) VALUES(?,?,?,?,1,?)',
+                     ('RET-ESIGN','Approval Signatures',3650,1,now()))
 
         if conn.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0:
             role_ids={r['code']:r['id'] for r in conn.execute('SELECT * FROM roles')}
@@ -613,8 +708,22 @@ def init_db(hash_password):
                 conn.execute('''INSERT INTO assets(asset_no,name,description,asset_type_id,category,manufacturer,model,serial_no,installation_date,commissioning_date,purchase_cost,replacement_cost,current_value,criticality,condition,status,location_id,parent_asset_id,department,responsible_user_id,vendor_id,warranty_expiry,maintenance_strategy,last_maintenance,next_maintenance,meter_reading,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',a+(now(),now()))
             ids={r['asset_no']:r['id'] for r in conn.execute('SELECT id,asset_no FROM assets')}
             conn.execute('UPDATE assets SET parent_asset_id=? WHERE asset_no=?',(ids['SWGR-001'],'CB-101'))
+            if conn.execute('SELECT COUNT(*) FROM asset_topology_links').fetchone()[0] == 0:
+                creator=user_id_by_username_db=conn.execute("SELECT id FROM users WHERE username='omar'").fetchone()
+                creator_id=creator['id'] if creator else None
+                conn.executemany('INSERT INTO asset_topology_links(link_no,upstream_asset_id,downstream_asset_id,relation_type,active,notes,created_by,created_at) VALUES(?,?,?,?,1,?,?,?)',[
+                  ('TPL-1001',ids['TR-001'],ids['SWGR-001'],'Feeds','Transformer secondary feeds main 11 kV switchgear',creator_id,now()),
+                  ('TPL-1002',ids['SWGR-001'],ids['CB-101'],'Feeds','Main switchgear feeds feeder breaker CB-101',creator_id,now())])
             conn.executemany('INSERT INTO meters(meter_code,asset_id,meter_type,unit,current_reading) VALUES(?,?,?,?,?)',[
               ('MTR-TR001-TEMP',ids['TR-001'],'Temperature','°C',78.4),('MTR-CB101-OPS',ids['CB-101'],'Operation Count','ops',3250),('MTR-PMP301-HRS',ids['PMP-301'],'Runtime','h',8440)])
+
+        if conn.execute('SELECT COUNT(*) FROM asset_topology_links').fetchone()[0] == 0:
+            ids={r['asset_no']:r['id'] for r in conn.execute("SELECT id,asset_no FROM assets WHERE asset_no IN ('TR-001','SWGR-001','CB-101')")}
+            creator=conn.execute("SELECT id FROM users WHERE username='omar'").fetchone(); creator_id=creator['id'] if creator else None
+            links=[]
+            if 'TR-001' in ids and 'SWGR-001' in ids: links.append(('TPL-1001',ids['TR-001'],ids['SWGR-001'],'Feeds','Transformer secondary feeds main 11 kV switchgear',creator_id,now()))
+            if 'SWGR-001' in ids and 'CB-101' in ids: links.append(('TPL-1002',ids['SWGR-001'],ids['CB-101'],'Feeds','Main switchgear feeds feeder breaker CB-101',creator_id,now()))
+            if links: conn.executemany('INSERT INTO asset_topology_links(link_no,upstream_asset_id,downstream_asset_id,relation_type,active,notes,created_by,created_at) VALUES(?,?,?,?,1,?,?,?)',links)
 
         if conn.execute('SELECT COUNT(*) FROM warehouses').fetchone()[0] == 0:
             sites={r['site_code']:r['id'] for r in conn.execute('SELECT id,site_code FROM sites')}
@@ -682,6 +791,11 @@ def init_db(hash_password):
                     conn.execute('INSERT INTO telemetry_readings(channel_id,value,quality,source,captured_at,ingested_at,ingested_by) VALUES(?,?,?,?,?,?,?)',(cmap[code],val,'Good','Seed',captured,stamp,system_id))
             site=conn.execute('SELECT s.id FROM assets a LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE a.id=?',(amap['TR-001'],)).fetchone()
             conn.execute("INSERT INTO operational_alarms(alarm_no,channel_id,asset_id,site_id,severity,status,alarm_type,message,trigger_value,threshold_value,opened_at,last_seen_at,occurrence_count) VALUES(?,?,?,?,?,'Open','Threshold',?,?,?,?,?,1)",('ALM-50001',cmap['TEL-TR001-OIL-TEMP'],amap['TR-001'],site['id'] if site else None,'Warning','Transformer Oil Temperature high: 84 °C',84.0,80.0,stamp,stamp))
+
+            seeded_alarm=conn.execute("SELECT id FROM operational_alarms WHERE alarm_no='ALM-50001'").fetchone()
+            if seeded_alarm and conn.execute('SELECT COUNT(*) FROM alarm_incidents').fetchone()[0] == 0:
+                inc=conn.execute("INSERT INTO alarm_incidents(incident_no,correlation_key,site_id,asset_id,title,severity,status,opened_at,last_seen_at,alarm_count,created_at,updated_at) VALUES(?,?,?,?,?,?,'Open',?,?,1,?,?)",('INC-60001',f"asset:{amap['TR-001']}",site['id'] if site else None,amap['TR-001'],'TR-001 operational alarm incident','Warning',stamp,stamp,stamp,stamp))
+                conn.execute('INSERT INTO alarm_incident_members(incident_id,alarm_id,added_at) VALUES(?,?,?)',(inc.lastrowid,seeded_alarm['id'],stamp))
 
         if conn.execute('SELECT COUNT(*) FROM inspections').fetchone()[0] == 0:
             a={r['asset_no']:r['id'] for r in conn.execute('SELECT id,asset_no FROM assets')}; u={r['username']:r['id'] for r in conn.execute('SELECT id,username FROM users')}

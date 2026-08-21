@@ -66,7 +66,7 @@ def main() -> int:
 
             assert health["status"] == "ok"
             assert health["database_backend"] == "sqlite"
-            assert health["schema_version"] >= 9
+            assert health["schema_version"] >= 14
             assert headers.get("X-Frame-Options") == "DENY"
             assert headers.get("X-Content-Type-Options") == "nosniff"
             assert headers.get("X-Request-ID")
@@ -76,7 +76,7 @@ def main() -> int:
                 method="POST",
                 data={"username": "omar", "password": "EUAS@2026"},
             )
-            assert status == 200 and login["user"]["role"] == "admin"
+            assert status == 200 and login["user"]["role"] == "admin" and login.get("expires_at")
             token = login["token"]
 
             status, _, ready = request("/api/health/ready")
@@ -107,6 +107,12 @@ def main() -> int:
             status, _, delegations = request("/api/approval-delegations", token=token)
             assert status == 200 and isinstance(delegations, list)
 
+            status, _, signature_integrity = request("/api/approval-signatures/verify", token=token)
+            assert status == 200 and signature_integrity["valid"] is True
+
+            status, _, retention = request("/api/governance/retention", token=token)
+            assert status == 200 and any(x["data_class"] == "Approval Signatures" and x["protected"] for x in retention)
+
             status, _, workforce = request("/api/workforce/technicians", token=token)
             assert status == 200 and len(workforce) >= 2
 
@@ -136,6 +142,16 @@ def main() -> int:
             status, _, reservations = request(f"/api/work-orders/{demo_wo['id']}/reservations", token=token)
             assert status == 200 and isinstance(reservations, list) and reservations
 
+            status, _, tech_login = request(
+                "/api/auth/login", method="POST", data={"username": "tech1", "password": "Tech@2026"}
+            )
+            assert status == 200 and tech_login.get("expires_at")
+            tech_token = tech_login["token"]
+            status, _, field_sync = request(
+                "/api/field/sync/bootstrap?client_id=smoke-field-client-001&device_name=HTTP-Smoke", token=tech_token
+            )
+            assert status == 200 and field_sync["schema_version"] >= 14 and isinstance(field_sync["work_orders"], list)
+
             status, _, launchpad = request("/api/launchpad", token=token)
             assert status == 200 and any(x["code"] == "dispatch" for x in launchpad)
             assert any(x["code"] == "telemetry" for x in launchpad)
@@ -152,6 +168,20 @@ def main() -> int:
             assert status == 200
             assert intelligence["telemetry_channels"] >= 3
             assert intelligence["active_alarms"] >= 1
+
+            status, _, command_center = request("/api/operations/command-center", token=token)
+            assert status == 200
+            assert "incidents" in command_center and "data_quality" in command_center and "suppressions" in command_center
+            assert command_center["summary"]["telemetry_channels"] >= 3
+
+            status, _, quality = request("/api/telemetry/quality?hours=24", token=token)
+            assert status == 200 and "good_percent" in quality
+
+            status, _, incidents = request("/api/alarm-incidents", token=token)
+            assert status == 200 and isinstance(incidents, list) and incidents
+
+            status, _, batches = request("/api/telemetry/batches?limit=5", token=token)
+            assert status == 200 and isinstance(batches, list)
 
             status, _, shell = request("/")
             assert status == 200 and "ELSEWEDY UTILITIES" in shell

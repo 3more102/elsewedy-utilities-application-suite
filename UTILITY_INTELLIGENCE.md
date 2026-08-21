@@ -1,6 +1,6 @@
-# EUAS v3.9.0 — Utility Operations Intelligence
+# EUAS v4.2.0 — Utility Operations Intelligence
 
-EUAS v3.9.0 adds an operational telemetry and alarm layer for electrical, water and infrastructure assets.
+EUAS v4.2.0 extends the operational telemetry and alarm layer for electrical, water and infrastructure assets.
 
 ## Telemetry channels
 
@@ -31,3 +31,8 @@ The Telemetry & Alarms application shows channel health, stale channels, current
 ## Production integration path
 
 For utility deployment, place protocol-specific edge/gateway services between field/SCADA networks and this API boundary, use dedicated machine identity and TLS/mTLS, add time-series retention/partitioning appropriate to volume, and validate cyber-security zoning with the utility OT security architecture.
+
+
+## v4.0 additions
+
+The v4.0 Command Center layer adds quality-aware/idempotent ingestion, alarm suppression windows, correlated operational incidents, machine API keys and bucketed telemetry trends. See `COMMAND_CENTER.md` for the complete operator workflow.

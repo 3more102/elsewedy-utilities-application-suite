@@ -159,7 +159,7 @@ def test_euas_end_to_end():
         approvals = client.get('/api/approvals?status=Pending', headers=admin).json()
         approval = next(x for x in approvals if x['record_type'] == 'work_order' and x['record_id'] == approval_wid)
         supervisor_headers = auth(client, 'supervisor', 'Supervisor@2026')
-        decision = client.post(f"/api/approvals/{approval['id']}/decision", headers=supervisor_headers, json={'decision': 'approve', 'comments': 'Approved in QA'})
+        decision = client.post(f"/api/approvals/{approval['id']}/decision", headers=supervisor_headers, json={'decision': 'approve', 'comments': 'Approved in QA', 'current_password': 'Supervisor@2026', 'signer_intent': f"I approve {approval['record_code']}"})
         assert decision.status_code == 200, decision.text
         assert client.get(f'/api/work-orders/{approval_wid}', headers=admin).json()['status'] == 'Approved'
         history = client.get('/api/workflow-events', headers=admin, params={'module': 'Work Management', 'record_type': 'work_order', 'record_id': approval_wid}).json()
@@ -169,7 +169,7 @@ def test_euas_end_to_end():
         reject_wo = client.post('/api/work-orders', headers=admin, json={'title': 'Approval rejection regression', 'asset_id': tr['id'], 'supervisor_id': users['supervisor']}).json()['id']
         assert client.post(f'/api/work-orders/{reject_wo}/transition', headers=admin, json={'action': 'submit'}).status_code == 200
         rejection = next(x for x in client.get('/api/approvals?status=Pending', headers=supervisor_headers).json() if x['record_type'] == 'work_order' and x['record_id'] == reject_wo)
-        assert client.post(f"/api/approvals/{rejection['id']}/decision", headers=supervisor_headers, json={'decision': 'reject', 'comments': 'Revise scope'}).status_code == 200
+        assert client.post(f"/api/approvals/{rejection['id']}/decision", headers=supervisor_headers, json={'decision': 'reject', 'comments': 'Revise scope', 'current_password': 'Supervisor@2026', 'signer_intent': f"I reject {rejection['record_code']}"}).status_code == 200
         assert client.get(f'/api/work-orders/{reject_wo}', headers=admin).json()['status'] == 'Rejected'
         assert client.post(f'/api/work-orders/{reject_wo}/transition', headers=admin, json={'action': 'resubmit'}).status_code == 200
         assert any(x['record_id'] == reject_wo for x in client.get('/api/approvals?status=Pending', headers=admin).json())
@@ -184,7 +184,7 @@ def test_euas_end_to_end():
         assert client.post(f'/api/procurement/requisitions/{qa_pr_id}/submit', headers=admin).status_code == 200
         proc_headers = auth(client, 'proc', 'Proc@2026')
         pr_approval = next(x for x in client.get('/api/approvals?status=Pending', headers=proc_headers).json() if x['record_type'] == 'purchase_requisition' and x['record_id'] == qa_pr_id)
-        assert client.post(f"/api/approvals/{pr_approval['id']}/decision", headers=proc_headers, json={'decision': 'approve'}).status_code == 200
+        assert client.post(f"/api/approvals/{pr_approval['id']}/decision", headers=proc_headers, json={'decision': 'approve', 'current_password': 'Proc@2026', 'signer_intent': f"I approve {pr_approval['record_code']}"}).status_code == 200
         assert next(x for x in client.get('/api/procurement', headers=admin).json()['requisitions'] if x['id'] == qa_pr_id)['status'] == 'Approved'
 
         # Technicians cannot execute work assigned to another user.

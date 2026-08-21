@@ -10,7 +10,7 @@ services:
     environment:
       EUAS_DB_PATH: /app/data/euas.db
       EUAS_ENV: production
-      EUAS_VERSION: 3.9.0
+      EUAS_VERSION: 4.2.0
       EUAS_SESSION_HOURS: 12
       EUAS_MAX_UPLOAD_MB: 25
       EUAS_AUTOMATION_INTERVAL_MINUTES: 0

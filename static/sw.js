@@ -1,4 +1,4 @@
-const CACHE='euas-shell-v3.9.0';
+const CACHE='euas-shell-v4.4.0';
 const ASSETS=['/','/static/styles.css','/static/app.js','/static/manifest.webmanifest'];
 
 self.addEventListener('install',event=>{

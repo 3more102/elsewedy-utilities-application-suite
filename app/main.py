@@ -19,6 +19,8 @@ async def lifespan(app: FastAPI):
     init_db(hash_password)
     with db() as conn:
         _backfill_work_order_slas(conn)
+        for incident in rows(conn.execute('SELECT id FROM alarm_incidents ORDER BY id')):
+            _refresh_incident(conn,incident['id'])
     scheduler_task = asyncio.create_task(_automation_loop()) if AUTOMATION_INTERVAL_MINUTES > 0 else None
     try:
         yield
@@ -86,6 +88,21 @@ DOC_WRITE_ROLES = ('admin','asset_manager','maintenance_manager','planner','supe
 PROC_ROLES = ('admin','maintenance_manager','procurement')
 HSE_ROLES = ('admin','hse','maintenance_manager')
 PROJECT_ROLES = ('admin','project_manager','maintenance_manager')
+TELEMETRY_WRITE_ROLES = ('admin','asset_manager','maintenance_manager','planner','supervisor','technician')
+
+def telemetry_ingest_principal(authorization:Optional[str]=Header(default=None),x_euas_integration_key:Optional[str]=Header(default=None,alias='X-EUAS-Integration-Key')):
+    if x_euas_integration_key:
+        digest=hashlib.sha256(x_euas_integration_key.encode()).hexdigest();stamp=now()
+        with db() as conn:
+            key=conn.execute("SELECT * FROM integration_api_keys WHERE key_hash=? AND active=1 AND scope='telemetry:write'",(digest,)).fetchone()
+            if not key or (key['expires_at'] and key['expires_at']<=stamp):raise HTTPException(401,'Invalid or expired integration API key')
+            system=conn.execute("SELECT id,username,full_name FROM users WHERE username='system'").fetchone()
+            if not system:raise HTTPException(503,'Automation principal is unavailable')
+            conn.execute('UPDATE integration_api_keys SET last_used_at=? WHERE id=?',(stamp,key['id']))
+            return {'id':system['id'],'username':system['username'],'full_name':f"Integration: {key['name']}",'role':'integration','role_name':'Integration Service','integration_key_no':key['key_no']}
+    user=current_user(authorization)
+    if user['role'] not in TELEMETRY_WRITE_ROLES:raise HTTPException(403,'Insufficient permissions')
+    return user
 
 
 def rows(cur): return [dict(r) for r in cur.fetchall()]
@@ -392,6 +409,72 @@ def get_or_404(conn, sql, args, message='Record not found'):
     if not r: raise HTTPException(404,message)
     return dict(r)
 
+def _approval_expected_intent(decision:str, record_code:str) -> str:
+    action='approve' if decision.lower().strip()=='approve' else 'reject'
+    return f'I {action} {record_code}'
+
+def _approval_target_snapshot(conn, approval):
+    if approval['record_type']=='work_order':
+        return get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(approval['record_id'],),'Work order not found')
+    if approval['record_type']=='purchase_requisition':
+        return get_or_404(conn,'SELECT * FROM purchase_requisitions WHERE id=?',(approval['record_id'],),'Purchase requisition not found')
+    if approval['record_type']=='alarm_shelf':
+        return get_or_404(conn,'SELECT * FROM alarm_shelves WHERE id=?',(approval['record_id'],),'Alarm shelf request not found')
+    return {'record_type':approval['record_type'],'record_id':approval['record_id']}
+
+def _approval_signature_digest(prev_hash:str, payload_json:str) -> str:
+    return hashlib.sha256(f'{prev_hash or ""}|{payload_json}'.encode('utf-8')).hexdigest()
+
+def _record_approval_signature(conn, approval, target_status:str, user, intent_statement:str, comments:str, delegated:bool, record_snapshot:dict):
+    evidence_no=next_no(conn,'approval_signature_evidence','evidence_no','SIG-',9001)
+    signed_at=now()
+    payload={
+      'schema':1,'evidence_no':evidence_no,
+      'approval':{'id':approval['id'],'approval_no':approval['approval_no'],'module':approval['module'],'record_type':approval['record_type'],
+                  'record_id':approval['record_id'],'record_code':approval['record_code'],'title':approval['title'],
+                  'requested_by':approval['requested_by'],'requested_at':approval['requested_at']},
+      'decision':target_status,
+      'signer':{'user_id':user['id'],'username':user['username'],'full_name':user['full_name'],'role':user['role']},
+      'authority':{'delegated':bool(delegated)},'credential_verified':True,
+      'intent_statement':intent_statement,'comments':comments or '', 'signed_at':signed_at,
+      'record_snapshot':record_snapshot
+    }
+    payload_json=json.dumps(payload,sort_keys=True,separators=(',',':'),ensure_ascii=False,default=str)
+    prev=conn.execute('SELECT evidence_hash FROM approval_signature_evidence ORDER BY id DESC LIMIT 1').fetchone()
+    prev_hash=prev['evidence_hash'] if prev and prev['evidence_hash'] else ''
+    digest=_approval_signature_digest(prev_hash,payload_json)
+    cur=conn.execute('''INSERT INTO approval_signature_evidence(
+      evidence_no,approval_id,approval_no,module,record_type,record_id,record_code,decision,signer_user_id,signer_username,signer_name,signer_role,
+      delegated_authority,credential_verified,intent_statement,comments,signed_at,payload_json,prev_hash,evidence_hash
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+      evidence_no,approval['id'],approval['approval_no'],approval['module'],approval['record_type'],approval['record_id'],approval['record_code'],target_status,
+      user['id'],user['username'],user['full_name'],user['role'],int(bool(delegated)),1,intent_statement,comments or '',signed_at,payload_json,prev_hash,digest))
+    return {'id':cur.lastrowid,'evidence_no':evidence_no,'signed_at':signed_at,'evidence_hash':digest,'prev_hash':prev_hash}
+
+def verify_approval_signature_chain(conn):
+    prev='';checked=0
+    for r in conn.execute('SELECT * FROM approval_signature_evidence ORDER BY id').fetchall():
+        checked+=1
+        payload_json=r['payload_json'] or ''
+        expected=_approval_signature_digest(prev,payload_json)
+        try:payload=json.loads(payload_json)
+        except Exception:
+            return {'valid':False,'checked':checked,'first_invalid_id':r['id'],'first_invalid_evidence_no':r['evidence_no'],'reason':'invalid_payload_json','head_hash':prev}
+        approval=payload.get('approval') or {}; signer=payload.get('signer') or {}; authority=payload.get('authority') or {}
+        columns_match=(
+          payload.get('evidence_no')==r['evidence_no'] and approval.get('approval_no')==r['approval_no'] and approval.get('module')==r['module'] and
+          approval.get('record_type')==r['record_type'] and int(approval.get('record_id',-1))==int(r['record_id']) and approval.get('record_code')==r['record_code'] and
+          payload.get('decision')==r['decision'] and int(signer.get('user_id',-1))==int(r['signer_user_id']) and signer.get('username')==r['signer_username'] and
+          signer.get('full_name')==r['signer_name'] and signer.get('role')==r['signer_role'] and int(bool(authority.get('delegated')))==int(r['delegated_authority']) and
+          bool(payload.get('credential_verified'))==bool(r['credential_verified']) and payload.get('intent_statement')==r['intent_statement'] and
+          (payload.get('comments') or '')==(r['comments'] or '') and payload.get('signed_at')==r['signed_at']
+        )
+        if (r['prev_hash'] or '')!=prev or (r['evidence_hash'] or '')!=expected or not columns_match:
+            reason='chain_link' if (r['prev_hash'] or '')!=prev else ('hash_mismatch' if (r['evidence_hash'] or '')!=expected else 'column_payload_mismatch')
+            return {'valid':False,'checked':checked,'first_invalid_id':r['id'],'first_invalid_evidence_no':r['evidence_no'],'reason':reason,'head_hash':prev}
+        prev=r['evidence_hash']
+    return {'valid':True,'checked':checked,'first_invalid_id':None,'first_invalid_evidence_no':None,'reason':'ok','head_hash':prev}
+
 def user_id_by_username(conn, username):
     r=conn.execute('SELECT id FROM users WHERE username=?',(username,)).fetchone(); return r['id'] if r else None
 
@@ -408,6 +491,206 @@ def _channel_site(conn, asset_id:int):
     r=conn.execute('SELECT s.id site_id,s.site_code,s.name site_name FROM assets a LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE a.id=?',(asset_id,)).fetchone()
     return dict(r) if r else {'site_id':None,'site_code':None,'site_name':None}
 
+SEVERITY_RANK={'Info':0,'Warning':1,'Critical':2}
+
+
+def _topology_graph(conn):
+    links=rows(conn.execute("SELECT * FROM asset_topology_links WHERE active=1 ORDER BY id"))
+    down={};undirected={}
+    for link in links:
+        u=int(link['upstream_asset_id']);v=int(link['downstream_asset_id'])
+        down.setdefault(u,[]).append(v)
+        undirected.setdefault(u,[]).append(v);undirected.setdefault(v,[]).append(u)
+    return links,down,undirected
+
+
+def _graph_distance(graph:dict[int,list[int]], start:int, target:int, max_hops:int=3):
+    if start==target:return 0
+    seen={start};front=[(start,0)]
+    while front:
+        node,hops=front.pop(0)
+        if hops>=max_hops:continue
+        for nxt in graph.get(node,[]):
+            if nxt==target:return hops+1
+            if nxt not in seen:
+                seen.add(nxt);front.append((nxt,hops+1))
+    return None
+
+
+def _incident_root_cause(conn, members:list[dict]):
+    asset_ids=sorted({int(x['asset_id']) for x in members})
+    if not asset_ids:return {'asset_id':None,'asset_no':'','mode':'Asset','score':0,'reason':'No alarm members','hops':0}
+    placeholders=','.join('?' for _ in asset_ids)
+    meta={int(r['id']):dict(r) for r in conn.execute(f'SELECT id,asset_no,name FROM assets WHERE id IN ({placeholders})',asset_ids).fetchall()}
+    if len(asset_ids)==1:
+        a=meta[asset_ids[0]]
+        return {'asset_id':asset_ids[0],'asset_no':a['asset_no'],'mode':'Asset','score':100.0,'reason':f"All correlated alarms originate from {a['asset_no']}.",'hops':0}
+    _,down,undirected=_topology_graph(conn)
+    first_seen={aid:min(_dt(x['opened_at']) for x in members if int(x['asset_id'])==aid) for aid in asset_ids}
+    severity={aid:max((SEVERITY_RANK.get(x['severity'],0) for x in members if int(x['asset_id'])==aid),default=0) for aid in asset_ids}
+    candidates=[]
+    for aid in asset_ids:
+        directed=[_graph_distance(down,aid,other,3) for other in asset_ids if other!=aid]
+        downstream_count=sum(d is not None for d in directed)
+        connected=[_graph_distance(undirected,aid,other,3) for other in asset_ids if other!=aid]
+        connected_count=sum(d is not None for d in connected)
+        candidates.append((aid,downstream_count,connected_count,first_seen[aid],severity[aid],directed,connected))
+    candidates.sort(key=lambda x:(-x[1],-x[2],x[3],-x[4],x[0]))
+    aid,downstream_count,connected_count,opened,sev,directed,connected=candidates[0]
+    other_count=max(len(asset_ids)-1,1)
+    earliest=min(first_seen.values())==opened
+    score=min(95.0,60.0+25.0*(downstream_count/other_count)+(10.0 if earliest else 0.0))
+    reachable=[d for d in directed if d is not None] or [d for d in connected if d is not None]
+    hops=max(reachable,default=0)
+    a=meta[aid]
+    if downstream_count:
+        reason=f"{a['asset_no']} is upstream of {downstream_count} of {other_count} other alarmed asset(s) within the configured topology"
+        if earliest:reason+=' and its alarm evidence appeared earliest'
+        reason+='.'
+    else:
+        reason=f"{a['asset_no']} is the earliest alarmed asset in the connected topology; no alarmed asset is upstream of another alarmed member."
+    return {'asset_id':aid,'asset_no':a['asset_no'],'mode':'Topology','score':round(score,1),'reason':reason,'hops':hops}
+
+
+def _incident_candidate_distance(conn, incident_id:int, asset_id:int, max_hops:int=2):
+    member_assets=[int(r['asset_id']) for r in conn.execute('SELECT DISTINCT oa.asset_id FROM alarm_incident_members m JOIN operational_alarms oa ON oa.id=m.alarm_id WHERE m.incident_id=?',(incident_id,)).fetchall()]
+    if asset_id in member_assets:return 0
+    _,_,undirected=_topology_graph(conn)
+    ds=[_graph_distance(undirected,asset_id,x,max_hops) for x in member_assets]
+    ds=[x for x in ds if x is not None]
+    return min(ds) if ds else None
+
+
+def _normalize_quality(value:str) -> str:
+    q=str(value or 'Good').strip().title()
+    if q not in ('Good','Uncertain','Bad'):
+        raise HTTPException(422,"Telemetry quality must be Good, Uncertain or Bad")
+    return q
+
+
+def _active_alarm_suppression(conn, channel:dict, captured_at:str):
+    """Return the most specific active suppression window for a telemetry channel."""
+    site=_channel_site(conn,channel['asset_id'])
+    rows_=rows(conn.execute("""SELECT s.*,u.full_name created_by_name FROM alarm_suppressions s
+      LEFT JOIN users u ON u.id=s.created_by
+      WHERE s.active=1 AND s.start_at<=? AND s.end_at>=?
+      AND ((s.channel_id=? ) OR (s.channel_id IS NULL AND s.asset_id=? )
+           OR (s.channel_id IS NULL AND s.asset_id IS NULL AND s.site_id=?))""",
+      (captured_at,captured_at,channel['id'],channel['asset_id'],site.get('site_id'))))
+    if not rows_:return None
+    rows_.sort(key=lambda x:(1 if x.get('channel_id') else 0,1 if x.get('asset_id') else 0,1 if x.get('site_id') else 0),reverse=True)
+    return rows_[0]
+
+
+def _incident_member_summary(conn, incident_id:int):
+    members=rows(conn.execute("""SELECT oa.*,tc.channel_code,tc.name channel_name,tc.unit,a.asset_no,a.name asset_name
+      FROM alarm_incident_members m JOIN operational_alarms oa ON oa.id=m.alarm_id
+      JOIN telemetry_channels tc ON tc.id=oa.channel_id JOIN assets a ON a.id=oa.asset_id
+      WHERE m.incident_id=? ORDER BY oa.opened_at""",(incident_id,)))
+    active=[x for x in members if x['status'] in ('Open','Acknowledged')]
+    severity=max((x['severity'] for x in members),key=lambda x:SEVERITY_RANK.get(x,0),default='Warning')
+    return members,active,severity
+
+
+def _refresh_incident(conn, incident_id:int, actor_id:Optional[int]=None):
+    incident=conn.execute('SELECT * FROM alarm_incidents WHERE id=?',(incident_id,)).fetchone()
+    if not incident:return None
+    incident=dict(incident)
+    members,active,severity=_incident_member_summary(conn,incident_id)
+    last=max((x['last_seen_at'] for x in members),default=incident['last_seen_at'])
+    root=_incident_root_cause(conn,members)
+    title=incident['title'];key=incident['correlation_key']
+    if root['asset_id']:
+        if root['mode']=='Topology':
+            title=f"{root['asset_no']} topology-correlated operational incident";key=f"topology:{root['asset_id']}"
+        else:
+            title=f"{root['asset_no']} operational alarm incident";key=f"asset:{root['asset_id']}"
+    updates={'severity':severity,'alarm_count':len(members),'last_seen_at':last,'root_cause_asset_id':root['asset_id'],
+             'correlation_mode':root['mode'],'root_cause_score':root['score'],'root_cause_reason':root['reason'],'topology_hops':root['hops'],
+             'title':title,'correlation_key':key,'updated_at':now()}
+    if not active and incident['status'] in ('Open','Acknowledged'):
+        updates['status']='Resolved';updates['resolved_at']=now();updates['resolved_by']=actor_id
+    conn.execute('UPDATE alarm_incidents SET '+','.join(f'{k}=?' for k in updates)+' WHERE id=?',(*updates.values(),incident_id))
+    updated=one(conn.execute('SELECT * FROM alarm_incidents WHERE id=?',(incident_id,)))
+    if root['mode']=='Topology' and incident.get('root_cause_asset_id') not in (None,root['asset_id']):
+        emit_event(conn,'operations.incident.root_cause_updated','alarm_incident',incident['incident_no'],{'incident_no':incident['incident_no'],'root_cause_asset_id':root['asset_id'],'score':root['score'],'reason':root['reason']})
+        if actor_id:audit(conn,actor_id,'UPDATE INCIDENT ROOT CAUSE','Utilities Operations',incident['incident_no'],incident.get('root_cause_asset_id'),root)
+    if incident['status'] in ('Open','Acknowledged') and updated and updated['status']=='Resolved':
+        emit_event(conn,'operations.incident.auto_resolved','alarm_incident',incident['incident_no'],{'incident_no':incident['incident_no'],'alarm_count':len(members)})
+        if actor_id:audit(conn,actor_id,'AUTO RESOLVE INCIDENT','Utilities Operations',incident['incident_no'],incident['status'],'Resolved')
+    return updated
+
+
+def _correlate_alarm(conn, alarm_id:int, actor_id:Optional[int]=None):
+    alarm=get_or_404(conn,"""SELECT oa.*,a.asset_no,a.name asset_name FROM operational_alarms oa
+      JOIN assets a ON a.id=oa.asset_id WHERE oa.id=?""",(alarm_id,),'Alarm not found')
+    existing=conn.execute('SELECT incident_id FROM alarm_incident_members WHERE alarm_id=? ORDER BY incident_id DESC LIMIT 1',(alarm_id,)).fetchone()
+    if existing:return _refresh_incident(conn,existing['incident_id'],actor_id)
+    cutoff=(_dt(alarm['last_seen_at'])-timedelta(minutes=30)).isoformat(timespec='seconds')
+    sql="SELECT * FROM alarm_incidents WHERE status IN ('Open','Acknowledged') AND last_seen_at>=?";args=[cutoff]
+    if alarm.get('site_id') is None:sql+=' AND site_id IS NULL'
+    else:sql+=' AND site_id=?';args.append(alarm['site_id'])
+    candidates=[]
+    for inc in rows(conn.execute(sql,args)):
+        dist=_incident_candidate_distance(conn,inc['id'],alarm['asset_id'],1)
+        if dist is not None:candidates.append((dist,-_dt(inc['last_seen_at']).timestamp(),inc))
+    candidates.sort(key=lambda x:(x[0],x[1],x[2]['id']))
+    incident=candidates[0][2] if candidates else None
+    if not incident:
+        no=next_no(conn,'alarm_incidents','incident_no','INC-',60001)
+        cur=conn.execute("""INSERT INTO alarm_incidents(incident_no,correlation_key,site_id,asset_id,title,severity,status,opened_at,last_seen_at,alarm_count,root_cause_asset_id,correlation_mode,root_cause_score,root_cause_reason,topology_hops,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,'Open',?,?,0,?,'Asset',100,?,0,?,?)""",
+          (no,f"asset:{alarm['asset_id']}",alarm.get('site_id'),alarm['asset_id'],f"{alarm['asset_no']} operational alarm incident",alarm['severity'],alarm['opened_at'],alarm['last_seen_at'],alarm['asset_id'],f"Initial alarm evidence originates from {alarm['asset_no']}.",now(),now()))
+        incident_id=cur.lastrowid
+        emit_event(conn,'operations.incident.opened','alarm_incident',no,{'incident_no':no,'asset_id':alarm['asset_id'],'alarm_no':alarm['alarm_no'],'severity':alarm['severity']})
+        notify_once(conn,'Operational incident',f"{no} — {alarm['asset_no']} correlated alarm incident",alarm['severity'],None,'maintenance_manager','commandcenter',no)
+        if actor_id:audit(conn,actor_id,'INCIDENT OPEN','Utilities Operations',no,'',{'alarm':alarm['alarm_no'],'asset':alarm['asset_no']})
+    else:
+        incident_id=incident['id'];no=incident['incident_no']
+    conn.execute('INSERT OR IGNORE INTO alarm_incident_members(incident_id,alarm_id,added_at) VALUES(?,?,?)',(incident_id,alarm_id,now()))
+    updated=_refresh_incident(conn,incident_id,actor_id)
+    if updated and updated.get('correlation_mode')=='Topology':
+        emit_event(conn,'operations.incident.topology_correlated','alarm_incident',no,{'incident_no':no,'alarm_no':alarm['alarm_no'],'asset_id':alarm['asset_id'],'root_cause_asset_id':updated.get('root_cause_asset_id'),'score':updated.get('root_cause_score')})
+    return updated
+
+
+def _refresh_incidents_for_alarm(conn, alarm_id:int, actor_id:Optional[int]=None):
+    result=[]
+    for r in conn.execute('SELECT incident_id FROM alarm_incident_members WHERE alarm_id=?',(alarm_id,)).fetchall():
+        updated=_refresh_incident(conn,r['incident_id'],actor_id)
+        if updated:result.append(updated)
+    return result
+
+
+def _telemetry_quality_summary(conn, hours:int=24, site_id:Optional[int]=None):
+    cutoff=(datetime.now()-timedelta(hours=hours)).isoformat(timespec='seconds')
+    sql="""SELECT tr.quality,COUNT(*) count FROM telemetry_readings tr JOIN telemetry_channels tc ON tc.id=tr.channel_id
+      JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id
+      WHERE tr.captured_at>=?""";args=[cutoff]
+    if site_id is not None:sql+=' AND s.id=?';args.append(site_id)
+    sql+=' GROUP BY tr.quality';counts={r['quality']:int(r['count']) for r in conn.execute(sql,args).fetchall()}
+    total=sum(counts.values());good=counts.get('Good',0);bad=counts.get('Bad',0);uncertain=counts.get('Uncertain',0)
+    return {'hours':hours,'total_readings':total,'good':good,'uncertain':uncertain,'bad':bad,
+            'good_percent':round(good/max(total,1)*100,1),'bad_percent':round(bad/max(total,1)*100,1)}
+
+
+def _telemetry_series(conn, channel_id:int, hours:int, bucket_minutes:int):
+    cutoff=datetime.now()-timedelta(hours=hours)
+    data=rows(conn.execute('SELECT value,quality,captured_at FROM telemetry_readings WHERE channel_id=? AND captured_at>=? ORDER BY captured_at',(channel_id,cutoff.isoformat(timespec='seconds'))))
+    buckets={}
+    span=max(1,bucket_minutes)*60
+    for r in data:
+        try:dt=_dt(r['captured_at'])
+        except Exception:continue
+        epoch=int(dt.timestamp());bucket_epoch=epoch-(epoch%span);key=datetime.fromtimestamp(bucket_epoch).isoformat(timespec='seconds')
+        b=buckets.setdefault(key,{'timestamp':key,'values':[],'good':0,'uncertain':0,'bad':0})
+        b['values'].append(float(r['value']));q=str(r['quality']).lower();b[q]=b.get(q,0)+1
+    points=[]
+    for key in sorted(buckets):
+        b=buckets[key];vals=b.pop('values');points.append(b|{'min':min(vals),'max':max(vals),'avg':round(sum(vals)/len(vals),4),'count':len(vals)})
+    return points
+
+
 def _telemetry_alarm_level(channel, value:float):
     checks=[('Critical','critical_high','high'),('Critical','critical_low','low'),('Warning','warning_high','high'),('Warning','warning_low','low')]
     for severity,key,direction in checks:
@@ -423,22 +706,32 @@ def _evaluate_telemetry_alarm(conn, channel:dict, value:float, captured_at:str, 
     active=conn.execute("SELECT * FROM operational_alarms WHERE channel_id=? AND status IN ('Open','Acknowledged') ORDER BY id DESC LIMIT 1",(channel['id'],)).fetchone()
     site=_channel_site(conn,channel['asset_id']); unit=channel.get('unit') or ''
     if severity:
+        suppression=_active_alarm_suppression(conn,channel,captured_at)
+        if suppression:
+            return {'action':'suppressed','alarm_id':None,'alarm_no':None,'severity':severity,'threshold':threshold,
+                    'suppression_id':suppression['id'],'suppression_no':suppression['suppression_no'],'suppression_reason':suppression['reason']}
         message=f"{channel['name']} {severity.lower()}: {value:g} {unit}".strip()
         if active:
             conn.execute('UPDATE operational_alarms SET severity=?,message=?,trigger_value=?,threshold_value=?,last_seen_at=?,occurrence_count=occurrence_count+1 WHERE id=?',(severity,message,value,threshold,captured_at,active['id']))
-            return {'action':'updated','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':severity}
+            incident=_correlate_alarm(conn,active['id'],actor_id)
+            return {'action':'updated','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':severity,
+                    'incident_id':incident['id'] if incident else None,'incident_no':incident['incident_no'] if incident else None}
         no=next_no(conn,'operational_alarms','alarm_no','ALM-',50001)
         cur=conn.execute("INSERT INTO operational_alarms(alarm_no,channel_id,asset_id,site_id,severity,status,alarm_type,message,trigger_value,threshold_value,opened_at,last_seen_at,occurrence_count) VALUES(?,?,?,?,?,'Open','Threshold',?,?,?,?,?,1)",(no,channel['id'],channel['asset_id'],site.get('site_id'),severity,message,value,threshold,captured_at,captured_at))
         notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'maintenance_manager','operations',no)
         notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'asset_manager','operations',no)
         emit_event(conn,'operations.alarm.opened','alarm',no,{'alarm_no':no,'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'severity':severity,'value':value,'threshold':threshold,'captured_at':captured_at})
         if actor_id:audit(conn,actor_id,'ALARM OPEN','Utilities Operations',no,'',{'channel':channel['channel_code'],'severity':severity,'value':value,'threshold':threshold})
-        return {'action':'opened','alarm_id':cur.lastrowid,'alarm_no':no,'severity':severity}
+        incident=_correlate_alarm(conn,cur.lastrowid,actor_id)
+        return {'action':'opened','alarm_id':cur.lastrowid,'alarm_no':no,'severity':severity,
+                'incident_id':incident['id'] if incident else None,'incident_no':incident['incident_no'] if incident else None}
     if active:
         conn.execute("UPDATE operational_alarms SET status='Cleared',cleared_at=?,last_seen_at=?,trigger_value=? WHERE id=?",(captured_at,captured_at,value,active['id']))
         emit_event(conn,'operations.alarm.cleared','alarm',active['alarm_no'],{'alarm_no':active['alarm_no'],'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'value':value,'captured_at':captured_at})
         if actor_id:audit(conn,actor_id,'ALARM CLEAR','Utilities Operations',active['alarm_no'],active['status'],'Cleared')
-        return {'action':'cleared','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':active['severity']}
+        incidents=_refresh_incidents_for_alarm(conn,active['id'],actor_id)
+        return {'action':'cleared','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':active['severity'],
+                'incidents_resolved':[x['incident_no'] for x in incidents if x.get('status')=='Resolved']}
     return {'action':'normal','alarm_id':None,'alarm_no':None,'severity':None}
 
 def _operations_intelligence(conn, site_id:Optional[int]=None):
@@ -451,7 +744,15 @@ def _operations_intelligence(conn, site_id:Optional[int]=None):
     channels=int(conn.execute('SELECT COUNT(*) FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE tc.active=1'+ch_clause,ch_args).fetchone()[0])
     stale_cut=(datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds')
     stale=int(conn.execute('SELECT COUNT(*) FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE tc.active=1 AND (tc.last_reading_at IS NULL OR tc.last_reading_at<?)'+ch_clause,[stale_cut]+ch_args).fetchone()[0])
-    return {'active_alarms':active_alarms,'critical_alarms':critical,'telemetry_channels':channels,'stale_channels_24h':stale}
+    inc_sql="SELECT COUNT(*) FROM alarm_incidents WHERE status IN ('Open','Acknowledged')";inc_args=[]
+    if site_id is not None:inc_sql+=' AND site_id=?';inc_args.append(site_id)
+    incidents=int(conn.execute(inc_sql,inc_args).fetchone()[0])
+    sup_sql="SELECT COUNT(*) FROM alarm_suppressions WHERE active=1 AND start_at<=? AND end_at>=?";sup_args=[now(),now()]
+    if site_id is not None:sup_sql+=' AND (site_id=? OR site_id IS NULL)';sup_args.append(site_id)
+    suppressions=int(conn.execute(sup_sql,sup_args).fetchone()[0])
+    quality=_telemetry_quality_summary(conn,24,site_id)
+    return {'active_alarms':active_alarms,'critical_alarms':critical,'telemetry_channels':channels,'stale_channels_24h':stale,
+            'open_incidents':incidents,'active_suppressions':suppressions,'data_quality':quality}
 
 def _ensure_work_sla(conn,work_order_id:int,force:bool=False):
     w=conn.execute('SELECT id,priority,status,created_at,actual_start,actual_finish FROM work_orders WHERE id=?',(work_order_id,)).fetchone()
@@ -610,9 +911,17 @@ def _execute_automation(conn, actor_id:int, trigger_source='manual', as_of:Optio
                 critical_health+=1
                 notify_once(conn,'Critical asset health',f"{h['asset_no']} — {h['name']} health score {h['score']}",'Critical',None,'asset_manager','assets',h['asset_no']+':health')
         expired=conn.execute('UPDATE approval_delegations SET active=0 WHERE active=1 AND end_at<?',(now(),)).rowcount
+        expired_suppressions=conn.execute('UPDATE alarm_suppressions SET active=0 WHERE active=1 AND end_at<?',(now(),)).rowcount
+        expired_shelves=conn.execute("UPDATE alarm_shelves SET status='Expired' WHERE status='Approved' AND end_at<=?",(now(),)).rowcount
+        stale_telemetry_alerts=0;stale_cut=(datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds')
+        for ch in rows(conn.execute("SELECT tc.channel_code,tc.name,a.asset_no FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id WHERE tc.active=1 AND (tc.last_reading_at IS NULL OR tc.last_reading_at<?)",(stale_cut,))):
+            stale_telemetry_alerts += int(notify_once(conn,'Stale telemetry',f"{ch['channel_code']} — {ch['asset_no']} {ch['name']} has no good recent data",'Warning',None,'maintenance_manager','commandcenter',ch['channel_code']+':stale'))
+        correlated=0
+        for alarm_row in rows(conn.execute("SELECT oa.id FROM operational_alarms oa WHERE oa.status IN ('Open','Acknowledged') AND NOT EXISTS (SELECT 1 FROM alarm_incident_members m WHERE m.alarm_id=oa.id)")):
+            _correlate_alarm(conn,alarm_row['id'],actor_id);correlated+=1
         outbox=_process_outbox(conn)
         health_avg=round(sum(x['score'] for x in health_results)/max(len(health_results),1),1)
-        summary={'pm_work_orders':len(pm),'reorder_requisitions':len(reorders),'overdue_alerts':overdue_alerts,'warranty_alerts':warranty_alerts,'contract_alerts':contract_alerts,'approval_alerts':approval_alerts,'sla_response_breaches':sla['response_breaches'],'sla_resolution_breaches':sla['resolution_breaches'],'asset_health_average':health_avg,'critical_health_assets':critical_health,'delegations_expired':expired,'outbox_delivered':outbox['delivered'],'outbox_failed':outbox['failed'],'outbox_skipped':outbox['skipped']}
+        summary={'pm_work_orders':len(pm),'reorder_requisitions':len(reorders),'overdue_alerts':overdue_alerts,'warranty_alerts':warranty_alerts,'contract_alerts':contract_alerts,'approval_alerts':approval_alerts,'sla_response_breaches':sla['response_breaches'],'sla_resolution_breaches':sla['resolution_breaches'],'asset_health_average':health_avg,'critical_health_assets':critical_health,'delegations_expired':expired,'alarm_suppressions_expired':expired_suppressions,'alarm_shelves_expired':expired_shelves,'stale_telemetry_alerts':stale_telemetry_alerts,'alarms_correlated':correlated,'outbox_delivered':outbox['delivered'],'outbox_failed':outbox['failed'],'outbox_skipped':outbox['skipped']}
         conn.execute('RELEASE SAVEPOINT automation_payload')
         conn.execute("UPDATE job_runs SET status='Succeeded',finished_at=?,summary_json=? WHERE id=?",(now(),json.dumps(summary),run_id));audit(conn,actor_id,'RUN','Automation',run_no,'',summary)
         return {'id':run_id,'run_no':run_no,'status':'Succeeded','as_of':target.isoformat(),'summary':summary}
@@ -685,7 +994,8 @@ class ProjectTaskPatch(BaseModel):
 class HSEPatch(BaseModel):
     status:Optional[str]=None; corrective_action:Optional[str]=None; severity:Optional[int]=Field(default=None,ge=1,le=5); probability:Optional[int]=Field(default=None,ge=1,le=5)
 class UserStatusIn(BaseModel): active:bool
-class ApprovalDecisionIn(BaseModel): decision:str; comments:str=''
+class ApprovalDecisionIn(BaseModel):
+    decision:str; comments:str=''; current_password:str=''; signer_intent:str=Field(default='',max_length=240)
 class ApprovalDelegationIn(BaseModel):
     delegate_user_id:int; module:str='*'; start_at:str; end_at:str
 class WorkRequirementIn(BaseModel):
@@ -713,15 +1023,42 @@ class TelemetryChannelPatch(BaseModel):
     name:Optional[str]=None; metric_type:Optional[str]=None; unit:Optional[str]=None; source_system:Optional[str]=None
     warning_low:Optional[float]=None; critical_low:Optional[float]=None; warning_high:Optional[float]=None; critical_high:Optional[float]=None; active:Optional[bool]=None
 class TelemetryReadingItem(BaseModel):
-    channel_code:str; value:float; captured_at:Optional[str]=None; quality:str='Good'; source:Optional[str]=None
+    channel_code:str; value:float; captured_at:Optional[str]=None; quality:str='Good'; source:Optional[str]=None; external_id:Optional[str]=Field(default=None,max_length=160)
 class TelemetryIngestIn(BaseModel):
-    readings:list[TelemetryReadingItem]=Field(min_length=1,max_length=500)
+    readings:list[TelemetryReadingItem]=Field(min_length=1,max_length=500); source_system:str='API'; idempotency_key:Optional[str]=Field(default=None,max_length=160)
+class IntegrationKeyIn(BaseModel):
+    name:str=Field(min_length=3,max_length=120); expires_at:Optional[str]=None
+class AlarmSuppressionIn(BaseModel):
+    site_id:Optional[int]=None; asset_id:Optional[int]=None; channel_id:Optional[int]=None; reason:str=Field(min_length=3,max_length=500); start_at:str; end_at:str
+class AlarmShelfIn(BaseModel):
+    reason:str=Field(min_length=10,max_length=500); duration_minutes:int=Field(ge=5,le=1440)
+class AssetTopologyLinkIn(BaseModel):
+    upstream_asset_id:int; downstream_asset_id:int; relation_type:str=Field(default='Feeds',min_length=3,max_length=80); notes:str=Field(default='',max_length=500)
+class IncidentTransitionIn(BaseModel):
+    notes:str=''
+class IncidentWorkOrderIn(BaseModel):
+    assigned_to:Optional[int]=None; supervisor_id:Optional[int]=None; target_finish:Optional[str]=None; notes:str=''
 class AlarmWorkOrderIn(BaseModel):
     assigned_to:Optional[int]=None; supervisor_id:Optional[int]=None; target_finish:Optional[str]=None; notes:str=''
 class DispatchIn(BaseModel):
     technician_user_id:int; eta_minutes:Optional[int]=Field(default=None,ge=0,le=1440); notes:str=''
 class DispatchTransitionIn(BaseModel):
     action:str; notes:str=''
+class FieldSyncOperationIn(BaseModel):
+    operation_id:str=Field(min_length=8,max_length=160)
+    entity_type:str=Field(min_length=3,max_length=40)
+    entity_id:int=Field(gt=0)
+    operation_type:str=Field(min_length=3,max_length=40)
+    base_hash:str=Field(default='',max_length=128)
+    payload:dict=Field(default_factory=dict)
+    client_created_at:Optional[str]=None
+class FieldSyncPushIn(BaseModel):
+    client_id:str=Field(min_length=8,max_length=128)
+    device_name:str=Field(default='',max_length=120)
+    operations:list[FieldSyncOperationIn]=Field(min_length=1,max_length=100)
+class FieldSyncResolveIn(BaseModel):
+    resolution:str=Field(pattern='^(discard|retry)$')
+    expected_server_hash:str=Field(default='',max_length=128)
 
 @app.get('/api/health')
 def health():
@@ -748,10 +1085,10 @@ def login(body:LoginIn, request:Request):
             _login_failure(key)
             raise HTTPException(401,'Invalid username or password')
         _login_success(key)
-        token=secrets.token_urlsafe(36)
-        conn.execute('INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)',(token,r['id'],now(),(datetime.now()+timedelta(hours=SESSION_HOURS)).isoformat(timespec='seconds')))
+        token=secrets.token_urlsafe(36);expires_at=(datetime.now()+timedelta(hours=SESSION_HOURS)).isoformat(timespec='seconds')
+        conn.execute('INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)',(token,r['id'],now(),expires_at))
         audit(conn,r['id'],'LOGIN','Authentication',r['username'],'','Successful login')
-        return {'token':token,'user':{'id':r['id'],'username':r['username'],'full_name':r['full_name'],'email':r['email'],'department':r['department'],'phone':r['phone'],'role':r['role'],'role_name':r['role_name']}}
+        return {'token':token,'expires_at':expires_at,'user':{'id':r['id'],'username':r['username'],'full_name':r['full_name'],'email':r['email'],'department':r['department'],'phone':r['phone'],'role':r['role'],'role_name':r['role_name']}}
 
 @app.post('/api/auth/logout')
 def logout(authorization:Optional[str]=Header(None), user=Depends(current_user)):
@@ -807,11 +1144,13 @@ def revoke_other_sessions(authorization:Optional[str]=Header(None),user=Depends(
 
 
 # ---------- approvals / workflow ----------
-APPROVAL_SELECT="""SELECT ap.*,req.full_name requested_by_name,dec.full_name decided_by_name,ass.full_name assigned_user_name
+APPROVAL_SELECT="""SELECT ap.*,req.full_name requested_by_name,dec.full_name decided_by_name,ass.full_name assigned_user_name,
+sig.evidence_no,sig.signed_at,sig.evidence_hash,sig.credential_verified,sig.delegated_authority,sig.intent_statement
 FROM approval_requests ap
 JOIN users req ON req.id=ap.requested_by
 LEFT JOIN users dec ON dec.id=ap.decided_by
-LEFT JOIN users ass ON ass.id=ap.assigned_user_id"""
+LEFT JOIN users ass ON ass.id=ap.assigned_user_id
+LEFT JOIN approval_signature_evidence sig ON sig.approval_id=ap.id"""
 
 @app.get('/api/approvals')
 def list_approvals(status:str='Pending',module:str='',user=Depends(current_user)):
@@ -836,26 +1175,71 @@ def decide_approval(approval_id:int,body:ApprovalDecisionIn,user=Depends(current
     with db() as conn:
         ap=get_or_404(conn,'SELECT * FROM approval_requests WHERE id=?',(approval_id,),'Approval request not found')
         if ap['status']!='Pending':raise HTTPException(409,'Approval request is already decided')
-        allowed=user['role'] in ('admin','maintenance_manager') or ap['assigned_user_id']==user['id'] or (ap['assigned_role'] and ap['assigned_role']==user['role']) or _delegation_active(conn,ap,user['id'])
+        delegated=_delegation_active(conn,ap,user['id'])
+        allowed=user['role'] in ('admin','maintenance_manager') or ap['assigned_user_id']==user['id'] or (ap['assigned_role'] and ap['assigned_role']==user['role']) or delegated
         if not allowed:raise HTTPException(403,'This approval is not assigned to your role or user')
         target='Approved' if decision=='approve' else 'Rejected'
         if ap['record_type']=='work_order':
             rec=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(ap['record_id'],),'Work order not found')
             if rec['status']!='Submitted':raise HTTPException(409,f"Work order is {rec['status']}, not Submitted")
+        elif ap['record_type']=='purchase_requisition':
+            rec=get_or_404(conn,'SELECT * FROM purchase_requisitions WHERE id=?',(ap['record_id'],),'Purchase requisition not found')
+            if rec['status']!='Submitted':raise HTTPException(409,f"Purchase requisition is {rec['status']}, not Submitted")
+        elif ap['record_type']=='alarm_shelf':
+            rec=get_or_404(conn,'SELECT sh.*,oa.alarm_no,oa.status alarm_status,oa.severity FROM alarm_shelves sh JOIN operational_alarms oa ON oa.id=sh.alarm_id WHERE sh.id=?',(ap['record_id'],),'Alarm shelf request not found')
+            if rec['status']!='Pending':raise HTTPException(409,f"Alarm shelf request is {rec['status']}, not Pending")
+            if ap['requested_by']==user['id']:raise HTTPException(403,'Alarm shelving requires approval by a different authorized user')
+        else:
+            raise HTTPException(400,'Unsupported approval record type')
+
+        expected_intent=_approval_expected_intent(decision,ap['record_code'])
+        if body.signer_intent.strip()!=expected_intent:
+            raise HTTPException(400,f'Electronic signature intent must exactly match: {expected_intent}')
+        pwd=conn.execute('SELECT password_hash FROM users WHERE id=? AND active=1',(user['id'],)).fetchone()
+        if not pwd or not body.current_password or not verify_password(body.current_password,pwd['password_hash']):
+            raise HTTPException(401,'Electronic signature re-authentication failed')
+
+        if ap['record_type']=='work_order':
             conn.execute('UPDATE work_orders SET status=?,updated_at=? WHERE id=?',(target,now(),rec['id']))
             workflow_event(conn,'Work Management','work_order',rec['id'],rec['wo_no'],decision.upper(),rec['status'],target,user['id'],body.comments)
             audit(conn,user['id'],decision.upper(),'Work Management',rec['wo_no'],rec['status'],target)
         elif ap['record_type']=='purchase_requisition':
-            rec=get_or_404(conn,'SELECT * FROM purchase_requisitions WHERE id=?',(ap['record_id'],),'Purchase requisition not found')
-            if rec['status']!='Submitted':raise HTTPException(409,f"Purchase requisition is {rec['status']}, not Submitted")
             conn.execute('UPDATE purchase_requisitions SET status=?,approved_at=? WHERE id=?',(target,now() if target=='Approved' else None,rec['id']))
             workflow_event(conn,'Procurement','purchase_requisition',rec['id'],rec['pr_no'],decision.upper(),rec['status'],target,user['id'],body.comments)
             audit(conn,user['id'],decision.upper(),'Procurement',rec['pr_no'],rec['status'],target)
-        else:
-            raise HTTPException(400,'Unsupported approval record type')
+        elif ap['record_type']=='alarm_shelf':
+            stamp=now()
+            if target=='Approved':
+                end=(_dt(stamp)+timedelta(minutes=rec['duration_minutes'])).isoformat(timespec='seconds')
+                conn.execute("UPDATE alarm_shelves SET status='Approved',approved_by=?,approved_at=?,start_at=?,end_at=?,decision_comments=? WHERE id=?",(user['id'],stamp,stamp,end,body.comments,rec['id']))
+                emit_event(conn,'operations.alarm_shelf.approved','alarm_shelf',rec['shelf_no'],{'shelf_no':rec['shelf_no'],'alarm_no':rec['alarm_no'],'end_at':end})
+            else:
+                conn.execute("UPDATE alarm_shelves SET status='Rejected',rejected_by=?,rejected_at=?,decision_comments=? WHERE id=?",(user['id'],stamp,body.comments,rec['id']))
+                emit_event(conn,'operations.alarm_shelf.rejected','alarm_shelf',rec['shelf_no'],{'shelf_no':rec['shelf_no'],'alarm_no':rec['alarm_no']})
+            audit(conn,user['id'],decision.upper()+' ALARM SHELF','Utilities Operations',rec['shelf_no'],rec['status'],target)
+
         resolve_approval(conn,ap['module'],ap['record_type'],ap['record_id'],decision,user['id'],body.comments)
-        notify(conn,'Approval decision',f"{ap['record_code']} was {target.lower()}",'Info',ap['requested_by'],None,'work' if ap['record_type']=='work_order' else 'procurement',ap['record_code'])
-        return {'ok':True,'status':target,'record_code':ap['record_code']}
+        snapshot=_approval_target_snapshot(conn,ap)
+        evidence=_record_approval_signature(conn,ap,target,user,body.signer_intent.strip(),body.comments,delegated,snapshot)
+        audit(conn,user['id'],'E-SIGN '+decision.upper(),'Approvals',ap['approval_no'],'',{'evidence_no':evidence['evidence_no'],'record_code':ap['record_code'],'evidence_hash':evidence['evidence_hash']})
+        module_link='commandcenter' if ap['record_type']=='alarm_shelf' else ('work' if ap['record_type']=='work_order' else 'procurement')
+        notify(conn,'Approval decision',f"{ap['record_code']} was {target.lower()} and electronically signed",'Info',ap['requested_by'],None,module_link,ap['record_code'])
+        return {'ok':True,'status':target,'record_code':ap['record_code'],'signature_evidence':evidence}
+
+@app.get('/api/approvals/{approval_id}/signature-evidence')
+def approval_signature_evidence(approval_id:int,user=Depends(current_user)):
+    with db() as conn:
+        ap=get_or_404(conn,'SELECT * FROM approval_requests WHERE id=?',(approval_id,),'Approval request not found')
+        visible=user['role'] in ('admin','maintenance_manager','executive') or ap['requested_by']==user['id'] or ap['assigned_user_id']==user['id'] or (ap['assigned_role'] and ap['assigned_role']==user['role']) or ap.get('decided_by')==user['id'] or _delegation_active(conn,ap,user['id'])
+        if not visible:raise HTTPException(403,'Approval evidence is not visible to this user')
+        evidence=get_or_404(conn,'SELECT * FROM approval_signature_evidence WHERE approval_id=?',(approval_id,),'Electronic signature evidence not found')
+        evidence['payload']=json.loads(evidence['payload_json'])
+        evidence.pop('payload_json',None)
+        return evidence
+
+@app.get('/api/approval-signatures/verify')
+def approval_signature_integrity(user=Depends(require_roles('admin','maintenance_manager','executive'))):
+    with db() as conn:return verify_approval_signature_chain(conn)
 
 @app.get('/api/approval-delegations')
 def list_approval_delegations(user=Depends(current_user)):
@@ -1014,7 +1398,7 @@ def list_workflow_events(module:str='',record_type:str='',record_id:Optional[int
 @app.get('/api/launchpad')
 def launchpad(user=Depends(current_user)):
     apps=[
-      ('assets','Asset Management','Enterprise asset registry & hierarchy','AS'),('work','Work Management','Plan, assign and execute work','WO'),('maintenance','Preventive Maintenance','Calendar, meter and condition plans','PM'),('workforce','Workforce Planning','Crafts, shifts, absences and capacity','WF'),('inventory','Inventory','Spares, warehouses and transactions','IN'),('procurement','Procurement','PR, approval, PO and receipt','PO'),('approvals','Approval Center','Unified operational approval queue','AP'),('operations','Utilities Operations','Electrical, water and infrastructure','OP'),('telemetry','Telemetry & Alarms','SCADA-style readings, thresholds and alarm response','TM'),('field','Field Service','Technician mobile workspace','FS'),('dispatch','Technician Dispatch','Dispatch board, ETA and field arrival','DP'),('map','GIS / Locations','Sites, assets, work and alerts','GI'),('inspections','Inspection Management','Digital inspection forms','IP'),('hse','Safety & HSE','Incidents, hazards and actions','HS'),('contracts','Contracts','Utility service and supply agreements','CT'),('vendors','Vendors','Supplier and OEM management','VN'),('projects','Projects','Budgets, progress and milestones','PJ'),('documents','Documents','Technical records and attachments','DC'),('analytics','Analytics','Reliability, cost and performance','AN'),('automation','Automation & Reports','Scheduled controls, exports, backups and observability','AU'),('administration','Administration','Users, RBAC and audit','AD')]
+      ('assets','Asset Management','Enterprise asset registry & hierarchy','AS'),('work','Work Management','Plan, assign and execute work','WO'),('maintenance','Preventive Maintenance','Calendar, meter and condition plans','PM'),('workforce','Workforce Planning','Crafts, shifts, absences and capacity','WF'),('inventory','Inventory','Spares, warehouses and transactions','IN'),('procurement','Procurement','PR, approval, PO and receipt','PO'),('approvals','Approval Center','Unified operational approval queue','AP'),('operations','Utilities Operations','Electrical, water and infrastructure','OP'),('commandcenter','Utility Command Center','Correlated incidents, outages, dispatch and telemetry quality','CC'),('telemetry','Telemetry & Alarms','SCADA-style readings, thresholds and alarm response','TM'),('field','Field Service','Technician mobile workspace','FS'),('dispatch','Technician Dispatch','Dispatch board, ETA and field arrival','DP'),('map','GIS / Locations','Sites, assets, work and alerts','GI'),('inspections','Inspection Management','Digital inspection forms','IP'),('hse','Safety & HSE','Incidents, hazards and actions','HS'),('contracts','Contracts','Utility service and supply agreements','CT'),('vendors','Vendors','Supplier and OEM management','VN'),('projects','Projects','Budgets, progress and milestones','PJ'),('documents','Documents','Technical records and attachments','DC'),('analytics','Analytics','Reliability, cost and performance','AN'),('automation','Automation & Reports','Scheduled controls, exports, backups and observability','AU'),('administration','Administration','Users, RBAC and audit','AD')]
     return [{'code':a[0],'name':a[1],'description':a[2],'icon':a[3]} for a in apps]
 
 @app.get('/api/dashboard')
@@ -1046,6 +1430,10 @@ def dashboard(site_id:Optional[int]=None,as_of:Optional[str]=None,user=Depends(c
         if site_id:
             alarm_sql+=' AND site_id=?';alarm_args=[site_id];crit_alarm_sql+=' AND site_id=?';crit_alarm_args=[site_id]
         active_alarms=conn.execute(alarm_sql,alarm_args).fetchone()[0];critical_alarms=conn.execute(crit_alarm_sql,crit_alarm_args).fetchone()[0]
+        inc_sql="SELECT COUNT(*) FROM alarm_incidents WHERE status IN ('Open','Acknowledged')";inc_args=[]
+        if site_id:inc_sql+=' AND site_id=?';inc_args=[site_id]
+        open_alarm_incidents=conn.execute(inc_sql,inc_args).fetchone()[0]
+        data_quality=_telemetry_quality_summary(conn,24,site_id)
         pm_total=conn.execute('SELECT COUNT(*) FROM maintenance_plans WHERE active=1').fetchone()[0]
         pm_over=conn.execute("SELECT COUNT(*) FROM maintenance_plans WHERE active=1 AND trigger_type='Calendar' AND next_due IS NOT NULL AND next_due<?",(asof,)).fetchone()[0]
         pm_compliance=round(100*(pm_total-pm_over)/pm_total,1) if pm_total else 100
@@ -1059,7 +1447,7 @@ def dashboard(site_id:Optional[int]=None,as_of:Optional[str]=None,user=Depends(c
         for x in asset_ids:health_scores.append(_asset_health(conn,x['id'])['score'])
         portfolio_health=round(sum(health_scores)/max(len(health_scores),1),1)
         forecast=_maintenance_forecast(conn,90,site_id)
-        return {'kpis':{'total_assets':asset_total,'operating_assets':operating,'assets_under_maintenance':maintenance,'critical_assets':critical,'open_work_orders':openwo,'emergency_work_orders':emergency,'overdue_work_orders':overdue,'completed_work_orders':completed,'pm_compliance':pm_compliance,'mttr':round(avg_repair,1),'mtbf':round(mtbf,1) if mtbf is not None else None,'inventory_value':round(inv_value,2),'low_stock_items':low,'pending_purchase_orders':po_pending,'active_technicians':forecast['technicians'],'safety_incidents':incidents,'open_outages':open_outages,'active_dispatches':active_dispatches,'active_alarms':active_alarms,'critical_alarms':critical_alarms,'maintenance_cost':round(sum(x['cost'] for x in costs),2),'utility_performance':round(100*operating/max(asset_total,1),1),'asset_health_score':portfolio_health,'forecast_demand_hours_90d':forecast['summary']['demand_hours'],'forecast_peak_utilization':forecast['summary']['peak_utilization_pct'],'parts_shortage_jobs_90d':forecast['summary']['parts_shortage_jobs']},'wo_by_status':statuses,'asset_health':health,'cost_by_asset':costs,'recent_activity':recent}
+        return {'kpis':{'total_assets':asset_total,'operating_assets':operating,'assets_under_maintenance':maintenance,'critical_assets':critical,'open_work_orders':openwo,'emergency_work_orders':emergency,'overdue_work_orders':overdue,'completed_work_orders':completed,'pm_compliance':pm_compliance,'mttr':round(avg_repair,1),'mtbf':round(mtbf,1) if mtbf is not None else None,'inventory_value':round(inv_value,2),'low_stock_items':low,'pending_purchase_orders':po_pending,'active_technicians':forecast['technicians'],'safety_incidents':incidents,'open_outages':open_outages,'active_dispatches':active_dispatches,'active_alarms':active_alarms,'critical_alarms':critical_alarms,'open_alarm_incidents':open_alarm_incidents,'telemetry_good_percent':data_quality['good_percent'],'telemetry_bad_quality':data_quality['bad'],'maintenance_cost':round(sum(x['cost'] for x in costs),2),'utility_performance':round(100*operating/max(asset_total,1),1),'asset_health_score':portfolio_health,'forecast_demand_hours_90d':forecast['summary']['demand_hours'],'forecast_peak_utilization':forecast['summary']['peak_utilization_pct'],'parts_shortage_jobs_90d':forecast['summary']['parts_shortage_jobs']},'wo_by_status':statuses,'asset_health':health,'cost_by_asset':costs,'recent_activity':recent}
 
 # ---------- reference / operations / map ----------
 @app.get('/api/reference')
@@ -1086,6 +1474,33 @@ def map_data(user=Depends(current_user)):
         return sites
 
 # ---------- utility telemetry & operational alarms ----------
+@app.get('/api/integrations/api-keys')
+def integration_api_keys(user=Depends(require_roles('admin'))):
+    with db() as conn:
+        return rows(conn.execute("""SELECT k.id,k.key_no,k.name,k.scope,k.active,k.created_at,k.last_used_at,k.expires_at,u.full_name created_by_name
+          FROM integration_api_keys k JOIN users u ON u.id=k.created_by ORDER BY k.id DESC"""))
+
+@app.post('/api/integrations/api-keys')
+def create_integration_api_key(body:IntegrationKeyIn,user=Depends(require_roles('admin'))):
+    if body.expires_at:
+        try:
+            if _dt(body.expires_at)<=datetime.now():raise HTTPException(422,'API key expiry must be in the future')
+        except HTTPException:raise
+        except Exception:raise HTTPException(422,'Invalid API key expiry')
+    raw='euas_'+secrets.token_urlsafe(32);digest=hashlib.sha256(raw.encode()).hexdigest()
+    with db() as conn:
+        no=next_no(conn,'integration_api_keys','key_no','KEY-',7001)
+        cur=conn.execute("INSERT INTO integration_api_keys(key_no,name,key_hash,scope,active,created_by,created_at,expires_at) VALUES(?,?,?,'telemetry:write',1,?,?,?)",(no,body.name,digest,user['id'],now(),body.expires_at))
+        audit(conn,user['id'],'CREATE API KEY','Integrations',no,'',{'name':body.name,'scope':'telemetry:write','expires_at':body.expires_at})
+        return {'id':cur.lastrowid,'key_no':no,'name':body.name,'scope':'telemetry:write','api_key':raw,'warning':'This plaintext key is shown once. Store it securely.'}
+
+@app.post('/api/integrations/api-keys/{key_id}/revoke')
+def revoke_integration_api_key(key_id:int,user=Depends(require_roles('admin'))):
+    with db() as conn:
+        key=get_or_404(conn,'SELECT * FROM integration_api_keys WHERE id=?',(key_id,),'Integration API key not found')
+        if not key['active']:return {'ok':True,'active':False}
+        conn.execute('UPDATE integration_api_keys SET active=0 WHERE id=?',(key_id,));audit(conn,user['id'],'REVOKE API KEY','Integrations',key['key_no'],'Active','Revoked');return {'ok':True,'active':False}
+
 @app.get('/api/telemetry/channels')
 def telemetry_channels(asset_id:Optional[int]=None,site_id:Optional[int]=None,q:str='',user=Depends(current_user)):
     sql="SELECT tc.*,a.asset_no,a.name asset_name,s.id site_id,s.site_code,s.name site_name FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE 1=1";args=[]
@@ -1116,19 +1531,46 @@ def update_telemetry_channel(channel_id:int,body:TelemetryChannelPatch,user=Depe
         return {'ok':True}
 
 @app.post('/api/telemetry/ingest')
-def ingest_telemetry(body:TelemetryIngestIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor','technician'))):
-    summary={'accepted':0,'alarms_opened':0,'alarms_updated':0,'alarms_cleared':0,'normal':0,'results':[]}
+def ingest_telemetry(body:TelemetryIngestIn,user=Depends(telemetry_ingest_principal)):
+    summary={'accepted':0,'duplicates':0,'bad_quality':0,'quality_ignored':0,'suppressed':0,'alarms_opened':0,'alarms_updated':0,'alarms_cleared':0,'normal':0,'results':[]}
     with db() as conn:
+        if body.idempotency_key:
+            previous=conn.execute('SELECT * FROM telemetry_ingest_batches WHERE idempotency_key=?',(body.idempotency_key,)).fetchone()
+            if previous:
+                return {'batch_no':previous['batch_no'],'idempotent_replay':True,'accepted':previous['accepted_count'],'duplicates':previous['duplicate_count'],
+                        'bad_quality':previous['bad_quality_count'],'suppressed':previous['suppressed_count'],'alarms_opened':previous['alarms_opened'],
+                        'alarms_updated':previous['alarms_updated'],'alarms_cleared':previous['alarms_cleared'],'normal':0,'results':[]}
+        batch_no=next_no(conn,'telemetry_ingest_batches','batch_no','TIB-',70001)
+        cur=conn.execute("""INSERT INTO telemetry_ingest_batches(batch_no,source_system,idempotency_key,received_count,ingested_by,started_at)
+          VALUES(?,?,?,?,?,?)""",(batch_no,body.source_system or 'API',body.idempotency_key,len(body.readings),user['id'],now()))
+        batch_id=cur.lastrowid
         for reading in body.readings:
-            c=get_or_404(conn,'SELECT * FROM telemetry_channels WHERE channel_code=? AND active=1',(reading.channel_code.strip().upper(),),f'Telemetry channel {reading.channel_code} not found or inactive')
-            captured=reading.captured_at or now();source=reading.source or c['source_system'] or 'Manual'
-            conn.execute('INSERT INTO telemetry_readings(channel_id,value,quality,source,captured_at,ingested_at,ingested_by) VALUES(?,?,?,?,?,?,?)',(c['id'],reading.value,reading.quality,source,captured,now(),user['id']))
-            conn.execute('UPDATE telemetry_channels SET last_value=?,last_quality=?,last_reading_at=?,updated_at=? WHERE id=?',(reading.value,reading.quality,captured,now(),c['id']))
-            c=dict(c);result=_evaluate_telemetry_alarm(conn,c,float(reading.value),captured,user['id']);summary['accepted']+=1;summary['results'].append({'channel_code':c['channel_code'],'value':reading.value,**result})
-            key='alarms_'+result['action'] if result['action'] in ('opened','updated','cleared') else 'normal';summary[key]+=1
-        emit_event(conn,'operations.telemetry.ingested','telemetry','batch',{'accepted':summary['accepted'],'alarms_opened':summary['alarms_opened'],'alarms_updated':summary['alarms_updated'],'alarms_cleared':summary['alarms_cleared']})
-        audit(conn,user['id'],'INGEST TELEMETRY','Utilities Operations','batch','',{'accepted':summary['accepted'],'alarms_opened':summary['alarms_opened'],'alarms_cleared':summary['alarms_cleared']})
-        return summary
+            code=reading.channel_code.strip().upper()
+            c=get_or_404(conn,'SELECT * FROM telemetry_channels WHERE channel_code=? AND active=1',(code,),f'Telemetry channel {reading.channel_code} not found or inactive')
+            captured=reading.captured_at or now();source=reading.source or body.source_system or c['source_system'] or 'Manual';quality=_normalize_quality(reading.quality)
+            if reading.external_id:
+                duplicate=conn.execute('SELECT id FROM telemetry_readings WHERE channel_id=? AND external_id=?',(c['id'],reading.external_id)).fetchone()
+                if duplicate:
+                    summary['duplicates']+=1;summary['results'].append({'channel_code':code,'value':reading.value,'action':'duplicate','external_id':reading.external_id});continue
+            conn.execute('INSERT INTO telemetry_readings(channel_id,value,quality,source,captured_at,ingested_at,ingested_by,external_id,batch_id) VALUES(?,?,?,?,?,?,?,?,?)',(c['id'],reading.value,quality,source,captured,now(),user['id'],reading.external_id,batch_id))
+            conn.execute('UPDATE telemetry_channels SET last_value=?,last_quality=?,last_reading_at=?,updated_at=? WHERE id=?',(reading.value,quality,captured,now(),c['id']))
+            summary['accepted']+=1
+            if quality!='Good':
+                if quality=='Bad':summary['bad_quality']+=1
+                summary['quality_ignored']+=1
+                result={'action':'quality_ignored','alarm_id':None,'alarm_no':None,'severity':None,'quality':quality}
+            else:
+                result=_evaluate_telemetry_alarm(conn,dict(c),float(reading.value),captured,user['id'])
+            summary['results'].append({'channel_code':c['channel_code'],'value':reading.value,'quality':quality,'external_id':reading.external_id,**result})
+            if result['action'] in ('opened','updated','cleared'):
+                summary['alarms_'+result['action']]+=1
+            elif result['action']=='suppressed':summary['suppressed']+=1
+            elif result['action']=='normal':summary['normal']+=1
+        conn.execute("""UPDATE telemetry_ingest_batches SET accepted_count=?,duplicate_count=?,bad_quality_count=?,alarms_opened=?,alarms_updated=?,alarms_cleared=?,suppressed_count=?,completed_at=? WHERE id=?""",
+          (summary['accepted'],summary['duplicates'],summary['bad_quality'],summary['alarms_opened'],summary['alarms_updated'],summary['alarms_cleared'],summary['suppressed'],now(),batch_id))
+        emit_event(conn,'operations.telemetry.ingested','telemetry',batch_no,{'batch_no':batch_no,'accepted':summary['accepted'],'duplicates':summary['duplicates'],'bad_quality':summary['bad_quality'],'suppressed':summary['suppressed'],'alarms_opened':summary['alarms_opened'],'alarms_updated':summary['alarms_updated'],'alarms_cleared':summary['alarms_cleared']})
+        audit(conn,user['id'],'INGEST TELEMETRY','Utilities Operations',batch_no,'',{'accepted':summary['accepted'],'duplicates':summary['duplicates'],'bad_quality':summary['bad_quality'],'suppressed':summary['suppressed'],'alarms_opened':summary['alarms_opened'],'alarms_cleared':summary['alarms_cleared']})
+        return {'batch_no':batch_no,'idempotent_replay':False,**summary}
 
 @app.get('/api/telemetry/readings')
 def telemetry_readings(channel_id:Optional[int]=None,asset_id:Optional[int]=None,hours:int=Query(24,ge=1,le=8760),limit:int=Query(500,ge=1,le=5000),user=Depends(current_user)):
@@ -1139,6 +1581,190 @@ def telemetry_readings(channel_id:Optional[int]=None,asset_id:Optional[int]=None
     sql+=' ORDER BY tr.captured_at DESC LIMIT ?';args.append(limit)
     with db() as conn:return rows(conn.execute(sql,args))
 
+@app.get('/api/telemetry/batches')
+def telemetry_batches(limit:int=Query(100,ge=1,le=500),user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','executive'))):
+    with db() as conn:return rows(conn.execute("""SELECT b.*,u.full_name ingested_by_name FROM telemetry_ingest_batches b
+      LEFT JOIN users u ON u.id=b.ingested_by ORDER BY b.id DESC LIMIT ?""",(limit,)))
+
+@app.get('/api/telemetry/quality')
+def telemetry_quality(hours:int=Query(24,ge=1,le=8760),site_id:Optional[int]=None,user=Depends(current_user)):
+    with db() as conn:
+        q=_telemetry_quality_summary(conn,hours,site_id)
+        cutoff=(datetime.now()-timedelta(hours=hours)).isoformat(timespec='seconds')
+        sql="""SELECT tr.source,COUNT(*) count FROM telemetry_readings tr JOIN telemetry_channels tc ON tc.id=tr.channel_id
+          JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id
+          WHERE tr.captured_at>=?""";args=[cutoff]
+        if site_id is not None:sql+=' AND s.id=?';args.append(site_id)
+        sql+=' GROUP BY tr.source ORDER BY count DESC';q['sources']=rows(conn.execute(sql,args));return q
+
+@app.get('/api/telemetry/series')
+def telemetry_series(channel_id:int,hours:int=Query(24,ge=1,le=8760),bucket_minutes:int=Query(60,ge=1,le=1440),user=Depends(current_user)):
+    with db() as conn:
+        channel=get_or_404(conn,"""SELECT tc.*,a.asset_no,a.name asset_name FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id WHERE tc.id=?""",(channel_id,),'Telemetry channel not found')
+        return {'channel':channel,'hours':hours,'bucket_minutes':bucket_minutes,'points':_telemetry_series(conn,channel_id,hours,bucket_minutes)}
+
+@app.get('/api/alarm-suppressions')
+def alarm_suppressions(active_only:bool=False,site_id:Optional[int]=None,user=Depends(current_user)):
+    sql="""SELECT sp.*,s.site_code,s.name site_name,a.asset_no,a.name asset_name,tc.channel_code,tc.name channel_name,u.full_name created_by_name
+      FROM alarm_suppressions sp LEFT JOIN sites s ON s.id=sp.site_id LEFT JOIN assets a ON a.id=sp.asset_id
+      LEFT JOIN telemetry_channels tc ON tc.id=sp.channel_id LEFT JOIN users u ON u.id=sp.created_by WHERE 1=1""";args=[]
+    if active_only:sql+=' AND sp.active=1 AND sp.start_at<=? AND sp.end_at>=?';args += [now(),now()]
+    if site_id is not None:sql+=' AND (sp.site_id=? OR s.id=?)';args += [site_id,site_id]
+    sql+=' ORDER BY sp.id DESC'
+    with db() as conn:return rows(conn.execute(sql,args))
+
+@app.post('/api/alarm-suppressions')
+def create_alarm_suppression(body:AlarmSuppressionIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor'))):
+    if not any((body.site_id,body.asset_id,body.channel_id)):raise HTTPException(422,'Suppression requires a site, asset or telemetry channel scope')
+    try:start=_dt(body.start_at);end=_dt(body.end_at)
+    except Exception:raise HTTPException(422,'Invalid suppression start/end date-time')
+    if end<=start:raise HTTPException(422,'Suppression end must be after start')
+    with db() as conn:
+        if body.site_id:get_or_404(conn,'SELECT id FROM sites WHERE id=?',(body.site_id,),'Site not found')
+        if body.asset_id:get_or_404(conn,'SELECT id FROM assets WHERE id=?',(body.asset_id,),'Asset not found')
+        if body.channel_id:get_or_404(conn,'SELECT id FROM telemetry_channels WHERE id=?',(body.channel_id,),'Telemetry channel not found')
+        no=next_no(conn,'alarm_suppressions','suppression_no','SUP-',65001)
+        cur=conn.execute("""INSERT INTO alarm_suppressions(suppression_no,site_id,asset_id,channel_id,reason,start_at,end_at,active,created_by,created_at)
+          VALUES(?,?,?,?,?,?,?,1,?,?)""",(no,body.site_id,body.asset_id,body.channel_id,body.reason,start.isoformat(timespec='seconds'),end.isoformat(timespec='seconds'),user['id'],now()))
+        audit(conn,user['id'],'CREATE SUPPRESSION','Utilities Operations',no,'',body.model_dump());emit_event(conn,'operations.alarm_suppression.created','alarm_suppression',no,{'suppression_no':no,'reason':body.reason,'start_at':body.start_at,'end_at':body.end_at})
+        return {'id':cur.lastrowid,'suppression_no':no}
+
+@app.post('/api/alarm-suppressions/{suppression_id}/deactivate')
+def deactivate_alarm_suppression(suppression_id:int,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor'))):
+    with db() as conn:
+        sp=get_or_404(conn,'SELECT * FROM alarm_suppressions WHERE id=?',(suppression_id,),'Suppression not found')
+        if not sp['active']:return {'ok':True,'active':False}
+        conn.execute('UPDATE alarm_suppressions SET active=0 WHERE id=?',(suppression_id,));audit(conn,user['id'],'DEACTIVATE SUPPRESSION','Utilities Operations',sp['suppression_no'],'Active','Inactive');return {'ok':True,'active':False}
+
+@app.get('/api/alarm-shelves')
+def alarm_shelves(status:str='',alarm_id:Optional[int]=None,active_only:bool=False,site_id:Optional[int]=None,user=Depends(current_user)):
+    sql="""SELECT sh.*,oa.alarm_no,oa.severity,oa.status alarm_status,a.asset_no,a.name asset_name,tc.channel_code,tc.name channel_name,
+      req.full_name requested_by_name,apr.full_name approved_by_name,rej.full_name rejected_by_name,rev.full_name revoked_by_name
+      FROM alarm_shelves sh JOIN operational_alarms oa ON oa.id=sh.alarm_id JOIN assets a ON a.id=oa.asset_id JOIN telemetry_channels tc ON tc.id=oa.channel_id
+      JOIN users req ON req.id=sh.requested_by LEFT JOIN users apr ON apr.id=sh.approved_by LEFT JOIN users rej ON rej.id=sh.rejected_by LEFT JOIN users rev ON rev.id=sh.revoked_by WHERE 1=1""";args=[]
+    if status:sql+=' AND sh.status=?';args.append(status)
+    if alarm_id is not None:sql+=' AND sh.alarm_id=?';args.append(alarm_id)
+    if active_only:sql+=" AND sh.status='Approved' AND sh.start_at<=? AND sh.end_at>? AND oa.status IN ('Open','Acknowledged')";args += [now(),now()]
+    if site_id is not None:sql+=' AND oa.site_id=?';args.append(site_id)
+    sql+=' ORDER BY sh.id DESC'
+    with db() as conn:return rows(conn.execute(sql,args))
+
+@app.post('/api/alarms/{alarm_id}/shelf')
+def request_alarm_shelf(alarm_id:int,body:AlarmShelfIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor','technician'))):
+    with db() as conn:
+        alarm=get_or_404(conn,'SELECT * FROM operational_alarms WHERE id=?',(alarm_id,),'Alarm not found')
+        if alarm['status'] not in ('Open','Acknowledged'):raise HTTPException(409,'Only active alarms can be shelved')
+        if alarm['severity']=='Critical' and body.duration_minutes>120:raise HTTPException(422,'Critical alarms can be shelved for at most 120 minutes')
+        existing=conn.execute("SELECT * FROM alarm_shelves WHERE alarm_id=? AND (status='Pending' OR (status='Approved' AND end_at>?)) ORDER BY id DESC LIMIT 1",(alarm_id,now())).fetchone()
+        if existing:raise HTTPException(409,f"Alarm already has {existing['status'].lower()} shelf request {existing['shelf_no']}")
+        no=next_no(conn,'alarm_shelves','shelf_no','SHF-',68001)
+        cur=conn.execute("INSERT INTO alarm_shelves(shelf_no,alarm_id,reason,duration_minutes,status,requested_by,requested_at) VALUES(?,?,?,?,'Pending',?,?)",(no,alarm_id,body.reason,body.duration_minutes,user['id'],now()))
+        create_approval(conn,'Utilities Operations','alarm_shelf',cur.lastrowid,no,f"Approve alarm shelf {no} — {alarm['alarm_no']}",user['id'],assigned_role='maintenance_manager')
+        emit_event(conn,'operations.alarm_shelf.requested','alarm_shelf',no,{'shelf_no':no,'alarm_no':alarm['alarm_no'],'duration_minutes':body.duration_minutes,'severity':alarm['severity']})
+        audit(conn,user['id'],'REQUEST ALARM SHELF','Utilities Operations',no,'',{'alarm_no':alarm['alarm_no'],'duration_minutes':body.duration_minutes,'reason':body.reason})
+        return {'id':cur.lastrowid,'shelf_no':no,'status':'Pending','approval_required':True}
+
+@app.post('/api/alarm-shelves/{shelf_id}/revoke')
+def revoke_alarm_shelf(shelf_id:int,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor'))):
+    with db() as conn:
+        sh=get_or_404(conn,'SELECT sh.*,oa.alarm_no FROM alarm_shelves sh JOIN operational_alarms oa ON oa.id=sh.alarm_id WHERE sh.id=?',(shelf_id,),'Alarm shelf not found')
+        if sh['status'] in ('Expired','Revoked','Rejected'):return {'ok':True,'status':sh['status']}
+        if sh['status']=='Pending':raise HTTPException(409,'Pending shelf requests must be approved or rejected in Approval Center')
+        conn.execute("UPDATE alarm_shelves SET status='Revoked',revoked_by=?,revoked_at=? WHERE id=?",(user['id'],now(),shelf_id))
+        emit_event(conn,'operations.alarm_shelf.revoked','alarm_shelf',sh['shelf_no'],{'shelf_no':sh['shelf_no'],'alarm_no':sh['alarm_no']});audit(conn,user['id'],'REVOKE ALARM SHELF','Utilities Operations',sh['shelf_no'],'Approved','Revoked')
+        return {'ok':True,'status':'Revoked'}
+
+@app.get('/api/asset-topology')
+def asset_topology(active_only:bool=True,site_id:Optional[int]=None,user=Depends(current_user)):
+    sql="""SELECT t.*,ua.asset_no upstream_asset_no,ua.name upstream_asset_name,da.asset_no downstream_asset_no,da.name downstream_asset_name,
+      us.id upstream_site_id,us.name upstream_site_name,ds.id downstream_site_id,ds.name downstream_site_name,u.full_name created_by_name
+      FROM asset_topology_links t JOIN assets ua ON ua.id=t.upstream_asset_id JOIN assets da ON da.id=t.downstream_asset_id
+      LEFT JOIN locations ul ON ul.id=ua.location_id LEFT JOIN sites us ON us.id=ul.site_id
+      LEFT JOIN locations dl ON dl.id=da.location_id LEFT JOIN sites ds ON ds.id=dl.site_id LEFT JOIN users u ON u.id=t.created_by WHERE 1=1""";args=[]
+    if active_only:sql+=' AND t.active=1'
+    if site_id is not None:sql+=' AND (us.id=? OR ds.id=?)';args += [site_id,site_id]
+    sql+=' ORDER BY t.link_no'
+    with db() as conn:return rows(conn.execute(sql,args))
+
+@app.post('/api/asset-topology')
+def create_asset_topology(body:AssetTopologyLinkIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager'))):
+    if body.upstream_asset_id==body.downstream_asset_id:raise HTTPException(422,'Topology link must connect two different assets')
+    with db() as conn:
+        up=get_or_404(conn,'SELECT id,asset_no,name FROM assets WHERE id=?',(body.upstream_asset_id,),'Upstream asset not found')
+        down_asset=get_or_404(conn,'SELECT id,asset_no,name FROM assets WHERE id=?',(body.downstream_asset_id,),'Downstream asset not found')
+        dup=conn.execute('SELECT * FROM asset_topology_links WHERE upstream_asset_id=? AND downstream_asset_id=? AND active=1',(body.upstream_asset_id,body.downstream_asset_id)).fetchone()
+        if dup:raise HTTPException(409,f"Active topology link {dup['link_no']} already exists")
+        _,directed,_=_topology_graph(conn)
+        if _graph_distance(directed,body.downstream_asset_id,body.upstream_asset_id,50) is not None:raise HTTPException(409,'Topology link would create a directed cycle')
+        no=next_no(conn,'asset_topology_links','link_no','TPL-',1001)
+        cur=conn.execute('INSERT INTO asset_topology_links(link_no,upstream_asset_id,downstream_asset_id,relation_type,active,notes,created_by,created_at) VALUES(?,?,?,?,1,?,?,?)',(no,body.upstream_asset_id,body.downstream_asset_id,body.relation_type.strip(),body.notes.strip(),user['id'],now()))
+        emit_event(conn,'operations.topology.link_created','asset_topology_link',no,{'link_no':no,'upstream_asset':up['asset_no'],'downstream_asset':down_asset['asset_no'],'relation_type':body.relation_type})
+        audit(conn,user['id'],'CREATE TOPOLOGY LINK','Utilities Operations',no,'',body.model_dump())
+        return {'id':cur.lastrowid,'link_no':no,'active':True}
+
+@app.post('/api/asset-topology/{link_id}/deactivate')
+def deactivate_asset_topology(link_id:int,user=Depends(require_roles('admin','asset_manager','maintenance_manager'))):
+    with db() as conn:
+        link=get_or_404(conn,'SELECT * FROM asset_topology_links WHERE id=?',(link_id,),'Topology link not found')
+        if not link['active']:return {'ok':True,'active':False}
+        conn.execute('UPDATE asset_topology_links SET active=0 WHERE id=?',(link_id,))
+        emit_event(conn,'operations.topology.link_deactivated','asset_topology_link',link['link_no'],{'link_no':link['link_no']})
+        audit(conn,user['id'],'DEACTIVATE TOPOLOGY LINK','Utilities Operations',link['link_no'],'Active','Inactive')
+        return {'ok':True,'active':False}
+
+@app.get('/api/alarm-incidents')
+def alarm_incidents(status:str='',severity:str='',site_id:Optional[int]=None,asset_id:Optional[int]=None,limit:int=Query(200,ge=1,le=1000),user=Depends(current_user)):
+    sql="""SELECT i.*,s.site_code,s.name site_name,a.asset_no,a.name asset_name,rc.asset_no root_cause_asset_no,rc.name root_cause_asset_name,w.wo_no,ack.full_name acknowledged_by_name,res.full_name resolved_by_name
+      FROM alarm_incidents i LEFT JOIN sites s ON s.id=i.site_id LEFT JOIN assets a ON a.id=i.asset_id LEFT JOIN assets rc ON rc.id=i.root_cause_asset_id
+      LEFT JOIN work_orders w ON w.id=i.work_order_id LEFT JOIN users ack ON ack.id=i.acknowledged_by LEFT JOIN users res ON res.id=i.resolved_by WHERE 1=1""";args=[]
+    if status:sql+=' AND i.status=?';args.append(status)
+    if severity:sql+=' AND i.severity=?';args.append(severity)
+    if site_id is not None:sql+=' AND i.site_id=?';args.append(site_id)
+    if asset_id is not None:sql+=' AND i.asset_id=?';args.append(asset_id)
+    sql+=" ORDER BY CASE i.severity WHEN 'Critical' THEN 2 ELSE 1 END DESC,i.last_seen_at DESC LIMIT ?";args.append(limit)
+    with db() as conn:return rows(conn.execute(sql,args))
+
+@app.get('/api/alarm-incidents/{incident_id}')
+def alarm_incident_detail(incident_id:int,user=Depends(current_user)):
+    with db() as conn:
+        incident=get_or_404(conn,"""SELECT i.*,s.site_code,s.name site_name,a.asset_no,a.name asset_name,rc.asset_no root_cause_asset_no,rc.name root_cause_asset_name,w.wo_no
+          FROM alarm_incidents i LEFT JOIN sites s ON s.id=i.site_id LEFT JOIN assets a ON a.id=i.asset_id LEFT JOIN assets rc ON rc.id=i.root_cause_asset_id LEFT JOIN work_orders w ON w.id=i.work_order_id WHERE i.id=?""",(incident_id,),'Alarm incident not found')
+        members,active,severity=_incident_member_summary(conn,incident_id);incident['alarms']=members;incident['active_alarm_count']=len(active);incident['derived_severity']=severity;return incident
+
+@app.post('/api/alarm-incidents/{incident_id}/acknowledge')
+def acknowledge_alarm_incident(incident_id:int,body:IncidentTransitionIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor','technician'))):
+    with db() as conn:
+        inc=get_or_404(conn,'SELECT * FROM alarm_incidents WHERE id=?',(incident_id,),'Alarm incident not found')
+        if inc['status']=='Resolved':raise HTTPException(409,'Incident is already resolved')
+        conn.execute("UPDATE alarm_incidents SET status='Acknowledged',acknowledged_at=?,acknowledged_by=?,updated_at=? WHERE id=?",(now(),user['id'],now(),incident_id))
+        audit(conn,user['id'],'ACKNOWLEDGE INCIDENT','Utilities Operations',inc['incident_no'],inc['status'],'Acknowledged');return {'ok':True,'status':'Acknowledged'}
+
+@app.post('/api/alarm-incidents/{incident_id}/resolve')
+def resolve_alarm_incident(incident_id:int,body:IncidentTransitionIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor'))):
+    with db() as conn:
+        inc=get_or_404(conn,'SELECT * FROM alarm_incidents WHERE id=?',(incident_id,),'Alarm incident not found');members,active,_=_incident_member_summary(conn,incident_id)
+        if active:raise HTTPException(409,f'{len(active)} member alarm(s) are still active')
+        conn.execute("UPDATE alarm_incidents SET status='Resolved',resolved_at=?,resolved_by=?,updated_at=? WHERE id=?",(now(),user['id'],now(),incident_id))
+        emit_event(conn,'operations.incident.resolved','alarm_incident',inc['incident_no'],{'incident_no':inc['incident_no'],'notes':body.notes});audit(conn,user['id'],'RESOLVE INCIDENT','Utilities Operations',inc['incident_no'],inc['status'],'Resolved');return {'ok':True,'status':'Resolved'}
+
+@app.post('/api/alarm-incidents/{incident_id}/work-order')
+def incident_create_work_order(incident_id:int,body:IncidentWorkOrderIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor'))):
+    with db() as conn:
+        inc=get_or_404(conn,"""SELECT i.*,a.asset_no anchor_asset_no,a.location_id anchor_location_id,rc.asset_no root_asset_no,rc.location_id root_location_id
+          FROM alarm_incidents i JOIN assets a ON a.id=i.asset_id LEFT JOIN assets rc ON rc.id=i.root_cause_asset_id WHERE i.id=?""",(incident_id,),'Alarm incident not found')
+        work_asset_id=inc.get('root_cause_asset_id') or inc['asset_id'];work_asset_no=inc.get('root_asset_no') or inc['anchor_asset_no'];work_location_id=inc.get('root_location_id') or inc['anchor_location_id']
+        if inc.get('work_order_id'):
+            w=conn.execute('SELECT id,wo_no FROM work_orders WHERE id=?',(inc['work_order_id'],)).fetchone();return {'id':w['id'],'wo_no':w['wo_no'],'existing':True}
+        members,active,severity=_incident_member_summary(conn,incident_id);priority='Critical' if severity=='Critical' else 'High';no=next_no(conn,'work_orders','wo_no','WO-',10026)
+        finish=body.target_finish or (date.today()+timedelta(days=1 if priority=='Critical' else 2)).isoformat();channels=', '.join(sorted({x['channel_code'] for x in members}));title=f"Investigate {inc['incident_no']} — {work_asset_no} operational incident"
+        desc=f"Correlated operational incident containing {len(members)} alarm(s). Channels: {channels}. Deterministic root-cause candidate: {work_asset_no} ({inc.get('root_cause_score') or 0:.1f}%). {inc.get('root_cause_reason') or ''}";instructions=body.notes or 'Validate telemetry, inspect the asset, identify root cause and restore normal operation.'
+        cur=conn.execute("""INSERT INTO work_orders(wo_no,title,description,asset_id,location_id,priority,status,work_type,failure_code,requested_by,assigned_to,supervisor_id,target_start,target_finish,estimated_hours,instructions,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,'Submitted','Corrective Maintenance',?,?,?,?,?,?,?,?,?,?)""",(no,title,desc,work_asset_id,work_location_id,priority,f"INCIDENT-{inc['incident_no']}",user['id'],body.assigned_to,body.supervisor_id,date.today().isoformat(),finish,4,instructions,now(),now()))
+        conn.execute('UPDATE alarm_incidents SET work_order_id=?,updated_at=? WHERE id=?',(cur.lastrowid,now(),incident_id));_ensure_work_sla(conn,cur.lastrowid)
+        create_approval(conn,'Work Management','work_order',cur.lastrowid,no,f"Approve {no} — {title}",user['id'],assigned_user_id=body.supervisor_id,assigned_role=None if body.supervisor_id else 'maintenance_manager')
+        workflow_event(conn,'Work Management','work_order',cur.lastrowid,no,'INCIDENT GENERATED','', 'Submitted',user['id'],inc['incident_no']);emit_event(conn,'operations.incident.work_order_created','alarm_incident',inc['incident_no'],{'incident_no':inc['incident_no'],'work_order':no});audit(conn,user['id'],'CREATE WORK FROM INCIDENT','Utilities Operations',inc['incident_no'],'',no)
+        return {'id':cur.lastrowid,'wo_no':no,'existing':False}
+
 @app.get('/api/alarms')
 def alarms(status:str='',severity:str='',asset_id:Optional[int]=None,site_id:Optional[int]=None,limit:int=Query(200,ge=1,le=1000),user=Depends(current_user)):
     sql="SELECT oa.*,tc.channel_code,tc.name channel_name,tc.unit,a.asset_no,a.name asset_name,s.site_code,s.name site_name,w.wo_no,ack.full_name acknowledged_by_name,cl.full_name closed_by_name FROM operational_alarms oa JOIN telemetry_channels tc ON tc.id=oa.channel_id JOIN assets a ON a.id=oa.asset_id LEFT JOIN sites s ON s.id=oa.site_id LEFT JOIN work_orders w ON w.id=oa.work_order_id LEFT JOIN users ack ON ack.id=oa.acknowledged_by LEFT JOIN users cl ON cl.id=oa.closed_by WHERE 1=1";args=[]
@@ -1147,21 +1773,26 @@ def alarms(status:str='',severity:str='',asset_id:Optional[int]=None,site_id:Opt
     if asset_id is not None:sql+=' AND oa.asset_id=?';args.append(asset_id)
     if site_id is not None:sql+=' AND oa.site_id=?';args.append(site_id)
     sql+=" ORDER BY CASE oa.severity WHEN 'Critical' THEN 2 ELSE 1 END DESC,oa.id DESC LIMIT ?";args.append(limit)
-    with db() as conn:return rows(conn.execute(sql,args))
+    with db() as conn:
+        data=rows(conn.execute(sql,args));stamp=now()
+        for alarm in data:
+            sh=conn.execute("SELECT id,shelf_no,end_at FROM alarm_shelves WHERE alarm_id=? AND status='Approved' AND start_at<=? AND end_at>? ORDER BY id DESC LIMIT 1",(alarm['id'],stamp,stamp)).fetchone()
+            alarm['shelved']=bool(sh);alarm['shelf_id']=sh['id'] if sh else None;alarm['shelf_no']=sh['shelf_no'] if sh else None;alarm['shelf_end_at']=sh['end_at'] if sh else None
+        return data
 
 @app.post('/api/alarms/{alarm_id}/acknowledge')
 def acknowledge_alarm(alarm_id:int,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor','technician'))):
     with db() as conn:
         a=get_or_404(conn,'SELECT * FROM operational_alarms WHERE id=?',(alarm_id,),'Alarm not found')
         if a['status'] not in ('Open','Acknowledged'):raise HTTPException(409,f"Alarm is {a['status']}")
-        conn.execute("UPDATE operational_alarms SET status='Acknowledged',acknowledged_at=?,acknowledged_by=? WHERE id=?",(now(),user['id'],alarm_id));audit(conn,user['id'],'ACKNOWLEDGE ALARM','Utilities Operations',a['alarm_no'],a['status'],'Acknowledged');return {'ok':True,'status':'Acknowledged'}
+        conn.execute("UPDATE operational_alarms SET status='Acknowledged',acknowledged_at=?,acknowledged_by=? WHERE id=?",(now(),user['id'],alarm_id));_correlate_alarm(conn,alarm_id,user['id']);audit(conn,user['id'],'ACKNOWLEDGE ALARM','Utilities Operations',a['alarm_no'],a['status'],'Acknowledged');return {'ok':True,'status':'Acknowledged'}
 
 @app.post('/api/alarms/{alarm_id}/close')
 def close_alarm(alarm_id:int,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor'))):
     with db() as conn:
         a=get_or_404(conn,'SELECT * FROM operational_alarms WHERE id=?',(alarm_id,),'Alarm not found')
         if a['status']=='Closed':return {'ok':True,'status':'Closed'}
-        conn.execute("UPDATE operational_alarms SET status='Closed',closed_at=?,closed_by=? WHERE id=?",(now(),user['id'],alarm_id));emit_event(conn,'operations.alarm.closed','alarm',a['alarm_no'],{'alarm_no':a['alarm_no'],'asset_id':a['asset_id']});audit(conn,user['id'],'CLOSE ALARM','Utilities Operations',a['alarm_no'],a['status'],'Closed');return {'ok':True,'status':'Closed'}
+        conn.execute("UPDATE operational_alarms SET status='Closed',closed_at=?,closed_by=? WHERE id=?",(now(),user['id'],alarm_id));_refresh_incidents_for_alarm(conn,alarm_id,user['id']);emit_event(conn,'operations.alarm.closed','alarm',a['alarm_no'],{'alarm_no':a['alarm_no'],'asset_id':a['asset_id']});audit(conn,user['id'],'CLOSE ALARM','Utilities Operations',a['alarm_no'],a['status'],'Closed');return {'ok':True,'status':'Closed'}
 
 @app.post('/api/alarms/{alarm_id}/work-order')
 def alarm_create_work_order(alarm_id:int,body:AlarmWorkOrderIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor'))):
@@ -1184,6 +1815,55 @@ def operations_intelligence(site_id:Optional[int]=None,user=Depends(current_user
         csql="SELECT tc.channel_code,tc.name,tc.metric_type,tc.unit,tc.last_value,tc.last_quality,tc.last_reading_at,a.asset_no,a.name asset_name,s.id site_id FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE tc.active=1";cargs=[]
         if site_id is not None:csql+=' AND s.id=?';cargs.append(site_id)
         csql+=' ORDER BY tc.last_reading_at DESC LIMIT 50';result['channels']=rows(conn.execute(csql,cargs));return result
+
+@app.get('/api/operations/command-center')
+def operations_command_center(site_id:Optional[int]=None,user=Depends(current_user)):
+    with db() as conn:
+        intel=_operations_intelligence(conn,site_id)
+        incident_sql="""SELECT i.*,a.asset_no,a.name asset_name,rc.asset_no root_cause_asset_no,rc.name root_cause_asset_name,s.name site_name,w.wo_no FROM alarm_incidents i
+          LEFT JOIN assets a ON a.id=i.asset_id LEFT JOIN assets rc ON rc.id=i.root_cause_asset_id LEFT JOIN sites s ON s.id=i.site_id LEFT JOIN work_orders w ON w.id=i.work_order_id
+          WHERE i.status IN ('Open','Acknowledged')""";incident_args=[]
+        if site_id is not None:incident_sql+=' AND i.site_id=?';incident_args.append(site_id)
+        incident_sql+=" ORDER BY CASE i.severity WHEN 'Critical' THEN 2 ELSE 1 END DESC,i.last_seen_at DESC LIMIT 20"
+        incidents=rows(conn.execute(incident_sql,incident_args))
+        outage_sql="""SELECT o.*,a.asset_no,a.name asset_name,s.name site_name FROM asset_outages o JOIN assets a ON a.id=o.asset_id
+          LEFT JOIN sites s ON s.id=o.site_id WHERE o.status='Open'""";outage_args=[]
+        if site_id is not None:outage_sql+=' AND o.site_id=?';outage_args.append(site_id)
+        outages=rows(conn.execute(outage_sql,outage_args));lost_capacity=sum(float(x.get('lost_capacity') or 0) for x in outages)
+        dispatch_sql="""SELECT d.*,w.wo_no,w.title,u.full_name technician_name,a.asset_no FROM dispatch_assignments d
+          JOIN work_orders w ON w.id=d.work_order_id JOIN users u ON u.id=d.technician_user_id LEFT JOIN assets a ON a.id=w.asset_id
+          LEFT JOIN locations l ON l.id=w.location_id LEFT JOIN sites s ON s.id=l.site_id
+          WHERE d.status IN ('Dispatched','Accepted','En Route','On Site')""";dispatch_args=[]
+        if site_id is not None:dispatch_sql+=' AND s.id=?';dispatch_args.append(site_id)
+        dispatch=rows(conn.execute(dispatch_sql,dispatch_args))
+        quality=_telemetry_quality_summary(conn,24,site_id)
+        sup_sql="""SELECT sp.*,a.asset_no,tc.channel_code,s.name site_name FROM alarm_suppressions sp LEFT JOIN assets a ON a.id=sp.asset_id
+          LEFT JOIN telemetry_channels tc ON tc.id=sp.channel_id LEFT JOIN sites s ON s.id=sp.site_id
+          WHERE sp.active=1 AND sp.start_at<=? AND sp.end_at>=?""";sup_args=[now(),now()]
+        if site_id is not None:sup_sql+=' AND (sp.site_id=? OR sp.site_id IS NULL)';sup_args.append(site_id)
+        suppressions=rows(conn.execute(sup_sql,sup_args))
+        alarm_sql="""SELECT oa.*,a.asset_no,tc.channel_code,tc.name channel_name,tc.unit FROM operational_alarms oa
+          JOIN assets a ON a.id=oa.asset_id JOIN telemetry_channels tc ON tc.id=oa.channel_id WHERE oa.status IN ('Open','Acknowledged')""";alarm_args=[]
+        if site_id is not None:alarm_sql+=' AND oa.site_id=?';alarm_args.append(site_id)
+        alarm_sql+=" ORDER BY CASE oa.severity WHEN 'Critical' THEN 2 ELSE 1 END DESC,oa.last_seen_at DESC LIMIT 30"
+        alarms=rows(conn.execute(alarm_sql,alarm_args))
+        shelf_sql="""SELECT sh.*,oa.alarm_no,oa.site_id,oa.severity,a.asset_no,tc.channel_code,req.full_name requested_by_name,apr.full_name approved_by_name
+          FROM alarm_shelves sh JOIN operational_alarms oa ON oa.id=sh.alarm_id JOIN assets a ON a.id=oa.asset_id JOIN telemetry_channels tc ON tc.id=oa.channel_id
+          JOIN users req ON req.id=sh.requested_by LEFT JOIN users apr ON apr.id=sh.approved_by
+          WHERE sh.status='Approved' AND sh.start_at<=? AND sh.end_at>? AND oa.status IN ('Open','Acknowledged')""";shelf_args=[now(),now()]
+        if site_id is not None:shelf_sql+=' AND oa.site_id=?';shelf_args.append(site_id)
+        shelves=rows(conn.execute(shelf_sql,shelf_args));shelf_by_alarm={x['alarm_id']:x for x in shelves}
+        for alarm in alarms:
+            sh=shelf_by_alarm.get(alarm['id']);alarm['shelved']=bool(sh);alarm['shelf_no']=sh['shelf_no'] if sh else None;alarm['shelf_end_at']=sh['end_at'] if sh else None
+        actionable=[x for x in alarms if not x['shelved']]
+        topology_sql="""SELECT t.*,ua.asset_no upstream_asset_no,da.asset_no downstream_asset_no,us.id upstream_site_id,ds.id downstream_site_id
+          FROM asset_topology_links t JOIN assets ua ON ua.id=t.upstream_asset_id JOIN assets da ON da.id=t.downstream_asset_id
+          LEFT JOIN locations ul ON ul.id=ua.location_id LEFT JOIN sites us ON us.id=ul.site_id LEFT JOIN locations dl ON dl.id=da.location_id LEFT JOIN sites ds ON ds.id=dl.site_id WHERE t.active=1""";topology_args=[]
+        if site_id is not None:topology_sql+=' AND (us.id=? OR ds.id=?)';topology_args += [site_id,site_id]
+        topology_links=rows(conn.execute(topology_sql+' ORDER BY t.link_no',topology_args))
+        topology_incidents=sum(1 for x in incidents if x.get('correlation_mode')=='Topology')
+        return {'summary':intel|{'open_outages':len(outages),'active_dispatches':len(dispatch),'lost_capacity_total':round(lost_capacity,2),'active_alarm_shelves':len(shelves),'actionable_alarms':len(actionable),'active_topology_links':len(topology_links),'topology_correlated_incidents':topology_incidents},
+                'data_quality':quality,'incidents':incidents,'alarms':alarms,'actionable_alarms':actionable,'shelves':shelves,'outages':outages,'dispatch':dispatch,'suppressions':suppressions,'topology_links':topology_links}
 
 # ---------- assets ----------
 ASSET_SELECT='''SELECT a.*,at.name asset_type,at.utility_domain,l.name location_name,l.location_code,s.id site_id,s.name site_name,p.asset_no parent_asset_no,p.name parent_asset_name,u.full_name responsible_person,v.name vendor_name FROM assets a LEFT JOIN asset_types at ON at.id=a.asset_type_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id LEFT JOIN assets p ON p.id=a.parent_asset_id LEFT JOIN users u ON u.id=a.responsible_user_id LEFT JOIN vendors v ON v.id=a.vendor_id'''
@@ -1209,6 +1889,8 @@ def get_asset(asset_id:int,user=Depends(current_user)):
         a['outages']=rows(conn.execute('SELECT * FROM asset_outages WHERE asset_id=? ORDER BY start_at DESC',(asset_id,)))
         a['telemetry_channels']=rows(conn.execute('SELECT * FROM telemetry_channels WHERE asset_id=? ORDER BY channel_code',(asset_id,)))
         a['operational_alarms']=rows(conn.execute("SELECT oa.*,tc.channel_code,tc.name channel_name,tc.unit FROM operational_alarms oa JOIN telemetry_channels tc ON tc.id=oa.channel_id WHERE oa.asset_id=? ORDER BY oa.id DESC",(asset_id,)))
+        a['topology_upstream']=rows(conn.execute('''SELECT t.*,ua.asset_no upstream_asset_no,ua.name upstream_asset_name FROM asset_topology_links t JOIN assets ua ON ua.id=t.upstream_asset_id WHERE t.downstream_asset_id=? AND t.active=1 ORDER BY t.link_no''',(asset_id,)))
+        a['topology_downstream']=rows(conn.execute('''SELECT t.*,da.asset_no downstream_asset_no,da.name downstream_asset_name FROM asset_topology_links t JOIN assets da ON da.id=t.downstream_asset_id WHERE t.upstream_asset_id=? AND t.active=1 ORDER BY t.link_no''',(asset_id,)))
         a['cost_ledger']=rows(conn.execute('''SELECT c.*,w.wo_no,u.full_name posted_by_name FROM maintenance_cost_ledger c LEFT JOIN work_orders w ON w.id=c.work_order_id LEFT JOIN users u ON u.id=c.posted_by WHERE c.asset_id=? ORDER BY c.id DESC''',(asset_id,)))
         a['cost_summary']=rows(conn.execute('SELECT cost_type,COUNT(*) entries,COALESCE(SUM(amount),0) amount FROM maintenance_cost_ledger WHERE asset_id=? GROUP BY cost_type ORDER BY amount DESC',(asset_id,)))
         a['lifetime_maintenance_cost']=sum(float(x['amount']) for x in a['cost_summary'])
@@ -1718,6 +2400,193 @@ def close_outage(outage_id:int,body:OutageCloseIn,user=Depends(require_roles('ad
         emit_event(conn,'asset.outage.closed','asset',o['asset_id'],{'outage_no':o['outage_no'],'asset_no':o['asset_no'],'end_at':end_at,'duration_hours':round(hours,2)})
         return {'ok':True,'status':'Closed','duration_hours':round(hours,2)}
 
+# ---------- offline field synchronization ----------
+def _field_sync_hash(value:dict):
+    payload=json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False,default=str)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+def _field_sync_work_access(conn,user,work_order_id:int):
+    w=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(work_order_id,),'Work order not found')
+    if user['role']=='technician' and int(w['assigned_to'] or 0)!=int(user['id']):
+        raise HTTPException(403,'Technicians can only synchronize work assigned to them')
+    return dict(w)
+
+def _field_sync_entity_state(conn,user,entity_type:str,entity_id:int):
+    kind=entity_type.strip().lower()
+    if kind=='work_order':
+        w=_field_sync_work_access(conn,user,entity_id)
+        state={'id':w['id'],'wo_no':w['wo_no'],'status':w['status'],'assigned_to':w.get('assigned_to'),'actual_start':w.get('actual_start'),'actual_finish':w.get('actual_finish'),'completion_notes':w.get('completion_notes') or '','technician_signature':w.get('technician_signature') or ''}
+    elif kind=='work_order_task':
+        r=get_or_404(conn,'''SELECT t.*,w.wo_no,w.assigned_to FROM work_order_tasks t JOIN work_orders w ON w.id=t.work_order_id WHERE t.id=?''',(entity_id,),'Work-order task not found')
+        if user['role']=='technician' and int(r['assigned_to'] or 0)!=int(user['id']):raise HTTPException(403,'Technicians can only synchronize tasks on their assigned work')
+        state={'id':r['id'],'work_order_id':r['work_order_id'],'wo_no':r['wo_no'],'task':r['task'],'status':r['status'],'completed_at':r.get('completed_at')}
+    elif kind=='asset':
+        a=get_or_404(conn,'SELECT id,asset_no,condition,meter_reading FROM assets WHERE id=?',(entity_id,),'Asset not found')
+        if user['role']=='technician':
+            allowed=conn.execute("SELECT id FROM work_orders WHERE asset_id=? AND assigned_to=? AND status NOT IN ('Closed','Cancelled') LIMIT 1",(entity_id,user['id'])).fetchone()
+            if not allowed:raise HTTPException(403,'Technicians can only synchronize assets linked to their assigned work')
+        state={'id':a['id'],'asset_no':a['asset_no'],'condition':a['condition'],'meter_reading':a['meter_reading']}
+    elif kind=='dispatch':
+        d=get_or_404(conn,'''SELECT d.*,w.wo_no,w.assigned_to FROM dispatch_assignments d JOIN work_orders w ON w.id=d.work_order_id WHERE d.id=?''',(entity_id,),'Dispatch not found')
+        if user['role']=='technician' and int(d['technician_user_id'])!=int(user['id']):raise HTTPException(403,'Technicians can only synchronize their own dispatch')
+        state={'id':d['id'],'dispatch_no':d['dispatch_no'],'work_order_id':d['work_order_id'],'wo_no':d['wo_no'],'status':d['status'],'accepted_at':d.get('accepted_at'),'enroute_at':d.get('enroute_at'),'arrived_at':d.get('arrived_at'),'completed_at':d.get('completed_at'),'cancelled_at':d.get('cancelled_at')}
+    else:
+        raise HTTPException(400,'Unsupported field-sync entity type')
+    return {'state':state,'hash':_field_sync_hash(state)}
+
+def _field_sync_apply(conn,user,entity_type:str,entity_id:int,operation_type:str,payload:dict):
+    kind=entity_type.strip().lower(); op=operation_type.strip().lower(); stamp=now()
+    if kind=='work_order' and op=='append_note':
+        w=_field_sync_work_access(conn,user,entity_id);note=str(payload.get('note') or '').strip()
+        if not note:raise HTTPException(400,'Field note is required')
+        if len(note)>2000:raise HTTPException(400,'Field note is too long')
+        entry=f"[{stamp}] {user['full_name']}: {note}";new=((w.get('comments') or '')+'\n'+entry).strip()
+        conn.execute('UPDATE work_orders SET comments=?,updated_at=? WHERE id=?',(new,stamp,entity_id));audit(conn,user['id'],'ADD NOTE','Field Sync',w['wo_no'],w.get('comments') or '',new)
+        return {'ok':True,'note_appended':True}
+    if kind=='work_order' and op=='transition':
+        w=_field_sync_work_access(conn,user,entity_id);action=str(payload.get('action') or '').lower();target=TRANSITIONS.get(w['status'],{}).get(action)
+        if not target:raise HTTPException(409,f"Action '{action}' is not valid from {w['status']}")
+        if action in ACTION_ROLES and user['role'] not in ACTION_ROLES[action]:raise HTTPException(403,f"Role {user['role']} cannot perform {action}")
+        if user['role']=='technician' and action not in ('start','pause','complete'):raise HTTPException(403,'Technicians can only start, pause or complete assigned work offline')
+        if action=='assign' and not w.get('assigned_to'):raise HTTPException(409,'Assign a technician before moving to Assigned')
+        fields={'status':target,'updated_at':stamp};notes=str(payload.get('notes') or '');signature=str(payload.get('signature') or '')
+        if action=='start':fields['actual_start']=stamp
+        if action=='complete':fields['actual_finish']=stamp;fields['completion_notes']=notes or w.get('completion_notes','');fields['technician_signature']=signature or w.get('technician_signature','')
+        conn.execute('UPDATE work_orders SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?',(*fields.values(),entity_id))
+        if action=='start':_mark_sla_response(conn,entity_id,stamp)
+        if action=='complete':_mark_sla_resolution(conn,entity_id,stamp)
+        if action in ('submit','resubmit'):create_approval(conn,'Work Management','work_order',entity_id,w['wo_no'],f"Approve {w['wo_no']} — {w['title']}",user['id'],assigned_user_id=w.get('supervisor_id'),assigned_role=None if w.get('supervisor_id') else 'maintenance_manager')
+        if action=='approve':resolve_approval(conn,'Work Management','work_order',entity_id,'approve',user['id'],notes)
+        if target=='Closed' and w.get('asset_id'):conn.execute('UPDATE assets SET last_maintenance=?,updated_at=? WHERE id=?',(date.today().isoformat(),stamp,w['asset_id']))
+        workflow_event(conn,'Work Management','work_order',entity_id,w['wo_no'],action.upper(),w['status'],target,user['id'],notes);audit(conn,user['id'],action.upper(),'Field Sync',w['wo_no'],w['status'],target)
+        notify(conn,'Work order status changed',f"{w['wo_no']} is now {target}",'Info',w.get('requested_by'),None,'work',w['wo_no'])
+        return {'ok':True,'status':target}
+    if kind=='work_order_task' and op=='set_status':
+        r=get_or_404(conn,'''SELECT t.*,w.wo_no,w.assigned_to FROM work_order_tasks t JOIN work_orders w ON w.id=t.work_order_id WHERE t.id=?''',(entity_id,),'Work-order task not found')
+        if user['role']=='technician' and int(r['assigned_to'] or 0)!=int(user['id']):raise HTTPException(403,'Technicians can only synchronize tasks on their assigned work')
+        target=str(payload.get('status') or '')
+        if target not in ('Pending','Completed'):raise HTTPException(400,'Task status must be Pending or Completed')
+        if r['status']!=target:
+            conn.execute('UPDATE work_order_tasks SET status=?,completed_at=? WHERE id=?',(target,stamp if target=='Completed' else None,entity_id));audit(conn,user['id'],'TASK '+target.upper(),'Field Sync',r['wo_no'],r['status'],target)
+        return {'ok':True,'status':target}
+    if kind=='asset' and op=='update':
+        current=_field_sync_entity_state(conn,user,'asset',entity_id)['state'];changes={}
+        if 'condition' in payload and payload.get('condition') is not None:
+            condition=str(payload.get('condition'));allowed=('Good','Fair','Warning','Poor','Critical')
+            if condition not in allowed:raise HTTPException(400,'Invalid asset condition')
+            changes['condition']=condition
+        if 'meter_reading' in payload and payload.get('meter_reading') is not None:
+            try:changes['meter_reading']=float(payload.get('meter_reading'))
+            except (TypeError,ValueError):raise HTTPException(400,'Meter reading must be numeric')
+        if not changes:raise HTTPException(400,'No asset changes supplied')
+        conn.execute('UPDATE assets SET '+','.join(f'{k}=?' for k in changes)+',updated_at=? WHERE id=?',(*changes.values(),stamp,entity_id));audit(conn,user['id'],'FIELD UPDATE','Field Sync',current['asset_no'],{k:current.get(k) for k in changes},changes)
+        return {'ok':True,'changes':changes}
+    if kind=='dispatch' and op=='transition':
+        d=get_or_404(conn,'SELECT d.*,w.wo_no,w.status work_status FROM dispatch_assignments d JOIN work_orders w ON w.id=d.work_order_id WHERE d.id=?',(entity_id,),'Dispatch not found');action=str(payload.get('action') or '').lower().replace(' ','');mapping={'accept':('Dispatched','Accepted','accepted_at'),'enroute':('Accepted','En Route','enroute_at'),'arrive':('En Route','On Site','arrived_at'),'complete':('On Site','Completed','completed_at')}
+        elevated=user['role'] in ('admin','maintenance_manager','planner','supervisor')
+        if user['role']=='technician' and int(d['technician_user_id'])!=int(user['id']):raise HTTPException(403,'Technicians can only update their own dispatch')
+        if action=='cancel':
+            if not elevated:raise HTTPException(403,'Only planners/supervisors can cancel dispatch')
+            if d['status'] in ('Completed','Cancelled'):raise HTTPException(409,f"Dispatch is {d['status']}")
+            target='Cancelled';field='cancelled_at'
+        else:
+            if action not in mapping:raise HTTPException(400,'Action must be accept, enroute, arrive, complete or cancel')
+            expected,target,field=mapping[action]
+            if d['status']!=expected:raise HTTPException(409,f"Action {action} requires {expected}, current status is {d['status']}")
+        notes=str(payload.get('notes') or '');conn.execute(f"UPDATE dispatch_assignments SET status=?,{field}=?,notes=CASE WHEN ?<>'' THEN ? ELSE notes END WHERE id=?",(target,stamp,notes,notes,entity_id))
+        if action=='arrive' and d['work_status']=='Assigned':
+            conn.execute("UPDATE work_orders SET status='In Progress',actual_start=COALESCE(actual_start,?),updated_at=? WHERE id=?",(stamp,stamp,d['work_order_id']));_mark_sla_response(conn,d['work_order_id'],stamp);workflow_event(conn,'Work Management','work_order',d['work_order_id'],d['wo_no'],'ARRIVE','Assigned','In Progress',user['id'],notes)
+        audit(conn,user['id'],'DISPATCH '+action.upper(),'Field Sync',d['dispatch_no'],d['status'],target);return {'ok':True,'status':target}
+    raise HTTPException(400,'Unsupported field-sync operation for this entity')
+
+def _field_sync_register_client(conn,user,client_id:str,device_name:str='',pulled:bool=False):
+    stamp=now();r=conn.execute('SELECT * FROM field_sync_clients WHERE client_id=?',(client_id,)).fetchone()
+    if r and int(r['user_id'])!=int(user['id']):raise HTTPException(409,'Field sync client ID is already registered to another user')
+    if r:
+        conn.execute("UPDATE field_sync_clients SET device_name=CASE WHEN ?<>'' THEN ? ELSE device_name END,last_seen_at=?,last_pull_at=CASE WHEN ?=1 THEN ? ELSE last_pull_at END WHERE id=?",(device_name,device_name,stamp,1 if pulled else 0,stamp,r['id']))
+        return r['id']
+    cur=conn.execute('INSERT INTO field_sync_clients(client_id,user_id,device_name,created_at,last_seen_at,last_pull_at) VALUES(?,?,?,?,?,?)',(client_id,user['id'],device_name,stamp,stamp,stamp if pulled else None));return cur.lastrowid
+
+def _field_sync_log_row(r):
+    d=dict(r)
+    for key in ('payload_json','result_json','conflict_json'):
+        raw=d.pop(key,'') or ''
+        d[key.replace('_json','')]=json.loads(raw) if raw else {}
+    return d
+
+@app.get('/api/field/sync/bootstrap')
+def field_sync_bootstrap(client_id:str=Query(min_length=8,max_length=128),device_name:str=Query(default='',max_length=120),user=Depends(require_roles(*WORK_ROLES))):
+    with db() as conn:
+        _field_sync_register_client(conn,user,client_id,device_name,True)
+        items=rows(conn.execute(WO_SELECT+' WHERE w.assigned_to=? ORDER BY w.target_finish,w.id DESC',(user['id'],)))
+        today=date.today().isoformat();rich=[]
+        for w in items:
+            w['sync_hash']=_field_sync_entity_state(conn,user,'work_order',w['id'])['hash']
+            w['tasks']=rows(conn.execute('SELECT * FROM work_order_tasks WHERE work_order_id=? ORDER BY sequence_no',(w['id'],)))
+            for t in w['tasks']:t['sync_hash']=_field_sync_entity_state(conn,user,'work_order_task',t['id'])['hash']
+            if w.get('asset_id'):
+                asset=_field_sync_entity_state(conn,user,'asset',w['asset_id']);w['asset_sync_hash']=asset['hash'];w['asset_state']=asset['state']
+            else:w['asset_sync_hash']='';w['asset_state']=None
+            dispatches=rows(conn.execute('SELECT * FROM dispatch_assignments WHERE work_order_id=? AND technician_user_id=? ORDER BY id DESC',(w['id'],user['id'])))
+            for d in dispatches:d['sync_hash']=_field_sync_entity_state(conn,user,'dispatch',d['id'])['hash']
+            w['dispatches']=dispatches;rich.append(w)
+        my_work={'assigned':[x for x in rich if x['status'] in ('Assigned','Approved')],'today':[x for x in rich if x.get('target_start')==today or x.get('target_finish')==today],'in_progress':[x for x in rich if x['status']=='In Progress'],'overdue':[x for x in rich if x.get('target_finish') and x['target_finish']<today and x['status'] not in ('Completed','Closed','Cancelled')],'completed':[x for x in rich if x['status'] in ('Completed','Closed')][:20]}
+        conflicts=rows(conn.execute("SELECT * FROM field_sync_operations WHERE user_id=? AND client_id=? AND status='Conflict' ORDER BY id DESC LIMIT 100",(user['id'],client_id)))
+        return {'server_time':now(),'client_id':client_id,'schema_version':SCHEMA_VERSION,'work_orders':rich,'my_work':my_work,'conflicts':[_field_sync_log_row(x) for x in conflicts]}
+
+@app.post('/api/field/sync/push')
+def field_sync_push(body:FieldSyncPushIn,user=Depends(require_roles(*WORK_ROLES))):
+    with db() as conn:
+        _field_sync_register_client(conn,user,body.client_id,body.device_name,False);results=[];batch_initial={};batch_mutated=set()
+        for op in body.operations:
+            existing=conn.execute('SELECT * FROM field_sync_operations WHERE operation_id=?',(op.operation_id,)).fetchone()
+            if existing:
+                if int(existing['user_id'])!=int(user['id']) or existing['client_id']!=body.client_id:raise HTTPException(409,'Field sync operation ID collision')
+                item=_field_sync_log_row(existing);item['idempotent_replay']=True;results.append(item);continue
+            payload=op.payload or {};submitted=now();payload_json=json.dumps(payload,sort_keys=True,ensure_ascii=False,default=str)
+            cur=conn.execute('''INSERT INTO field_sync_operations(operation_id,client_id,user_id,entity_type,entity_id,operation_type,base_hash,payload_json,status,client_created_at,submitted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(op.operation_id,body.client_id,user['id'],op.entity_type.lower(),op.entity_id,op.operation_type.lower(),op.base_hash,payload_json,'Pending',op.client_created_at,submitted));row_id=cur.lastrowid
+            try:current=_field_sync_entity_state(conn,user,op.entity_type,op.entity_id)
+            except HTTPException as exc:
+                result={'detail':str(exc.detail),'status_code':exc.status_code};conn.execute("UPDATE field_sync_operations SET status='Rejected',result_json=? WHERE id=?",(json.dumps(result),row_id));results.append({'operation_id':op.operation_id,'status':'Rejected','result':result});continue
+            key=(op.entity_type.lower(),int(op.entity_id));batch_initial.setdefault(key,current['hash']);is_append=op.entity_type.lower()=='work_order' and op.operation_type.lower()=='append_note';rebased=False
+            if not is_append and not op.base_hash:
+                result={'detail':'base_hash is required for conflict-safe mutable field operations'};conn.execute("UPDATE field_sync_operations SET status='Rejected',result_json=? WHERE id=?",(json.dumps(result),row_id));results.append({'operation_id':op.operation_id,'status':'Rejected','result':result});continue
+            if not is_append and op.base_hash!=current['hash']:
+                if key in batch_mutated and op.base_hash==batch_initial[key]:rebased=True
+                else:
+                    conflict={'reason':'Server state changed since the field snapshot','server_hash':current['hash'],'server_state':current['state'],'base_hash':op.base_hash};conn.execute("UPDATE field_sync_operations SET status='Conflict',conflict_json=? WHERE id=?",(json.dumps(conflict,sort_keys=True,default=str),row_id));results.append({'operation_id':op.operation_id,'status':'Conflict','conflict':conflict});continue
+            conn.execute('SAVEPOINT field_sync_apply')
+            try:
+                applied=_field_sync_apply(conn,user,op.entity_type,op.entity_id,op.operation_type,payload);fresh=_field_sync_entity_state(conn,user,op.entity_type,op.entity_id);applied.update({'server_hash':fresh['hash'],'server_state':fresh['state'],'rebased_in_batch':rebased});conn.execute('RELEASE SAVEPOINT field_sync_apply')
+                conn.execute("UPDATE field_sync_operations SET status='Applied',result_json=?,applied_at=? WHERE id=?",(json.dumps(applied,sort_keys=True,default=str),now(),row_id));batch_mutated.add(key);results.append({'operation_id':op.operation_id,'status':'Applied','result':applied})
+            except HTTPException as exc:
+                conn.execute('ROLLBACK TO SAVEPOINT field_sync_apply');conn.execute('RELEASE SAVEPOINT field_sync_apply');result={'detail':str(exc.detail),'status_code':exc.status_code};conn.execute("UPDATE field_sync_operations SET status='Rejected',result_json=? WHERE id=?",(json.dumps(result),row_id));results.append({'operation_id':op.operation_id,'status':'Rejected','result':result})
+        counts={k:sum(1 for x in results if x.get('status')==k) for k in ('Applied','Conflict','Rejected')};audit(conn,user['id'],'FIELD SYNC PUSH','Field Sync',body.client_id,'',{'operations':len(body.operations),**counts})
+        return {'client_id':body.client_id,'server_time':now(),'counts':counts,'results':results}
+
+@app.get('/api/field/sync/operations')
+def field_sync_operations(client_id:str=Query(min_length=8,max_length=128),status:str='',limit:int=Query(default=100,ge=1,le=500),user=Depends(require_roles(*WORK_ROLES))):
+    with db() as conn:
+        _field_sync_register_client(conn,user,client_id,'',False);sql='SELECT * FROM field_sync_operations WHERE user_id=? AND client_id=?';args=[user['id'],client_id]
+        if status:sql+=' AND status=?';args.append(status)
+        sql+=' ORDER BY id DESC LIMIT ?';args.append(limit);return [_field_sync_log_row(x) for x in rows(conn.execute(sql,args))]
+
+@app.post('/api/field/sync/conflicts/{operation_id}/resolve')
+def field_sync_resolve(operation_id:str,body:FieldSyncResolveIn,user=Depends(require_roles(*WORK_ROLES))):
+    with db() as conn:
+        op=get_or_404(conn,'SELECT * FROM field_sync_operations WHERE operation_id=? AND user_id=?',(operation_id,user['id']),'Field sync operation not found')
+        if op['status']!='Conflict':raise HTTPException(409,f"Operation is {op['status']}, not Conflict")
+        if body.resolution=='discard':
+            stamp=now();result={'resolution':'discard','detail':'Server state retained'};conn.execute("UPDATE field_sync_operations SET status='Discarded',result_json=?,resolved_at=? WHERE id=?",(json.dumps(result),stamp,op['id']));audit(conn,user['id'],'FIELD SYNC DISCARD','Field Sync',operation_id,'Conflict','Discarded');return {'operation_id':operation_id,'status':'Discarded','result':result}
+        current=_field_sync_entity_state(conn,user,op['entity_type'],op['entity_id'])
+        if not body.expected_server_hash or body.expected_server_hash!=current['hash']:raise HTTPException(409,{'message':'Server state changed again; refresh conflict before retry','server_hash':current['hash'],'server_state':current['state']})
+        payload=json.loads(op['payload_json'] or '{}');conn.execute('SAVEPOINT field_sync_retry')
+        try:
+            applied=_field_sync_apply(conn,user,op['entity_type'],op['entity_id'],op['operation_type'],payload);fresh=_field_sync_entity_state(conn,user,op['entity_type'],op['entity_id']);applied.update({'resolution':'retry','server_hash':fresh['hash'],'server_state':fresh['state']});conn.execute('RELEASE SAVEPOINT field_sync_retry')
+        except HTTPException:
+            conn.execute('ROLLBACK TO SAVEPOINT field_sync_retry');conn.execute('RELEASE SAVEPOINT field_sync_retry');raise
+        stamp=now();conn.execute("UPDATE field_sync_operations SET status='Applied',base_hash=?,result_json=?,applied_at=?,resolved_at=? WHERE id=?",(current['hash'],json.dumps(applied,sort_keys=True,default=str),stamp,stamp,op['id']));audit(conn,user['id'],'FIELD SYNC RETRY','Field Sync',operation_id,'Conflict','Applied');return {'operation_id':operation_id,'status':'Applied','result':applied}
+
 # ---------- technician dispatch ----------
 @app.get('/api/dispatch')
 def list_dispatch(status:str='',technician_user_id:Optional[int]=None,user=Depends(current_user)):
@@ -2029,9 +2898,26 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
         active_alarms=conn.execute("SELECT COUNT(*) FROM operational_alarms WHERE status IN ('Open','Acknowledged')").fetchone()[0]
         critical_alarms=conn.execute("SELECT COUNT(*) FROM operational_alarms WHERE status IN ('Open','Acknowledged') AND severity='Critical'").fetchone()[0]
         telemetry_channels=conn.execute("SELECT COUNT(*) FROM telemetry_channels WHERE active=1").fetchone()[0]
-    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {_REQUEST_METRICS["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}']
+        open_incidents=conn.execute("SELECT COUNT(*) FROM alarm_incidents WHERE status IN ('Open','Acknowledged')").fetchone()[0]
+        active_suppressions=conn.execute("SELECT COUNT(*) FROM alarm_suppressions WHERE active=1 AND start_at<=? AND end_at>=?",(now(),now())).fetchone()[0]
+        active_shelves=conn.execute("SELECT COUNT(*) FROM alarm_shelves sh JOIN operational_alarms oa ON oa.id=sh.alarm_id WHERE sh.status='Approved' AND sh.start_at<=? AND sh.end_at>? AND oa.status IN ('Open','Acknowledged')",(now(),now())).fetchone()[0]
+        active_topology_links=conn.execute("SELECT COUNT(*) FROM asset_topology_links WHERE active=1").fetchone()[0]
+        topology_incidents=conn.execute("SELECT COUNT(*) FROM alarm_incidents WHERE status IN ('Open','Acknowledged') AND correlation_mode='Topology'").fetchone()[0]
+        field_sync_pending=conn.execute("SELECT COUNT(*) FROM field_sync_operations WHERE status='Pending'").fetchone()[0]
+        field_sync_conflicts=conn.execute("SELECT COUNT(*) FROM field_sync_operations WHERE status='Conflict'").fetchone()[0]
+        field_sync_applied_24h=conn.execute("SELECT COUNT(*) FROM field_sync_operations WHERE status='Applied' AND applied_at>=?",((datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds'),)).fetchone()[0]
+        signed_approvals=conn.execute('SELECT COUNT(*) FROM approval_signature_evidence').fetchone()[0]
+        signature_integrity=verify_approval_signature_chain(conn)
+        q24=_telemetry_quality_summary(conn,24,None);bad_quality_24h=q24['bad'];duplicates_24h=conn.execute("SELECT COALESCE(SUM(duplicate_count),0) FROM telemetry_ingest_batches WHERE started_at>=?",((datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds'),)).fetchone()[0] or 0
+    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {_REQUEST_METRICS["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}',f'euas_open_alarm_incidents {open_incidents}',f'euas_active_alarm_suppressions {active_suppressions}',f'euas_active_alarm_shelves {active_shelves}',f'euas_active_topology_links {active_topology_links}',f'euas_topology_correlated_incidents {topology_incidents}',f'euas_field_sync_pending {field_sync_pending}',f'euas_field_sync_conflicts {field_sync_conflicts}',f'euas_field_sync_applied_24h {field_sync_applied_24h}',f'euas_signed_approvals_total {signed_approvals}',f'euas_approval_signature_chain_valid {1 if signature_integrity['valid'] else 0}',f'euas_bad_quality_readings_24h {bad_quality_24h}',f'euas_duplicate_telemetry_readings_24h {duplicates_24h}']
     for code,count in sorted(_REQUEST_METRICS['status'].items()):lines.append(f'euas_http_responses_total{{status="{code}"}} {count}')
     return '\n'.join(lines)+'\n'
+
+@app.get('/api/exports/approval-signatures.csv')
+def export_approval_signatures(user=Depends(require_roles('admin','maintenance_manager','executive'))):
+    with db() as conn:
+        data=rows(conn.execute('SELECT * FROM approval_signature_evidence ORDER BY id DESC'))
+    return csv_response('EUAS_approval_signature_evidence.csv',['Evidence','Approval','Module','Record Type','Record ID','Record','Decision','Signer','Username','Role','Delegated','Credential Verified','Intent','Comments','Signed At','Previous Hash','Evidence Hash'],[[x['evidence_no'],x['approval_no'],x['module'],x['record_type'],x['record_id'],x['record_code'],x['decision'],x['signer_name'],x['signer_username'],x['signer_role'],x['delegated_authority'],x['credential_verified'],x['intent_statement'],x.get('comments') or '',x['signed_at'],x.get('prev_hash') or '',x['evidence_hash']] for x in data])
 
 @app.get('/api/exports/work-orders.csv')
 def export_work_orders(user=Depends(current_user)):
@@ -2095,6 +2981,12 @@ def export_outages(user=Depends(current_user)):
         data=rows(conn.execute('''SELECT o.*,a.asset_no,a.name asset_name,s.name site_name,w.wo_no,u.full_name reported_by_name FROM asset_outages o JOIN assets a ON a.id=o.asset_id LEFT JOIN sites s ON s.id=o.site_id LEFT JOIN work_orders w ON w.id=o.work_order_id JOIN users u ON u.id=o.reported_by ORDER BY o.id DESC'''))
     return csv_response('EUAS_asset_outages.csv',['Outage','Asset','Asset Name','Site','Work Order','Type','Status','Cause','Impact','Lost Capacity','Unit','Start','End','Reported By'],[[x['outage_no'],x['asset_no'],x['asset_name'],x.get('site_name') or '',x.get('wo_no') or '',x['outage_type'],x['status'],x.get('cause_code') or '',x.get('impact') or '',x['lost_capacity'],x.get('capacity_unit') or '',x['start_at'],x.get('end_at') or '',x['reported_by_name']] for x in data])
 
+@app.get('/api/exports/field-sync.csv')
+def export_field_sync(user=Depends(require_roles('admin','maintenance_manager','planner','supervisor','executive'))):
+    with db() as conn:
+        data=rows(conn.execute('''SELECT o.*,u.full_name user_name FROM field_sync_operations o JOIN users u ON u.id=o.user_id ORDER BY o.id DESC'''))
+    return csv_response('EUAS_field_sync_operations.csv',['Operation','Client','User','Entity Type','Entity ID','Operation Type','Status','Base Hash','Client Created','Submitted','Applied','Resolved','Payload','Result','Conflict'],[[x['operation_id'],x['client_id'],x['user_name'],x['entity_type'],x['entity_id'],x['operation_type'],x['status'],x.get('base_hash') or '',x.get('client_created_at') or '',x['submitted_at'],x.get('applied_at') or '',x.get('resolved_at') or '',x['payload_json'],x.get('result_json') or '',x.get('conflict_json') or ''] for x in data])
+
 @app.get('/api/exports/dispatch.csv')
 def export_dispatch(user=Depends(current_user)):
     with db() as conn:
@@ -2118,6 +3010,39 @@ def export_telemetry(hours:int=Query(168,ge=1,le=8760),user=Depends(current_user
     cutoff=(datetime.now()-timedelta(hours=hours)).isoformat(timespec='seconds')
     with db() as conn:data=rows(conn.execute("""SELECT tr.*,tc.channel_code,tc.name channel_name,tc.metric_type,tc.unit,a.asset_no FROM telemetry_readings tr JOIN telemetry_channels tc ON tc.id=tr.channel_id JOIN assets a ON a.id=tc.asset_id WHERE tr.captured_at>=? ORDER BY tr.captured_at DESC""",(cutoff,)))
     return csv_response('EUAS_telemetry.csv',['Captured','Asset','Channel','Metric','Value','Unit','Quality','Source'],[[x['captured_at'],x['asset_no'],x['channel_code'],x['metric_type'],x['value'],x['unit'],x['quality'],x['source']] for x in data])
+
+@app.get('/api/exports/alarm-shelves.csv')
+def export_alarm_shelves(user=Depends(current_user)):
+    with db() as conn:data=rows(conn.execute("""SELECT sh.*,oa.alarm_no,a.asset_no,tc.channel_code,req.full_name requester,apr.full_name approver FROM alarm_shelves sh
+      JOIN operational_alarms oa ON oa.id=sh.alarm_id JOIN assets a ON a.id=oa.asset_id JOIN telemetry_channels tc ON tc.id=oa.channel_id
+      JOIN users req ON req.id=sh.requested_by LEFT JOIN users apr ON apr.id=sh.approved_by ORDER BY sh.id DESC"""))
+    return csv_response('EUAS_alarm_shelves.csv',['Shelf','Alarm','Asset','Channel','Status','Reason','Duration Minutes','Requester','Approver','Start','End'],[[x['shelf_no'],x['alarm_no'],x['asset_no'],x['channel_code'],x['status'],x['reason'],x['duration_minutes'],x['requester'],x.get('approver') or '',x.get('start_at') or '',x.get('end_at') or ''] for x in data])
+
+@app.get('/api/exports/alarm-incidents.csv')
+def export_alarm_incidents(user=Depends(current_user)):
+    with db() as conn:
+        data=rows(conn.execute("""SELECT i.*,a.asset_no,a.name asset_name,rc.asset_no root_cause_asset_no,rc.name root_cause_asset_name,s.name site_name,w.wo_no FROM alarm_incidents i
+          LEFT JOIN assets a ON a.id=i.asset_id LEFT JOIN assets rc ON rc.id=i.root_cause_asset_id LEFT JOIN sites s ON s.id=i.site_id LEFT JOIN work_orders w ON w.id=i.work_order_id ORDER BY i.id DESC"""))
+    return csv_response('EUAS_alarm_incidents.csv',['Incident','Anchor Asset','Site','Severity','Status','Alarm Count','Correlation','Root Cause Candidate','Root Score','Topology Hops','Root Cause Reason','Opened','Last Seen','Resolved','Work Order'],[[x['incident_no'],x.get('asset_no') or '',x.get('site_name') or '',x['severity'],x['status'],x['alarm_count'],x.get('correlation_mode') or 'Asset',x.get('root_cause_asset_no') or '',x.get('root_cause_score') or 0,x.get('topology_hops') or 0,x.get('root_cause_reason') or '',x['opened_at'],x['last_seen_at'],x.get('resolved_at') or '',x.get('wo_no') or ''] for x in data])
+
+@app.get('/api/exports/asset-topology.csv')
+def export_asset_topology(user=Depends(current_user)):
+    with db() as conn:
+        data=rows(conn.execute("""SELECT t.*,ua.asset_no upstream_asset_no,ua.name upstream_asset_name,da.asset_no downstream_asset_no,da.name downstream_asset_name,u.full_name created_by_name FROM asset_topology_links t
+          JOIN assets ua ON ua.id=t.upstream_asset_id JOIN assets da ON da.id=t.downstream_asset_id LEFT JOIN users u ON u.id=t.created_by ORDER BY t.link_no"""))
+    return csv_response('EUAS_asset_topology.csv',['Link','Upstream Asset','Upstream Name','Relation','Downstream Asset','Downstream Name','Active','Notes','Created','Created By'],[[x['link_no'],x['upstream_asset_no'],x['upstream_asset_name'],x['relation_type'],x['downstream_asset_no'],x['downstream_asset_name'],x['active'],x.get('notes') or '',x['created_at'],x.get('created_by_name') or ''] for x in data])
+
+@app.get('/api/exports/alarm-suppressions.csv')
+def export_alarm_suppressions(user=Depends(current_user)):
+    with db() as conn:
+        data=rows(conn.execute("""SELECT sp.*,s.name site_name,a.asset_no,tc.channel_code,u.full_name created_by_name FROM alarm_suppressions sp
+          LEFT JOIN sites s ON s.id=sp.site_id LEFT JOIN assets a ON a.id=sp.asset_id LEFT JOIN telemetry_channels tc ON tc.id=sp.channel_id LEFT JOIN users u ON u.id=sp.created_by ORDER BY sp.id DESC"""))
+    return csv_response('EUAS_alarm_suppressions.csv',['Suppression','Site','Asset','Channel','Reason','Start','End','Active','Created By'],[[x['suppression_no'],x.get('site_name') or '',x.get('asset_no') or '',x.get('channel_code') or '',x['reason'],x['start_at'],x['end_at'],x['active'],x.get('created_by_name') or ''] for x in data])
+
+@app.get('/api/exports/telemetry-batches.csv')
+def export_telemetry_batches(user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','executive'))):
+    with db() as conn:data=rows(conn.execute('SELECT * FROM telemetry_ingest_batches ORDER BY id DESC'))
+    return csv_response('EUAS_telemetry_ingest_batches.csv',['Batch','Source','Received','Accepted','Duplicates','Bad Quality','Suppressed','Alarms Opened','Alarms Updated','Alarms Cleared','Started','Completed'],[[x['batch_no'],x['source_system'],x['received_count'],x['accepted_count'],x['duplicate_count'],x['bad_quality_count'],x['suppressed_count'],x['alarms_opened'],x['alarms_updated'],x['alarms_cleared'],x['started_at'],x.get('completed_at') or ''] for x in data])
 
 @app.get('/api/admin/backup')
 def admin_backup(user=Depends(require_roles('admin'))):
@@ -2171,6 +3096,8 @@ def search(q:str=Query(min_length=2),user=Depends(current_user)):
         for r in rows(conn.execute('''SELECT d.*,w.wo_no,w.title,u.full_name technician_name FROM dispatch_assignments d JOIN work_orders w ON w.id=d.work_order_id JOIN users u ON u.id=d.technician_user_id WHERE d.dispatch_no LIKE ? OR w.wo_no LIKE ? OR w.title LIKE ? OR u.full_name LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'dispatch','id':r['id'],'code':r['dispatch_no'],'title':f"{r['wo_no']} — {r['technician_name']}",'subtitle':r['status']})
         for r in rows(conn.execute('''SELECT oa.*,tc.channel_code,tc.name channel_name,a.asset_no,a.name asset_name FROM operational_alarms oa JOIN telemetry_channels tc ON tc.id=oa.channel_id JOIN assets a ON a.id=oa.asset_id WHERE oa.alarm_no LIKE ? OR tc.channel_code LIKE ? OR tc.name LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10''',(like,like,like,like,like))):out.append({'module':'telemetry','id':r['id'],'code':r['alarm_no'],'title':f"{r['asset_no']} — {r['channel_name']} alarm",'subtitle':f"{r['severity']} · {r['status']}"})
         for r in rows(conn.execute('''SELECT tc.*,a.asset_no,a.name asset_name FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id WHERE tc.channel_code LIKE ? OR tc.name LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'telemetry','id':r['id'],'code':r['channel_code'],'title':r['name'],'subtitle':f"{r['asset_no']} · {r['metric_type']}"})
+        for r in rows(conn.execute('''SELECT i.*,a.asset_no,a.name asset_name FROM alarm_incidents i LEFT JOIN assets a ON a.id=i.asset_id WHERE i.incident_no LIKE ? OR i.title LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'commandcenter','id':r['id'],'code':r['incident_no'],'title':r['title'],'subtitle':f"{r['severity']} · {r['status']} · {r['alarm_count']} alarm(s)"})
+        for r in rows(conn.execute('''SELECT sp.*,a.asset_no,tc.channel_code FROM alarm_suppressions sp LEFT JOIN assets a ON a.id=sp.asset_id LEFT JOIN telemetry_channels tc ON tc.id=sp.channel_id WHERE sp.suppression_no LIKE ? OR sp.reason LIKE ? OR a.asset_no LIKE ? OR tc.channel_code LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'commandcenter','id':r['id'],'code':r['suppression_no'],'title':'Alarm suppression','subtitle':f"{r.get('asset_no') or r.get('channel_code') or 'Site'} · {r['reason']}"})
         return out
 @app.get('/api/analytics')
 def analytics(user=Depends(current_user)):
@@ -2190,13 +3117,16 @@ def analytics(user=Depends(current_user)):
         health_portfolio=[_asset_health(conn,x['id']) for x in rows(conn.execute('SELECT id FROM assets ORDER BY asset_no'))]
         forecast=_maintenance_forecast(conn,90,None)
         alarm_summary=rows(conn.execute("SELECT severity,status,COUNT(*) count FROM operational_alarms GROUP BY severity,status ORDER BY severity,status"))
+        incident_summary=rows(conn.execute("SELECT severity,status,COUNT(*) count FROM alarm_incidents GROUP BY severity,status ORDER BY severity,status"))
+        telemetry_quality=_telemetry_quality_summary(conn,24,None)
+        ingest_summary=rows(conn.execute("SELECT source_system,COUNT(*) batches,COALESCE(SUM(accepted_count),0) accepted,COALESCE(SUM(duplicate_count),0) duplicates,COALESCE(SUM(bad_quality_count),0) bad_quality FROM telemetry_ingest_batches GROUP BY source_system ORDER BY accepted DESC"))
         return {
           'summary':{'mtbf':round(mtbf,1) if mtbf is not None else None,'mttr':round(repair,1),'availability':round(availability,2),'pm_compliance':round(100*(pm_total-pm_over)/pm_total,1) if pm_total else 100,'work_order_completion_rate':round(100*done/max(total,1),1),'reliability_period_days':365},
           'maintenance_by_type':rows(conn.execute('SELECT work_type,COUNT(*) count,COALESCE(SUM(actual_cost),0) cost FROM work_orders GROUP BY work_type ORDER BY count DESC')),
           'cost_by_asset':rows(conn.execute('SELECT a.asset_no,a.name,COALESCE(SUM(w.actual_cost),0) maintenance_cost FROM assets a LEFT JOIN work_orders w ON w.asset_id=a.id GROUP BY a.id,a.asset_no,a.name ORDER BY maintenance_cost DESC')),
           'inventory_by_category':rows(conn.execute('SELECT category,COALESCE(SUM(current_stock*unit_price),0) value,COUNT(*) items FROM inventory_items GROUP BY category')),
           'hse_by_risk':rows(conn.execute("SELECT CASE WHEN risk_score>=15 THEN 'Extreme' WHEN risk_score>=10 THEN 'High' WHEN risk_score>=5 THEN 'Medium' ELSE 'Low' END risk_band,COUNT(*) count FROM safety_incidents GROUP BY risk_band")),
-          'monthly_work':monthly,'backlog_by_priority':backlog,'procurement_by_vendor':procurement_vendor,'inventory_health':inventory_health,'asset_reliability':reliability,'site_reliability':site_reliability,'approval_summary':approval_summary,'maintenance_cost_ledger':cost_ledger,'asset_health_scores':health_portfolio,'maintenance_forecast':forecast,'operational_alarm_summary':alarm_summary
+          'monthly_work':monthly,'backlog_by_priority':backlog,'procurement_by_vendor':procurement_vendor,'inventory_health':inventory_health,'asset_reliability':reliability,'site_reliability':site_reliability,'approval_summary':approval_summary,'maintenance_cost_ledger':cost_ledger,'asset_health_scores':health_portfolio,'maintenance_forecast':forecast,'operational_alarm_summary':alarm_summary,'operational_incident_summary':incident_summary,'telemetry_quality_24h':telemetry_quality,'telemetry_ingestion_sources':ingest_summary
         }
 @app.get('/api/audit/integrity')
 def audit_integrity(user=Depends(require_roles('admin','maintenance_manager','executive'))):
@@ -2209,7 +3139,8 @@ def retention_policies(user=Depends(require_roles('admin','maintenance_manager',
 @app.get('/api/governance/retention/preview')
 def retention_preview(user=Depends(require_roles('admin','maintenance_manager','executive'))):
     mapping={
-      'Audit Trail':('audit_logs','created_at'),'Work Management':('work_orders','created_at'),'Documents':('documents','uploaded_at'),
+      'Audit Trail':('audit_logs','created_at'),'Approval Signatures':('approval_signature_evidence','signed_at'),
+      'Work Management':('work_orders','created_at'),'Documents':('documents','uploaded_at'),
       'Notifications':('notifications','created_at'),'Integration Events':('event_outbox','created_at')
     }
     out=[];today=datetime.now()
