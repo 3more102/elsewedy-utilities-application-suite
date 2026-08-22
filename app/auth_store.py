@@ -195,7 +195,7 @@ def resolve_session(conn, token: str, *, at: Optional[datetime] = None) -> Optio
     stamp = _stamp(at)
     digest = token_digest(token)
     row = conn.execute(
-        '''SELECT s.id session_id,s.user_id,s.created_at,s.last_seen_at,s.expires_at,
+        '''SELECT s.id session_id,u.id,s.created_at,s.last_seen_at,s.expires_at,
                   s.revoked_at,s.client_label,
                   u.username,u.full_name,u.email,u.department,u.phone,u.active,
                   r.code role,r.name role_name
@@ -210,7 +210,7 @@ def resolve_session(conn, token: str, *, at: Optional[datetime] = None) -> Optio
         migrated_id = _migrate_one_legacy_session(conn, token)
         if migrated_id is not None:
             row = conn.execute(
-                '''SELECT s.id session_id,s.user_id,s.created_at,s.last_seen_at,s.expires_at,
+                '''SELECT s.id session_id,u.id,s.created_at,s.last_seen_at,s.expires_at,
                           s.revoked_at,s.client_label,
                           u.username,u.full_name,u.email,u.department,u.phone,u.active,
                           r.code role,r.name role_name
