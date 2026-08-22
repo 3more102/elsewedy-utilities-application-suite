@@ -26,13 +26,24 @@ def test_assigned_work_redispatch_snapshot_has_one_winner():
                 """SELECT u.id,u.full_name,r.code role FROM users u
                    JOIN roles r ON r.id=u.role_id WHERE u.username='omar'"""
             ).fetchone()
-            tech = conn.execute(
-                """SELECT u.id FROM users u JOIN roles r ON r.id=u.role_id
-                   WHERE r.code='technician' AND u.active=1 ORDER BY u.id LIMIT 1"""
-            ).fetchone()
-            assert user and tech
+            role = conn.execute("SELECT id FROM roles WHERE code='technician'").fetchone()
+            seed_hash = conn.execute('SELECT password_hash FROM users ORDER BY id LIMIT 1').fetchone()
+            assert user and role and seed_hash
             user = dict(user)
-            tech_id = int(tech['id'])
+            tech = conn.execute(
+                '''INSERT INTO users(
+                     username,password_hash,full_name,email,role_id,active,created_at
+                   ) VALUES(?,?,?,?,?,1,?)''',
+                (
+                    f'ci-redispatch-tech-{suffix}',
+                    seed_hash['password_hash'],
+                    f'CI Redispatch Technician {suffix}',
+                    f'ci-redispatch-tech-{suffix}@example.test',
+                    role['id'],
+                    now(),
+                ),
+            )
+            tech_id = int(tech.lastrowid)
             work = conn.execute(
                 '''INSERT INTO work_orders(
                      wo_no,title,priority,status,work_type,requested_by,assigned_to,
