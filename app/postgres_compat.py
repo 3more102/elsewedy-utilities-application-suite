@@ -61,10 +61,20 @@ def _table_has_serial_id(raw, table: str) -> bool:
     cached = _SERIAL_ID_CACHE.get(table)
     if cached is not None:
         return cached
+
+    # information_schema is safe for tables that intentionally have no `id`
+    # column (for example schema_migrations and composite-key bridge tables).
+    # pg_get_serial_sequence(table, 'id') raises when that column is absent.
+    table_name = table.rsplit('.', 1)[-1]
     with raw.cursor() as probe:
-        probe.execute("SELECT pg_get_serial_sequence(%s, 'id')", (table,))
+        probe.execute(
+            """SELECT column_default,is_identity
+               FROM information_schema.columns
+               WHERE table_schema=current_schema() AND table_name=%s AND column_name='id'""",
+            (table_name,),
+        )
         row = probe.fetchone()
-    result = bool(row and row[0])
+    result = bool(row and ((row[0] and 'nextval(' in str(row[0])) or str(row[1]).upper() == 'YES'))
     _SERIAL_ID_CACHE[table] = result
     return result
 
