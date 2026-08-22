@@ -4,7 +4,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.database import _pg_insert_or_ignore, _postgresize_schema
+# Import auth to install the application-wide PostgreSQL compatibility contract
+# before exercising adapter translation and cursor behavior directly.
+import app.auth  # noqa: F401
+from app.database import PostgresCursor, _pg_insert_or_ignore, _pg_sql, _postgresize_schema
 
 
 def test_postgres_sql_translation_contract():
@@ -13,3 +16,43 @@ def test_postgres_sql_translation_contract():
     schema = _postgresize_schema('CREATE TABLE x(id INTEGER PRIMARY KEY AUTOINCREMENT, value REAL);')
     assert 'SERIAL PRIMARY KEY' in schema
     assert 'DOUBLE PRECISION' in schema
+
+
+def test_postgres_translation_escapes_literal_percent_for_psycopg():
+    sql = _pg_sql("SELECT id FROM work_orders WHERE work_type LIKE 'Corrective%' AND asset_id=?")
+    assert sql == "SELECT id FROM work_orders WHERE work_type LIKE 'Corrective%%' AND asset_id=%s"
+    ignored = _pg_insert_or_ignore("INSERT OR IGNORE INTO demo(name,pattern) VALUES(?, 'PM%')")
+    assert ignored == "INSERT INTO demo(name,pattern) VALUES(%s, 'PM%%') ON CONFLICT DO NOTHING"
+
+
+def test_postgres_translation_types_standalone_null_checks():
+    sql = _pg_sql(
+        'SELECT id FROM notifications WHERE ((user_id=?) OR (user_id IS NULL AND ? IS NULL)) '
+        'AND ((role_code=?) OR (role_code IS NULL AND ? IS NULL))'
+    )
+    assert sql == (
+        'SELECT id FROM notifications WHERE ((user_id=%s) OR '
+        '(user_id IS NULL AND CAST(%s AS TEXT) IS NULL)) AND '
+        '((role_code=%s) OR (role_code IS NULL AND CAST(%s AS TEXT) IS NULL))'
+    )
+
+
+def test_postgres_cursor_supports_sqlite_style_iteration():
+    class Column:
+        def __init__(self, name):
+            self.name = name
+
+    class RawCursor:
+        rowcount = 2
+        description = [Column('code'), Column('id')]
+
+        def __init__(self):
+            self.rows = [('admin', 1), ('planner', 2)]
+
+        def fetchone(self):
+            return self.rows.pop(0) if self.rows else None
+
+    cursor = PostgresCursor(RawCursor(), None)
+    rows = list(cursor)
+    assert [row['code'] for row in rows] == ['admin', 'planner']
+    assert rows[0][1] == 1
