@@ -74,6 +74,7 @@ def adjust_stock_if_unchanged(
 from .approval_store import install_atomic_approval_route
 from .dispatch_startup import install_dispatch_assignment_startup
 from .dispatch_store import install_dispatch_assignment_route
+from .pm_startup import install_pm_generation_startup
 from .procurement_store import install_procurement_routes
 from .reservation_authorization import install_reservation_authorization_contract
 from .reservation_store import install_reservation_routes
@@ -85,6 +86,7 @@ install_reservation_authorization_contract()
 install_workflow_authorization_contract()
 install_dispatch_assignment_startup()
 install_inventory_transfer_startup()
+install_pm_generation_startup()
 install_procurement_routes()
 install_atomic_approval_route()
 install_reservation_routes()
