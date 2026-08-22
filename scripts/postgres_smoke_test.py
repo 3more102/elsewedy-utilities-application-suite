@@ -77,6 +77,7 @@ def main() -> int:
             raise RuntimeError('EUAS did not become healthy against PostgreSQL within 40 seconds')
 
         assert health['status'] == 'ok'
+        assert health['version'] == '4.0.0'
         assert health['database_backend'] == 'postgresql'
         assert health['schema_version'] >= 9
         assert headers.get('X-Request-ID')
