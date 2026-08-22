@@ -4,10 +4,12 @@ import sqlite3
 from datetime import datetime, timedelta
 
 from app.auth_store import (
+    CLIENT_LOGIN_MAX_FAILURES,
     LOGIN_MAX_FAILURES,
     LOGIN_WINDOW_SECONDS,
     active_session_count,
     clear_login_failures,
+    client_login_scope_digest,
     create_session,
     ensure_auth_schema,
     list_sessions,
@@ -158,6 +160,34 @@ def test_login_scope_is_normalized_and_does_not_store_account_or_ip():
     assert len(first) == 64
     assert 'omar' not in first
     assert '203.0.113.25' not in first
+
+
+def test_client_wide_scope_blocks_rotating_accounts_without_storing_host():
+    conn = make_conn()
+    ensure_auth_schema(conn)
+    scope = client_login_scope_digest('203.0.113.44')
+    start = datetime(2026, 8, 22, 12, 0, 0)
+
+    assert len(scope) == 64
+    assert '203.0.113.44' not in scope
+
+    for offset in range(CLIENT_LOGIN_MAX_FAILURES):
+        state = record_login_failure(
+            conn,
+            scope,
+            at=start + timedelta(seconds=offset),
+            max_failures=CLIENT_LOGIN_MAX_FAILURES,
+        )
+
+    assert state['failure_count'] == CLIENT_LOGIN_MAX_FAILURES
+    assert state['blocked_until'] is not None
+    blocked = throttle_status(
+        conn,
+        scope,
+        at=start + timedelta(seconds=CLIENT_LOGIN_MAX_FAILURES),
+    )
+    assert blocked['blocked'] is True
+    assert blocked['retry_after'] > 0
 
 
 def test_throttle_state_persists_and_progressively_blocks(tmp_path):
