@@ -3,28 +3,15 @@ import secrets
 from datetime import datetime
 from typing import Optional
 from fastapi import Header, HTTPException, Depends
-from .database import PostgresCursor, db
+from .database import db
+from .postgres_compat import apply_postgres_compat
 
 PBKDF2_ROUNDS = 180_000
 
-
-def _postgres_cursor_iter(cursor):
-    """Provide the sqlite cursor iteration contract used throughout EUAS.
-
-    EUAS query code historically iterates directly over sqlite cursors. The
-    PostgreSQL adapter exposes HybridRow through fetchone/fetchall, so bridge
-    the same behavior here for all application/auth/bootstrap paths.
-    """
-    while True:
-        row = cursor.fetchone()
-        if row is None:
-            return
-        yield row
-
-
-# Keep the adapter behavior compatible with sqlite without changing callers.
-if '__iter__' not in PostgresCursor.__dict__:
-    PostgresCursor.__iter__ = _postgres_cursor_iter
+# The application imports auth during startup, before database-backed endpoint
+# work begins, making this the compatibility bootstrap for both API and CLI
+# execution paths.
+apply_postgres_compat()
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
