@@ -11,6 +11,16 @@ from .pm_store import ensure_pm_generation_lock, install_pm_generator
 PM_BOOTSTRAP_LOCK_KEY = 1_169_982_297
 
 
+def initialize_pm_generation_support(conn) -> None:
+    """Create the coordinator safely during simultaneous PostgreSQL startup."""
+    if DB_BACKEND == 'postgresql':
+        conn.execute(
+            'SELECT pg_advisory_xact_lock(?)',
+            (PM_BOOTSTRAP_LOCK_KEY,),
+        )
+    ensure_pm_generation_lock(conn)
+
+
 def install_pm_generation_startup() -> None:
     """Initialize and install the PM generator before automation can execute."""
     app = _application.app
@@ -27,15 +37,9 @@ def install_pm_generation_startup() -> None:
     async def pm_generation_lifespan(app_instance):
         # This coordinator has no foreign keys, so it can be created before the
         # historical lifespan starts its automation task. PostgreSQL first-start
-        # DDL is serialized across replicas using a transaction-scoped advisory
-        # lock; SQLite already serializes schema writers.
+        # DDL is serialized across replicas; SQLite serializes schema writers.
         with db() as conn:
-            if DB_BACKEND == 'postgresql':
-                conn.execute(
-                    'SELECT pg_advisory_xact_lock(?)',
-                    (PM_BOOTSTRAP_LOCK_KEY,),
-                )
-            ensure_pm_generation_lock(conn)
+            initialize_pm_generation_support(conn)
         async with original_lifespan(app_instance):
             yield
 
