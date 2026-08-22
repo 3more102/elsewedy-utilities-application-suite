@@ -4,7 +4,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.database import _pg_insert_or_ignore, _postgresize_schema
+# Import auth to install the application-wide PostgreSQL cursor compatibility
+# contract before exercising the adapter directly.
+import app.auth  # noqa: F401
+from app.database import PostgresCursor, _pg_insert_or_ignore, _postgresize_schema
 
 
 def test_postgres_sql_translation_contract():
@@ -13,3 +16,24 @@ def test_postgres_sql_translation_contract():
     schema = _postgresize_schema('CREATE TABLE x(id INTEGER PRIMARY KEY AUTOINCREMENT, value REAL);')
     assert 'SERIAL PRIMARY KEY' in schema
     assert 'DOUBLE PRECISION' in schema
+
+
+def test_postgres_cursor_supports_sqlite_style_iteration():
+    class Column:
+        def __init__(self, name):
+            self.name = name
+
+    class RawCursor:
+        rowcount = 2
+        description = [Column('code'), Column('id')]
+
+        def __init__(self):
+            self.rows = [('admin', 1), ('planner', 2)]
+
+        def fetchone(self):
+            return self.rows.pop(0) if self.rows else None
+
+    cursor = PostgresCursor(RawCursor(), None)
+    rows = list(cursor)
+    assert [row['code'] for row in rows] == ['admin', 'planner']
+    assert rows[0][1] == 1
