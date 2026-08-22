@@ -71,7 +71,11 @@ def adjust_stock_if_unchanged(
 # compatibility façade. Install production hardening extensions here so the
 # monolithic application does not need broad rewrites. Every installer is
 # idempotent and preserves historical role authorization.
-from .alarm_authorization import install_alarm_work_order_authorization
+from .alarm_authorization import (
+    install_alarm_lifecycle_authorization,
+    install_alarm_work_order_authorization,
+)
+from .alarm_lifecycle_store import install_alarm_lifecycle_routes
 from .alarm_store import install_alarm_work_order_route
 from .approval_store import install_atomic_approval_route
 from .dispatch_startup import install_dispatch_assignment_startup
@@ -90,6 +94,7 @@ from .workflow_store import install_workflow_transition_routes
 install_reservation_authorization_contract()
 install_workflow_authorization_contract()
 install_alarm_work_order_authorization()
+install_alarm_lifecycle_authorization()
 install_inspection_authorization_contract()
 install_dispatch_assignment_startup()
 install_inventory_transfer_startup()
@@ -101,4 +106,5 @@ install_reservation_routes()
 install_workflow_transition_routes()
 install_dispatch_assignment_route()
 install_alarm_work_order_route()
+install_alarm_lifecycle_routes()
 install_inspection_submission_route()
