@@ -140,6 +140,9 @@ jobs:
       - name: Run PostgreSQL reorder generation concurrency smoke
         run: python scripts/reorder_generation_concurrency_smoke.py
 
+      - name: Run PostgreSQL telemetry temporal integrity concurrency smoke
+        run: python scripts/telemetry_temporal_integrity_concurrency_smoke.py
+
       - name: Run PostgreSQL outbox delivery concurrency smoke
         run: python scripts/outbox_delivery_concurrency_smoke.py
 
