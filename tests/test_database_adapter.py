@@ -4,10 +4,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-# Import auth to install the application-wide PostgreSQL cursor compatibility
-# contract before exercising the adapter directly.
+# Import auth to install the application-wide PostgreSQL compatibility contract
+# before exercising adapter translation and cursor behavior directly.
 import app.auth  # noqa: F401
-from app.database import PostgresCursor, _pg_insert_or_ignore, _postgresize_schema
+from app.database import PostgresCursor, _pg_insert_or_ignore, _pg_sql, _postgresize_schema
 
 
 def test_postgres_sql_translation_contract():
@@ -16,6 +16,13 @@ def test_postgres_sql_translation_contract():
     schema = _postgresize_schema('CREATE TABLE x(id INTEGER PRIMARY KEY AUTOINCREMENT, value REAL);')
     assert 'SERIAL PRIMARY KEY' in schema
     assert 'DOUBLE PRECISION' in schema
+
+
+def test_postgres_translation_escapes_literal_percent_for_psycopg():
+    sql = _pg_sql("SELECT id FROM work_orders WHERE work_type LIKE 'Corrective%' AND asset_id=?")
+    assert sql == "SELECT id FROM work_orders WHERE work_type LIKE 'Corrective%%' AND asset_id=%s"
+    ignored = _pg_insert_or_ignore("INSERT OR IGNORE INTO demo(name,pattern) VALUES(?, 'PM%')")
+    assert ignored == "INSERT INTO demo(name,pattern) VALUES(%s, 'PM%%') ON CONFLICT DO NOTHING"
 
 
 def test_postgres_cursor_supports_sqlite_style_iteration():
