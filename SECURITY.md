@@ -25,7 +25,8 @@ EUAS includes security controls appropriate for a runnable reference deployment.
 - GitHub CodeQL scans Python with the `security-extended` query suite on pushes, pull requests and a weekly schedule.
 - `pip-audit` checks the resolved Python dependency environment for known vulnerability advisories.
 - Trivy scans the built EUAS container image and fails on fixable high/critical OS or library vulnerabilities.
-- Dependabot monitors both Python packages and GitHub Actions for version updates.
+- The production container is smoke-tested through `/api/health` before vulnerability scanning.
+- Dependabot monitors Python packages, GitHub Actions and the pinned Docker base image for version updates.
 
 ## Password-hash migration contract
 
@@ -57,9 +58,11 @@ The dedicated `EUAS Security` workflow contains three independent controls:
 
 - **CodeQL / Python** performs static security analysis and publishes supported findings to GitHub code scanning.
 - **Python dependency audit** installs the application dependency set and runs `pip-audit`; known vulnerable resolved dependencies fail the job.
-- **Container image scan** builds the production Dockerfile and runs Trivy against OS and library packages; fixable high/critical findings fail the job.
+- **Container build, smoke and image scan** builds the hardened production Dockerfile, boots the non-root image, verifies the health endpoint, and runs Trivy against OS and library packages; fixable high/critical findings fail the job.
 
-The Trivy GitHub Action is pinned to a full release commit SHA rather than a movable tag. The workflow runs for `main`, pull requests targeting `main`, manual dispatches, and on a weekly schedule. Dependabot separately proposes updates for pip dependencies and GitHub Actions.
+The Trivy GitHub Action is pinned to a full release commit SHA rather than a movable tag. The workflow runs for `main`, pull requests targeting `main`, manual dispatches, and on a weekly schedule. Dependabot separately proposes updates for pip dependencies, GitHub Actions and the Docker base image.
+
+The production image installs a runtime-only dependency set and copies only the application and static assets needed by FastAPI, excluding test tooling and repository engineering metadata from the runtime filesystem.
 
 Security scanning complements, but does not replace, penetration testing, runtime monitoring, infrastructure hardening, secret management, malware scanning for uploads, or deployment-specific threat modeling.
 
