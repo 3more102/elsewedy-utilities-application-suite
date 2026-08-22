@@ -194,6 +194,68 @@ def test_project_task_capability_cannot_promote_executive_role():
                 replace_role_permissions(conn, 'executive', original)
 
 
+def test_sla_policy_revocation_is_immediate_before_policy_lookup():
+    """SLA governance capability changes affect an already-issued bearer."""
+    missing_policy = 2_147_483_647
+    payload = {'response_minutes': 60}
+    with TestClient(app) as client:
+        admin = _login(client, 'omar', 'EUAS@2026')
+        with db() as conn:
+            original = permission_codes_for_role(conn, 'admin')
+        assert 'sla.policy.manage' in original
+
+        baseline = client.patch(
+            f'/api/sla/policies/{missing_policy}', headers=admin, json=payload
+        )
+        assert baseline.status_code == 404, baseline.text
+
+        try:
+            with db() as conn:
+                replace_role_permissions(
+                    conn,
+                    'admin',
+                    [code for code in original if code != 'sla.policy.manage'],
+                )
+
+            denied = client.patch(
+                f'/api/sla/policies/{missing_policy}', headers=admin, json=payload
+            )
+            assert denied.status_code == 403, denied.text
+        finally:
+            with db() as conn:
+                replace_role_permissions(conn, 'admin', original)
+
+        restored = client.patch(
+            f'/api/sla/policies/{missing_policy}', headers=admin, json=payload
+        )
+        assert restored.status_code == 404, restored.text
+
+
+def test_sla_policy_capability_cannot_promote_executive_role():
+    missing_policy = 2_147_483_647
+    payload = {'response_minutes': 60}
+    with TestClient(app) as client:
+        executive = _login(client, 'exec', 'Viewer@2026')
+        with db() as conn:
+            original = permission_codes_for_role(conn, 'executive')
+
+        try:
+            with db() as conn:
+                replace_role_permissions(
+                    conn,
+                    'executive',
+                    sorted(set(original) | {'sla.policy.manage'}),
+                )
+
+            denied = client.patch(
+                f'/api/sla/policies/{missing_policy}', headers=executive, json=payload
+            )
+            assert denied.status_code == 403, denied.text
+        finally:
+            with db() as conn:
+                replace_role_permissions(conn, 'executive', original)
+
+
 def test_permission_management_rejects_unknown_business_capability():
     with TestClient(app) as client:
         admin = _login(client, 'omar', 'EUAS@2026')

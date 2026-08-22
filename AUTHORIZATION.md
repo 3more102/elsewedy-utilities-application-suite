@@ -4,14 +4,23 @@ EUAS uses a staged authorization model that preserves the existing role-based co
 
 ## Compatibility rule
 
-Existing endpoints continue to declare their historical `require_roles(...)` allow-list. For selected high-impact routes, EUAS now adds a database-backed capability overlay.
+Existing endpoints continue to declare their historical `require_roles(...)` allow-list. Selected routes additionally use a database-backed capability overlay.
 
 A request must satisfy **both** controls:
 
 1. the caller's role must still be allowed by the endpoint's historical role policy; and
 2. the caller's role must currently hold the mapped permission code in `role_permissions`.
 
-This is intentionally asymmetric during migration: a permission can remove access immediately, but assigning a permission to a role that was previously denied does **not** grant that role access. This prevents a permission-data migration from accidentally expanding privileges.
+Business/resource rules remain an additional layer. The effective rule is therefore:
+
+```text
+authenticated
+AND historical route role allowed
+AND mapped capability allowed
+AND existing resource/workflow/business rules allowed
+```
+
+This is intentionally asymmetric: a permission can remove access immediately, but assigning a permission to a role that was historically denied does **not** grant that role access. Capability administration can narrow the legacy authorization ceiling; it cannot raise it.
 
 ## Effective permissions
 
@@ -20,7 +29,7 @@ This is intentionally asymmetric during migration: a permission can remove acces
 Consequences:
 
 - a permission revocation applies to an already-issued session on its next request;
-- a grant change does not require logout or token rotation;
+- a grant restoration also applies without logout or token rotation;
 - multiple API workers or replicas sharing the same database observe the same authorization state;
 - session storage remains independent from authorization policy changes.
 
@@ -52,46 +61,118 @@ Content-Type: application/json
 }
 ```
 
-The update is transactional and audit logged as `ROLE_PERMISSIONS_UPDATE`.
+The update is transactional and audit logged as `ROLE_PERMISSIONS_UPDATE`. Unknown capability codes are rejected.
 
-The `admin` role is not allowed to lose `admin.permissions.manage`. This protected recovery grant prevents the system from locking its administrative role out of the permission-management API. Other grants can be removed and later restored through the same API.
+The `admin` role is not allowed to lose `admin.permissions.manage`. This protected recovery grant prevents the system from locking its administrative role out of permission management.
 
-## Additive capability catalog
-
-The current capability wave introduces the following explicit permission codes:
-
-| Permission | Purpose | Default roles |
-| --- | --- | --- |
-| `admin.permissions.manage` | Manage permission grants | admin |
-| `admin.users.manage` | Manage user accounts and activation state | admin |
-| `admin.backup.download` | Download administrative database backups | admin |
-| `operations.automation.run` | Execute the automation engine | admin, maintenance_manager |
-| `operations.automation.read` | Read automation status/run history | admin, maintenance_manager, executive |
-| `observability.metrics.read` | Read application metrics | admin, maintenance_manager, executive |
-| `audit.read` | Read audit records | admin, maintenance_manager, executive |
-| `audit.export` | Export audit records | admin, maintenance_manager, executive |
+## Capability catalog
 
 Default grants are inserted only when a capability code is first created. Subsequent application startups do not re-add grants that an administrator deliberately revoked.
 
-Existing broader permission codes such as `assets.manage`, `work.manage`, `inventory.manage`, `procurement.manage`, `hse.manage`, and `admin.manage` remain in the database for compatibility. They are not silently reinterpreted as new route grants in this wave because their historical seed semantics are broader than some current endpoint role policies.
+Existing broader seed codes such as `assets.manage`, `work.manage`, `inventory.manage`, `procurement.manage`, `hse.manage`, and `admin.manage` remain for compatibility. They are not silently reinterpreted as the newer route capabilities because their historical seed semantics can be broader than individual endpoint role policies.
 
-## Route overlays
+### Security and operations
 
-The first enforcement wave maps these sensitive routes:
+| Permission | Default roles |
+| --- | --- |
+| `admin.permissions.manage` | admin |
+| `admin.users.manage` | admin |
+| `admin.backup.download` | admin |
+| `operations.automation.run` | admin, maintenance_manager |
+| `operations.automation.read` | admin, maintenance_manager, executive |
+| `observability.metrics.read` | admin, maintenance_manager, executive |
+| `audit.read` | admin, maintenance_manager, executive |
+| `audit.export` | admin, maintenance_manager, executive |
 
-| Method | Route | Capability |
-| --- | --- | --- |
-| POST | `/api/admin/users` | `admin.users.manage` |
-| PATCH | `/api/admin/users/{user_id}/status` | `admin.users.manage` |
-| GET | `/api/admin/backup` | `admin.backup.download` |
-| POST | `/api/automation/run` | `operations.automation.run` |
-| GET | `/api/automation/status` | `operations.automation.read` |
-| GET | `/api/automation/runs` | `operations.automation.read` |
-| GET | `/api/metrics` | `observability.metrics.read` |
-| GET | `/api/audit` | `audit.read` |
-| GET | `/api/exports/audit.csv` | `audit.export` |
+### Assets
 
-The map is deliberately small and explicit. Additional business routes can migrate incrementally after their current role semantics and test coverage are reviewed.
+| Permission | Default roles |
+| --- | --- |
+| `assets.create` | admin, asset_manager, maintenance_manager, planner, supervisor |
+| `assets.update` | admin, asset_manager, maintenance_manager, planner, supervisor |
+| `assets.delete` | admin, asset_manager |
+| `assets.health.recalculate` | admin, asset_manager, maintenance_manager, planner, supervisor |
+| `assets.field.update` | admin, maintenance_manager, planner, supervisor, technician |
+| `assets.meter.reading.write` | admin, maintenance_manager, planner, supervisor, technician |
+
+### Work management
+
+| Permission | Default roles |
+| --- | --- |
+| `work.create` | admin, asset_manager, maintenance_manager, planner, supervisor |
+| `work.update` | admin, asset_manager, maintenance_manager, planner, supervisor |
+| `work.transition` | admin, maintenance_manager, planner, supervisor, technician |
+| `work.material.plan` | admin, maintenance_manager, planner, supervisor, storekeeper |
+| `work.material.reserve` | admin, maintenance_manager, planner, supervisor, storekeeper |
+| `work.craft.plan` | admin, maintenance_manager, planner, supervisor |
+| `work.labor.post` | admin, maintenance_manager, planner, supervisor, technician |
+| `work.material.issue` | admin, maintenance_manager, planner, storekeeper, technician |
+| `work.notes.write` | admin, maintenance_manager, planner, supervisor, technician |
+| `work.tasks.manage` | admin, maintenance_manager, planner, supervisor, technician |
+| `work.dispatch` | admin, maintenance_manager, planner, supervisor |
+
+### Inventory and procurement
+
+| Permission | Default roles |
+| --- | --- |
+| `inventory.create` | admin, storekeeper, maintenance_manager |
+| `inventory.transaction.post` | admin, maintenance_manager, planner, storekeeper, technician |
+| `inventory.reorder.scan` | admin, storekeeper, maintenance_manager, procurement |
+| `procurement.requisition.create` | admin, storekeeper, maintenance_manager, procurement, planner |
+| `procurement.requisition.submit` | admin, storekeeper, maintenance_manager, procurement, planner |
+| `procurement.requisition.approve` | admin, maintenance_manager, procurement |
+| `procurement.quotation.create` | admin, maintenance_manager, procurement |
+| `procurement.purchase_order.create` | admin, maintenance_manager, procurement |
+| `procurement.purchase_order.receive` | admin, procurement, storekeeper |
+
+### HSE, projects, SLA and governance
+
+| Permission | Default roles |
+| --- | --- |
+| `hse.incident.create` | admin, hse, maintenance_manager |
+| `hse.incident.update` | admin, hse, maintenance_manager |
+| `projects.create` | admin, project_manager, maintenance_manager |
+| `projects.tasks.create` | admin, project_manager, maintenance_manager |
+| `projects.tasks.update` | admin, project_manager, maintenance_manager |
+| `sla.policy.manage` | admin, maintenance_manager |
+| `governance.retention.manage` | admin |
+| `integrations.outbox.retry` | admin, maintenance_manager |
+
+## Business mutation coverage
+
+Capability-enforced mutation families now cover:
+
+- Assets, including field condition/meter writes;
+- Work Management;
+- Inventory;
+- Procurement;
+- HSE;
+- Projects; and
+- SLA/Governance, including integration outbox retry.
+
+The authorization contract test enumerates FastAPI routes and fails CI when a `POST`, `PUT`, `PATCH`, or `DELETE` route appears inside a migrated family without a capability overlay or a documented exemption.
+
+The only current business-mutation-prefix exemption is:
+
+```text
+POST /api/assets/{asset_id}/dossier
+```
+
+That endpoint creates an immutable report snapshot for an authenticated reader and does not mutate the asset business record.
+
+## Structural authorization contract
+
+CI verifies all of the following:
+
+1. every overlay points to exactly one registered route;
+2. every overlay references a defined capability;
+3. every capability's default role set exactly equals the route's historical `require_roles(...)` set;
+4. every migrated business domain remains present in the mutation-coverage map;
+5. every state-changing route inside a migrated family has an overlay or a documented real-route exemption;
+6. permission-management endpoints retain the protected `admin.permissions.manage` capability; and
+7. the protected recovery capability is not reused as an ordinary route overlay.
+
+This structural gate complements API regressions that prove an existing session immediately loses access after capability revocation and that assigning a capability to a historically forbidden role still yields `403`.
 
 ## Operational guidance
 
