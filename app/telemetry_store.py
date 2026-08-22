@@ -313,7 +313,10 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
     normalized: list[tuple[object, str, str]] = []
     for reading in body.readings:
         code = reading.channel_code.strip().upper()
-        captured = reading.captured_at or now()
+        # Explicit SCADA/client event times retain exact caller semantics. When a
+        # caller omits captured_at, generate higher-resolution local event time so
+        # rapid legacy API calls do not collapse into one equal-second generation.
+        captured = reading.captured_at or datetime.now().isoformat(timespec='microseconds')
         try:
             _event_instant(captured)
         except (TypeError, ValueError):
