@@ -13,6 +13,8 @@ import re
 
 from . import database
 
+_SERIAL_ID_CACHE: dict[str, bool] = {}
+
 
 def _type_null_check_binds(sql: str) -> str:
     """Give standalone NULL-test parameters an explicit PostgreSQL type.
@@ -55,9 +57,60 @@ def _postgres_cursor_iter(cursor):
         yield row
 
 
+def _table_has_serial_id(raw, table: str) -> bool:
+    cached = _SERIAL_ID_CACHE.get(table)
+    if cached is not None:
+        return cached
+    with raw.cursor() as probe:
+        probe.execute("SELECT pg_get_serial_sequence(%s, 'id')", (table,))
+        row = probe.fetchone()
+    result = bool(row and row[0])
+    _SERIAL_ID_CACHE[table] = result
+    return result
+
+
+def _postgres_execute(connection, sql, args=()):
+    """Execute SQL and capture generated IDs from the statement that made them.
+
+    The old adapter implemented ``lastrowid`` lazily with PostgreSQL LASTVAL().
+    That is session-global: if application code inserted an audit/event row
+    before reading an earlier cursor's ``lastrowid``, the cursor returned the
+    later table's sequence value. EUAS does exactly that in several endpoints.
+
+    For INSERTs into tables whose ``id`` column owns a serial/identity sequence,
+    append ``RETURNING id`` and snapshot the row immediately. This is
+    transaction- and concurrency-safe, preserves ON CONFLICT DO NOTHING
+    semantics, and makes the cursor behave like sqlite's statement-local
+    ``lastrowid``.
+    """
+    translated = _pg_insert_or_ignore(sql)
+    insert = re.match(r'^\s*INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_.]*)\b', translated, flags=re.I)
+    return_id = bool(insert and _table_has_serial_id(connection.raw, insert.group(1)))
+    if return_id:
+        translated = translated.rstrip().rstrip(';') + ' RETURNING id'
+
+    cur = connection.raw.cursor()
+    cur.execute(translated, tuple(args or ()))
+    generated_id = None
+    if return_id:
+        row = cur.fetchone()
+        generated_id = row[0] if row else None
+
+    wrapped = database.PostgresCursor(cur, connection.raw)
+    wrapped._lastrowid = generated_id
+    return wrapped
+
+
+def _statement_local_lastrowid(cursor):
+    """Return only the ID captured from this cursor's own INSERT statement."""
+    return cursor._lastrowid
+
+
 def apply_postgres_compat() -> None:
     """Install compatibility functions on the database module exactly once."""
     database._pg_sql = _pg_sql
     database._pg_insert_or_ignore = _pg_insert_or_ignore
+    database.PostgresConnection.execute = _postgres_execute
+    database.PostgresCursor.lastrowid = property(_statement_local_lastrowid)
     if '__iter__' not in database.PostgresCursor.__dict__:
         database.PostgresCursor.__iter__ = _postgres_cursor_iter
