@@ -12,6 +12,7 @@ SESSION_TOKEN_BYTES = 48
 SESSION_TOUCH_INTERVAL_SECONDS = 300
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_FAILURES = 5
+CLIENT_LOGIN_MAX_FAILURES = 20
 LOGIN_LOCK_BASE_SECONDS = 30
 LOGIN_LOCK_MAX_SECONDS = 5 * 60
 
@@ -29,7 +30,12 @@ def token_digest(token: str) -> str:
 def login_scope_digest(username: str, client_host: str) -> str:
     normalized = (username or '').strip().casefold()
     host = (client_host or 'unknown').strip().casefold()
-    return hashlib.sha256(f'{normalized}\0{host}'.encode('utf-8')).hexdigest()
+    return hashlib.sha256(f'account\0{normalized}\0{host}'.encode('utf-8')).hexdigest()
+
+
+def client_login_scope_digest(client_host: str) -> str:
+    host = (client_host or 'unknown').strip().casefold()
+    return hashlib.sha256(f'client\0{host}'.encode('utf-8')).hexdigest()
 
 
 def client_label(user_agent: str) -> str:
@@ -335,9 +341,14 @@ def throttle_status(
 
 
 def record_login_failure(
-    conn, scope_digest: str, *, at: Optional[datetime] = None
+    conn,
+    scope_digest: str,
+    *,
+    at: Optional[datetime] = None,
+    max_failures: int = LOGIN_MAX_FAILURES,
 ) -> dict:
     current = at or datetime.now()
+    threshold = max(1, int(max_failures))
     stamp = _stamp(current)
     cutoff = _stamp(current - timedelta(seconds=LOGIN_WINDOW_SECONDS))
     conn.execute(
@@ -364,8 +375,8 @@ def record_login_failure(
     ).fetchone()
     failures = int(row['failure_count'])
     blocked_until = None
-    if failures >= LOGIN_MAX_FAILURES:
-        exponent = max(0, failures - LOGIN_MAX_FAILURES)
+    if failures >= threshold:
+        exponent = max(0, failures - threshold)
         lock_seconds = min(LOGIN_LOCK_BASE_SECONDS * (2 ** exponent), LOGIN_LOCK_MAX_SECONDS)
         blocked_until = current + timedelta(seconds=lock_seconds)
         conn.execute(
