@@ -1,0 +1,57 @@
+name: Apply EUAS Session Hardening
+
+on:
+  push:
+    branches: ["dev/session-token-hardening"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: euas-session-hardening-apply
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout migration branch
+        uses: actions/checkout@v6
+        with:
+          ref: dev/session-token-hardening
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Apply assertion-guarded source migration
+        run: python scripts/apply_session_token_hardening.py
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile migrated backend
+        run: python -m compileall -q app scripts
+
+      - name: Run session and credential regression tests
+        env:
+          EUAS_DB_PATH: /tmp/euas_session_migration.db
+          EUAS_VERSION: 3.9.0
+        run: pytest -q tests/test_auth_security.py tests/test_session_security.py
+
+      - name: Commit migrated product sources
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "feat: migrate bearer sessions to digest-only storage"
+          git push origin HEAD:dev/session-token-hardening
