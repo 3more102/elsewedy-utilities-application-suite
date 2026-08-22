@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException
 
@@ -50,12 +50,7 @@ def _event_instant(value: str | datetime) -> datetime:
 
 
 def _is_temporally_current(captured_at: str, last_reading_at: str | None) -> bool:
-    """Only a strictly newer event-time reading may advance live state.
-
-    Equal event timestamps have no deterministic event-time ordering, so the
-    first serialized arrival remains the live representative and later equal-time
-    readings are retained as historical evidence only.
-    """
+    """Only a strictly newer event-time reading may advance live state."""
     if not last_reading_at:
         return True
     try:
@@ -63,6 +58,34 @@ def _is_temporally_current(captured_at: str, last_reading_at: str | None) -> boo
     except (TypeError, ValueError):
         # Allow valid incoming evidence to repair an invalid legacy marker.
         return True
+
+
+def _implicit_capture_after(last_reading_at: str | None) -> str:
+    """Return a server-local microsecond marker strictly after current live state.
+
+    Untimestamped telemetry historically followed arrival order. Generate its
+    event time only after the channel lock is held so concurrent legacy callers
+    are serialized by the database rather than by request-start timing. If the
+    host clock is equal to or behind the stored marker, synthesize the next
+    microsecond while retaining EUAS' historical naive-local storage format.
+    """
+    candidate = datetime.now().isoformat(timespec='microseconds')
+    if not last_reading_at:
+        return candidate
+    try:
+        if _event_instant(candidate) > _event_instant(last_reading_at):
+            return candidate
+        target_utc = (
+            _event_instant(last_reading_at).replace(tzinfo=timezone.utc)
+            + timedelta(microseconds=1)
+        )
+        return (
+            target_utc.astimezone()
+            .replace(tzinfo=None)
+            .isoformat(timespec='microseconds')
+        )
+    except (TypeError, ValueError):
+        return candidate
 
 
 def _resolve_and_lock_channels(conn, channel_codes: list[str]) -> dict[str, int]:
@@ -309,19 +332,17 @@ def evaluate_telemetry_alarm_atomic(
 
 
 def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
-    """Persist every reading; advance current state only by event time."""
-    normalized: list[tuple[object, str, str]] = []
+    """Persist every reading; advance current state only by explicit event time."""
+    normalized: list[tuple[object, str, str | None]] = []
     for reading in body.readings:
         code = reading.channel_code.strip().upper()
-        # Explicit SCADA/client event times retain exact caller semantics. When a
-        # caller omits captured_at, generate higher-resolution local event time so
-        # rapid legacy API calls do not collapse into one equal-second generation.
-        captured = reading.captured_at or datetime.now().isoformat(timespec='microseconds')
-        try:
-            _event_instant(captured)
-        except (TypeError, ValueError):
-            raise HTTPException(400, f'Invalid captured_at for telemetry channel {code}')
-        normalized.append((reading, code, captured))
+        explicit_capture = reading.captured_at
+        if explicit_capture is not None:
+            try:
+                _event_instant(explicit_capture)
+            except (TypeError, ValueError):
+                raise HTTPException(400, f'Invalid captured_at for telemetry channel {code}')
+        normalized.append((reading, code, explicit_capture))
 
     channel_ids = _resolve_and_lock_channels(
         conn,
@@ -337,8 +358,13 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
         'results': [],
     }
 
-    for reading, code, captured in normalized:
+    for reading, code, explicit_capture in normalized:
         channel = _load_channel(conn, channel_ids[code])
+        captured = (
+            explicit_capture
+            if explicit_capture is not None
+            else _implicit_capture_after(channel.get('last_reading_at'))
+        )
         source = reading.source or channel['source_system'] or 'Manual'
         conn.execute(
             '''INSERT INTO telemetry_readings(
@@ -356,7 +382,10 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
         )
         summary['accepted'] += 1
 
-        if not _is_temporally_current(captured, channel.get('last_reading_at')):
+        if explicit_capture is not None and not _is_temporally_current(
+            captured,
+            channel.get('last_reading_at'),
+        ):
             summary['historical'] += 1
             summary['results'].append(
                 {
