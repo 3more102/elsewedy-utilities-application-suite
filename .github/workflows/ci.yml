@@ -116,5 +116,8 @@ jobs:
       - name: Run PostgreSQL dispatch assignment concurrency smoke
         run: python scripts/dispatch_assignment_concurrency_smoke.py
 
+      - name: Run PostgreSQL dispatch redispatch concurrency smoke
+        run: python scripts/dispatch_redispatch_concurrency_smoke.py
+
       - name: Run live PostgreSQL HTTP smoke
         run: python scripts/postgres_smoke_test.py
