@@ -14,14 +14,26 @@ import re
 from . import database
 
 
+def _type_null_check_binds(sql: str) -> str:
+    """Give standalone NULL-test parameters an explicit PostgreSQL type.
+
+    PostgreSQL cannot infer the type of an untyped NULL parameter when the
+    parameter appears only in ``%s IS NULL``. Casting that parameter to TEXT is
+    semantics-preserving because the expression tests nullness only; the value
+    is never compared as text. This also keeps the original placeholder count
+    and argument ordering intact.
+    """
+    return re.sub(r'%s\s+IS\s+NULL', 'CAST(%s AS TEXT) IS NULL', sql, flags=re.I)
+
+
 def _pg_sql(sql: str) -> str:
     """Translate EUAS qmark SQL to psycopg while preserving literal `%`."""
     converted = sql.replace('INSERT OR IGNORE INTO', 'INSERT INTO')
     # psycopg treats every percent sign in a parameterized query as part of its
     # placeholder syntax. EUAS SQL uses qmark binds, so existing percent signs
     # are literals (primarily LIKE wildcards) and must be doubled first.
-    converted = converted.replace('%', '%%')
-    return converted.replace('?', '%s')
+    converted = converted.replace('%', '%%').replace('?', '%s')
+    return _type_null_check_binds(converted)
 
 
 def _pg_insert_or_ignore(sql: str) -> str:
@@ -30,6 +42,7 @@ def _pg_insert_or_ignore(sql: str) -> str:
         return _pg_sql(sql)
     converted = re.sub(r'INSERT\s+OR\s+IGNORE\s+INTO', 'INSERT INTO', sql, flags=re.I)
     converted = converted.replace('%', '%%').replace('?', '%s').rstrip().rstrip(';')
+    converted = _type_null_check_binds(converted)
     return converted + ' ON CONFLICT DO NOTHING'
 
 
