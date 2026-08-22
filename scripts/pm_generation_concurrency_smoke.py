@@ -16,6 +16,7 @@ from app.database import db
 from app.main import app  # import triggers the production compatibility composition
 from app.pm_startup import initialize_pm_generation_support
 from app.pm_store import generate_due_pm_atomic
+from app.work_creation_startup import initialize_work_creation_support
 
 
 WORKERS = 8
@@ -58,6 +59,10 @@ def _admin_and_asset():
     with db() as conn:
         ensure_audit_chain_lock(conn)
         initialize_pm_generation_support(conn)
+        # The composed PM generator now shares the global work-order number
+        # coordinator with every other work creator. Standalone smokes bypass
+        # lifespan startup, so bootstrap that dependency explicitly here.
+        initialize_work_creation_support(conn)
         user = conn.execute(
             """SELECT u.id,u.full_name,r.code role FROM users u
                JOIN roles r ON r.id=u.role_id WHERE u.username='omar'"""
