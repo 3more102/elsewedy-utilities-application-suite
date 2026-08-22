@@ -42,7 +42,7 @@ def seed_work(suffix: str, status: str, user: dict, assigned_to=None):
             '''INSERT INTO work_orders(
                  wo_no,title,priority,status,work_type,requested_by,assigned_to,
                  created_at,updated_at
-               ) VALUES(?,?,'Medium',?,'Corrective Maintenance',?,?,?,?,?)''',
+               ) VALUES(?,?,'Medium',?,'Corrective Maintenance',?,?,?,?)''',
             (
                 number,
                 'PostgreSQL workflow race',
