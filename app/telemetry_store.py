@@ -25,6 +25,18 @@ def _rowcount_one(cursor) -> bool:
     return int(cursor.rowcount or 0) == 1
 
 
+def _implicit_capture_time() -> str:
+    """Generate an arrival-time capture marker with sub-second precision.
+
+    The historical ``now()`` helper intentionally records only whole seconds.
+    Telemetry can ingest multiple live readings in one second, so using that
+    value as event time would make later implicit readings look like equal-time
+    replays. Keep the established local-naive timestamp shape while adding the
+    precision required for strict temporal ordering.
+    """
+    return datetime.now().isoformat(timespec='microseconds')
+
+
 def _event_instant(value: str | datetime) -> datetime:
     """Normalize an ISO-8601 capture value to a comparable UTC-naive instant."""
     if isinstance(value, datetime):
@@ -107,7 +119,7 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
 
     for reading in body.readings:
         channel_code = reading.channel_code.strip().upper()
-        captured = reading.captured_at or now()
+        captured = reading.captured_at or _implicit_capture_time()
         try:
             _event_instant(captured)
         except (TypeError, ValueError):
