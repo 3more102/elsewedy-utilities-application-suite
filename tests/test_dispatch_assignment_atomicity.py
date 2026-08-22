@@ -27,13 +27,24 @@ def admin(conn) -> dict:
     return dict(row)
 
 
-def technician_id(conn) -> int:
-    row = conn.execute(
-        """SELECT u.id FROM users u JOIN roles r ON r.id=u.role_id
-           WHERE r.code='technician' AND u.active=1 ORDER BY u.id LIMIT 1"""
-    ).fetchone()
-    assert row
-    return int(row['id'])
+def create_technician(conn, suffix: str) -> int:
+    role = conn.execute("SELECT id FROM roles WHERE code='technician'").fetchone()
+    seed_hash = conn.execute('SELECT password_hash FROM users ORDER BY id LIMIT 1').fetchone()
+    assert role and seed_hash
+    cur = conn.execute(
+        '''INSERT INTO users(
+             username,password_hash,full_name,email,role_id,active,created_at
+           ) VALUES(?,?,?,?,?,1,?)''',
+        (
+            f'ci-dispatch-tech-{suffix}',
+            seed_hash['password_hash'],
+            f'CI Dispatch Technician {suffix}',
+            f'ci-dispatch-tech-{suffix}@example.test',
+            role['id'],
+            now(),
+        ),
+    )
+    return int(cur.lastrowid)
 
 
 def seed_work(conn, suffix: str, requester_id: int, status: str = 'Approved') -> int:
@@ -78,7 +89,7 @@ def test_same_technician_cannot_be_concurrently_dispatched_to_multiple_work_orde
         suffix = uuid.uuid4().hex[:10]
         with db() as conn:
             user = admin(conn)
-            tech_id = technician_id(conn)
+            tech_id = create_technician(conn, suffix + '-B')
             work_ids = [seed_work(conn, f'{suffix}-{i}', user['id']) for i in range(WORKERS)]
             snapshots = [load_dispatch_work_snapshot(conn, work_id) for work_id in work_ids]
 
@@ -124,7 +135,7 @@ def test_same_work_snapshot_has_exactly_one_assignment_winner():
         suffix = uuid.uuid4().hex[:10]
         with db() as conn:
             user = admin(conn)
-            tech_id = technician_id(conn)
+            tech_id = create_technician(conn, suffix + '-S')
             work_id = seed_work(conn, suffix, user['id'])
             snapshot = load_dispatch_work_snapshot(conn, work_id)
 
@@ -166,7 +177,7 @@ def test_stale_work_snapshot_cannot_dispatch_terminal_work():
         suffix = uuid.uuid4().hex[:10]
         with db() as conn:
             user = admin(conn)
-            tech_id = technician_id(conn)
+            tech_id = create_technician(conn, suffix + '-T')
             work_id = seed_work(conn, suffix, user['id'])
             snapshot = load_dispatch_work_snapshot(conn, work_id)
             conn.execute(
@@ -203,27 +214,11 @@ def test_independent_assignments_get_unique_dispatch_numbers():
         workers = 4
         with db() as conn:
             user = admin(conn)
-            role = conn.execute("SELECT id FROM roles WHERE code='technician'").fetchone()
-            seed_hash = conn.execute('SELECT password_hash FROM users ORDER BY id LIMIT 1').fetchone()
-            assert role and seed_hash
             tech_ids = []
             work_ids = []
             snapshots = []
             for index in range(workers):
-                tech = conn.execute(
-                    '''INSERT INTO users(
-                         username,password_hash,full_name,email,role_id,active,created_at
-                       ) VALUES(?,?,?,?,?,1,?)''',
-                    (
-                        f'ci-tech-{suffix}-{index}',
-                        seed_hash['password_hash'],
-                        f'CI Technician {index}',
-                        f'ci-tech-{suffix}-{index}@example.test',
-                        role['id'],
-                        now(),
-                    ),
-                )
-                tech_ids.append(int(tech.lastrowid))
+                tech_ids.append(create_technician(conn, f'{suffix}-N-{index}'))
                 work_id = seed_work(conn, f'{suffix}-N-{index}', user['id'])
                 work_ids.append(work_id)
                 snapshots.append(load_dispatch_work_snapshot(conn, work_id))
