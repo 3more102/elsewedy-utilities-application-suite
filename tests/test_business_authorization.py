@@ -132,6 +132,68 @@ def test_procurement_approval_capability_cannot_promote_executive_role():
                 replace_role_permissions(conn, 'executive', original)
 
 
+def test_project_task_revocation_is_immediate_before_project_lookup():
+    """Project task capability changes affect an already-issued bearer."""
+    missing_project = 2_147_483_647
+    payload = {'task_name': 'Authorization contract probe'}
+    with TestClient(app) as client:
+        admin = _login(client, 'omar', 'EUAS@2026')
+        with db() as conn:
+            original = permission_codes_for_role(conn, 'admin')
+        assert 'projects.tasks.create' in original
+
+        baseline = client.post(
+            f'/api/projects/{missing_project}/tasks', headers=admin, json=payload
+        )
+        assert baseline.status_code == 404, baseline.text
+
+        try:
+            with db() as conn:
+                replace_role_permissions(
+                    conn,
+                    'admin',
+                    [code for code in original if code != 'projects.tasks.create'],
+                )
+
+            denied = client.post(
+                f'/api/projects/{missing_project}/tasks', headers=admin, json=payload
+            )
+            assert denied.status_code == 403, denied.text
+        finally:
+            with db() as conn:
+                replace_role_permissions(conn, 'admin', original)
+
+        restored = client.post(
+            f'/api/projects/{missing_project}/tasks', headers=admin, json=payload
+        )
+        assert restored.status_code == 404, restored.text
+
+
+def test_project_task_capability_cannot_promote_executive_role():
+    missing_project = 2_147_483_647
+    payload = {'task_name': 'Authorization contract probe'}
+    with TestClient(app) as client:
+        executive = _login(client, 'exec', 'Viewer@2026')
+        with db() as conn:
+            original = permission_codes_for_role(conn, 'executive')
+
+        try:
+            with db() as conn:
+                replace_role_permissions(
+                    conn,
+                    'executive',
+                    sorted(set(original) | {'projects.tasks.create'}),
+                )
+
+            denied = client.post(
+                f'/api/projects/{missing_project}/tasks', headers=executive, json=payload
+            )
+            assert denied.status_code == 403, denied.text
+        finally:
+            with db() as conn:
+                replace_role_permissions(conn, 'executive', original)
+
+
 def test_permission_management_rejects_unknown_business_capability():
     with TestClient(app) as client:
         admin = _login(client, 'omar', 'EUAS@2026')

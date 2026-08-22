@@ -143,6 +143,26 @@ PERMISSION_CATALOG: dict[str, tuple[str, tuple[str, ...]]] = {
         'Receive purchase orders into inventory',
         ('admin', 'procurement', 'storekeeper'),
     ),
+    'hse.incident.create': (
+        'Create HSE incident records',
+        ('admin', 'hse', 'maintenance_manager'),
+    ),
+    'hse.incident.update': (
+        'Update HSE incident records and state',
+        ('admin', 'hse', 'maintenance_manager'),
+    ),
+    'projects.create': (
+        'Create projects',
+        ('admin', 'project_manager', 'maintenance_manager'),
+    ),
+    'projects.tasks.create': (
+        'Create project tasks',
+        ('admin', 'project_manager', 'maintenance_manager'),
+    ),
+    'projects.tasks.update': (
+        'Update project tasks and progress',
+        ('admin', 'project_manager', 'maintenance_manager'),
+    ),
 }
 
 # FastAPI's matched route template is used for parameterized paths. Each entry
@@ -185,6 +205,11 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('POST', '/api/procurement/quotations'): 'procurement.quotation.create',
     ('POST', '/api/procurement/purchase-orders'): 'procurement.purchase_order.create',
     ('POST', '/api/procurement/purchase-orders/{po_id}/receive'): 'procurement.purchase_order.receive',
+    ('POST', '/api/hse'): 'hse.incident.create',
+    ('PATCH', '/api/hse/{incident_id}'): 'hse.incident.update',
+    ('POST', '/api/projects'): 'projects.create',
+    ('POST', '/api/projects/{project_id}/tasks'): 'projects.tasks.create',
+    ('PATCH', '/api/projects/{project_id}/tasks/{task_id}'): 'projects.tasks.update',
 }
 
 # Once a business route family is listed here, every state-changing route in
@@ -195,6 +220,8 @@ CAPABILITY_ENFORCED_MUTATION_PREFIXES: dict[str, tuple[str, ...]] = {
     'work_management': ('/api/work-orders',),
     'inventory': ('/api/inventory',),
     'procurement': ('/api/procurement',),
+    'hse': ('/api/hse',),
+    'projects': ('/api/projects',),
 }
 
 CAPABILITY_MUTATION_EXEMPTIONS: dict[tuple[str, str], str] = {
