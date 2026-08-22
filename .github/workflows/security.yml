@@ -66,7 +66,7 @@ jobs:
         run: python -m pip_audit --local
 
   container-scan:
-    name: Container image vulnerability scan
+    name: Container build, smoke and vulnerability scan
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -75,6 +75,34 @@ jobs:
 
       - name: Build EUAS image
         run: docker build --pull --tag euas-security:${{ github.sha }} .
+
+      - name: Smoke-test production image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name euas-security-smoke --publish 8879:8000 euas-security:${{ github.sha }}
+          cleanup() { docker logs euas-security-smoke || true; docker rm --force euas-security-smoke >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          healthy=0
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:8879/api/health >/tmp/euas-health.json; then
+              healthy=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$healthy" -ne 1 ]; then
+            echo "EUAS container did not become healthy" >&2
+            exit 1
+          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          payload = json.loads(Path('/tmp/euas-health.json').read_text())
+          assert payload['status'] == 'ok', payload
+          assert payload['database_backend'] == 'sqlite', payload
+          print(json.dumps(payload, sort_keys=True))
+          PY
 
       - name: Scan image for high and critical vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
