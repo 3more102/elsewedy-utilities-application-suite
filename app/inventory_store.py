@@ -79,14 +79,18 @@ from .procurement_store import install_procurement_routes
 from .reservation_authorization import install_reservation_authorization_contract
 from .reservation_store import install_reservation_routes
 from .transfer_startup import install_inventory_transfer_startup
+from .work_creation_authorization import install_alarm_work_authorization_contract
+from .work_creation_startup import install_work_creation_startup
 from .workflow_authorization import install_workflow_authorization_contract
 from .workflow_store import install_workflow_transition_routes
 
 install_reservation_authorization_contract()
 install_workflow_authorization_contract()
+install_alarm_work_authorization_contract()
 install_dispatch_assignment_startup()
 install_inventory_transfer_startup()
 install_pm_generation_startup()
+install_work_creation_startup()
 install_procurement_routes()
 install_atomic_approval_route()
 install_reservation_routes()
