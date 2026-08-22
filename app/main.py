@@ -16,6 +16,7 @@ for _name, _value in vars(_application).items():
     if not _name.startswith('__'):
         globals()[_name] = _value
 
+from .audit_store import append_audit, ensure_audit_chain_lock
 from .auth import (
     current_user,
     hash_password,
@@ -54,6 +55,12 @@ from .inventory_store import (
     issue_unreserved_stock,
 )
 
+# All original application handlers resolve ``audit`` from the application
+# module at call time. Replacing that one module global serializes the existing
+# tamper-evident chain without rewriting every business endpoint.
+audit = append_audit
+_application.audit = append_audit
+
 app = _application.app
 _legacy_metrics = _application.metrics
 
@@ -81,6 +88,8 @@ _original_lifespan = app.router.lifespan_context
 @asynccontextmanager
 async def _security_lifespan(app_instance):
     initialize_auth_database(hash_password)
+    with db() as conn:
+        ensure_audit_chain_lock(conn)
     async with _original_lifespan(app_instance):
         with db() as conn:
             ensure_permission_catalog(conn)
@@ -643,6 +652,7 @@ def metrics(user=Depends(require_roles('admin', 'maintenance_manager', 'executiv
 # functions while the FastAPI router retains the hardened handlers registered
 # above.
 for _export in (
+    'audit',
     'login',
     'logout',
     'change_password',
