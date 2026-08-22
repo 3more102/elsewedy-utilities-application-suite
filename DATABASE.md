@@ -1,10 +1,10 @@
 # EUAS Database Architecture
 
-EUAS v3.9.0 supports two runtime database modes behind the same application service boundary.
+EUAS v4.0.0 supports two runtime database modes behind the same application service boundary.
 
 ## 1. SQLite reference mode
 
-This is the default zero-configuration mode used for local demos, QA and presentations.
+SQLite remains the default zero-configuration mode for local development, demonstrations and lightweight QA.
 
 ```text
 EUAS_DB_PATH=./euas.db
@@ -17,18 +17,19 @@ Characteristics:
 - explicit indexes
 - automatic schema creation and demo seeding
 - no external database server required
+- full regression coverage in CI on Python 3.11 and Python 3.12
 
-## 2. PostgreSQL mode
+SQLite reference mode is not the recommended multi-user production database.
 
-Set:
+## 2. PostgreSQL production-target mode
+
+Configure a PostgreSQL URL:
 
 ```text
 EUAS_DATABASE_URL=postgresql://euas:<password>@<host>:5432/euas
 ```
 
-When a PostgreSQL URL is present, EUAS selects the PostgreSQL adapter instead of SQLite. The adapter provides parameter translation, PostgreSQL DDL conversion, transaction handling and generated-ID retrieval while keeping the application APIs unchanged.
-
-Install the project requirements in the target environment. PostgreSQL mode requires `psycopg`.
+When a PostgreSQL URL is present, EUAS selects the PostgreSQL adapter instead of SQLite. PostgreSQL mode requires `psycopg`, which is included in `requirements.txt`.
 
 ### Docker Compose
 
@@ -36,17 +37,27 @@ Install the project requirements in the target environment. PostgreSQL mode requ
 docker compose -f docker-compose.postgres.yml up --build
 ```
 
-Set a non-default password before production use:
+Set a non-default password before any non-development deployment:
 
 ```bash
 export EUAS_POSTGRES_PASSWORD='replace-with-a-secret'
 ```
 
-### Connectivity preflight
+## PostgreSQL compatibility contract
 
-```bash
-EUAS_DATABASE_URL=postgresql://... python scripts/postgres_preflight.py
-```
+EUAS v4.0.0 retains the SQLite-shaped application query layer while hardening the PostgreSQL adapter in `app/postgres_compat.py`.
+
+The compatibility layer currently provides:
+
+- SQLite qmark (`?`) bind translation to psycopg `%s` binds
+- literal `%` escaping for parameterized PostgreSQL queries such as SQL `LIKE` patterns
+- typed standalone nullable bind checks for PostgreSQL type inference
+- SQLite-style direct cursor iteration
+- statement-local generated IDs using `RETURNING id`
+- safe detection of serial/identity `id` columns through `information_schema`
+- `INSERT OR IGNORE` translation to `ON CONFLICT DO NOTHING`
+
+The v4 generated-ID implementation intentionally does **not** use a lazy session-global `LASTVAL()` result. Endpoints can insert audit/event records after their business row, so the originating insert must retain its own generated ID.
 
 ## Schema versioning
 
@@ -56,80 +67,133 @@ EUAS records applied schema versions in:
 schema_migrations
 ```
 
-Current schema version: **2**.
+Current application schema contract: **version 9**.
 
-The startup initializer is idempotent for the reference application: it creates missing tables/indexes and records the current schema version. For a large production rollout, replace startup DDL with a dedicated migration tool and controlled deployment pipeline.
+Fresh installations create the complete v9 schema and seed data idempotently. The current startup initializer is suitable for fresh/reference environments and additive table/index creation, but it is **not claimed as a complete production migration framework for arbitrary historical schemas**.
 
-## Important validation note
+For controlled production upgrades, use a reviewed migration process and validate the target database before traffic is enabled.
 
-SQLite initialization and the full EUAS regression suite are executed in the supplied build environment. The PostgreSQL adapter SQL translation contract is unit-tested. A live PostgreSQL server is not available in the current build sandbox, and the sandbox has no internet access to install the missing PostgreSQL driver, so a live PostgreSQL integration test is **not claimed** in this release.
+## Production readiness gate
 
-The target deployment should run:
+EUAS v4 adds a deterministic deployment check:
 
-1. `python scripts/postgres_preflight.py`
-2. application startup against an empty PostgreSQL database
-3. `python scripts/smoke_test.py` adapted to that environment or equivalent CI API smoke
-4. backup/restore validation before go-live
+```bash
+python scripts/production_readiness.py
+```
 
-## Production recommendations
+For a production PostgreSQL deployment:
 
-- managed PostgreSQL or HA cluster
-- encrypted connections and secret manager
-- automated backup / point-in-time recovery
-- migration approval in CI/CD
+```bash
+EUAS_ENV=production \
+EUAS_DATABASE_URL=postgresql://... \
+python scripts/production_readiness.py --strict-production --require-postgres --check-db
+```
+
+The gate validates deployment configuration, PostgreSQL selection, database initialization/connectivity, critical tables, seed integrity and the active schema contract. It also reports webhook-signing, scheduler, session-lifetime and upload-limit readiness.
+
+## PostgreSQL connectivity preflight
+
+Run:
+
+```bash
+EUAS_DATABASE_URL=postgresql://... python scripts/postgres_preflight.py
+```
+
+This verifies that the configured server is reachable and reports the connected PostgreSQL database/user/server version.
+
+## Live PostgreSQL CI evidence
+
+Unlike v3.x, EUAS v4.0.0 has a live PostgreSQL integration lane in GitHub Actions using PostgreSQL 16.
+
+The CI gate boots a fresh PostgreSQL service and validates:
+
+1. database connectivity preflight
+2. strict production-readiness checks
+3. application startup against PostgreSQL
+4. health and readiness endpoints
+5. security response headers
+6. administrator authentication
+7. dashboard read paths
+8. asset retrieval
+9. generated-ID work-order creation and persistence
+10. telemetry-channel creation
+11. telemetry-reading ingestion
+12. threshold-driven operational alarm creation
+13. telemetry history retrieval
+14. alarm-to-corrective-work-order linkage
+15. persisted telemetry/alarm retrieval
+16. automation execution
+17. application metrics exposure
+
+The same pull-request gate also runs the full SQLite regression suite on Python 3.11 and Python 3.12.
+
+## Current schema capability history
+
+### Schema v3 — automation operations ledger
+
+`job_runs` records every EUAS automation execution with run number, trigger source, actor, business date, status, timestamps, JSON result summary and error text.
+
+### Schema v4 — operational controls
+
+- `sla_policies`
+- `work_order_sla`
+- `sla_events`
+- `event_outbox`
+
+### Schema v5 — governance and evidence
+
+- `maintenance_cost_ledger`
+- `report_snapshots`
+- `backup_records`
+- `retention_policies`
+- `audit_logs.prev_hash`
+- `audit_logs.audit_hash`
+
+### Schema v6 — planning intelligence
+
+- `approval_delegations`
+- `asset_health_snapshots`
+
+### Schema v7 — workforce and planning readiness
+
+- `crafts`
+- `technician_profiles`
+- `shift_templates`
+- `technician_shift_assignments`
+- `technician_absences`
+- `work_order_requirements`
+- `work_order_craft_requirements`
+
+### Schema v8 — execution coordination
+
+- `inventory_reservations`
+- `dispatch_assignments`
+- `asset_outages`
+
+### Schema v9 — utility operations intelligence
+
+- `telemetry_channels`
+- `telemetry_readings`
+- `operational_alarms`
+
+The v9 schema contains the complete integrated EUAS data model used by the v4.0.0 application release.
+
+## Production database recommendations
+
+Before enterprise go-live, retain these deployment controls around EUAS:
+
+- managed PostgreSQL or an HA PostgreSQL topology
+- TLS for database connections
+- secrets manager rather than plaintext credentials
+- automated backups and point-in-time recovery
+- tested restore procedures
+- approved forward/rollback migrations
 - connection pooling
-- database monitoring and slow-query analysis
+- database metrics and slow-query analysis
 - least-privilege application role
-- separate reporting/read replicas where needed
+- separate reporting/read replicas where workload requires them
+- explicit upgrade rehearsals against a production-like copy
 
+## Remaining database lifecycle work
 
-## v3.3 operations ledger
-
-`job_runs` records every EUAS automation execution with run number, trigger source, actor, business date, status, timestamps, JSON result summary and error text. Schema version 3 creates this ledger and its status/start-time index.
-
-
-## Schema v4 additions
-
-Schema version 4 adds four operational-control tables:
-
-- `sla_policies` — priority-to-response/resolution policy master.
-- `work_order_sla` — one SLA clock/result row per work order.
-- `sla_events` — unique breach/escalation history.
-- `event_outbox` — durable integration events and delivery attempts.
-
-The release continues to initialize schema additively with `CREATE TABLE/INDEX IF NOT EXISTS` and records the active release schema in `schema_migrations`.
-
-
-## Schema v5 governance tables
-
-Schema version **5** adds:
-
-- `maintenance_cost_ledger` — posted maintenance labor/material/historical cost events linked to work orders and assets.
-- `report_snapshots` — point-in-time serialized reports with SHA-256 content hashes.
-- `backup_records` — evidence of application-generated SQLite backup packages and checksums.
-- `retention_policies` — configurable retention intent and non-destructive eligibility calculations.
-- `audit_logs.prev_hash` / `audit_logs.audit_hash` — linked tamper-evident audit-chain fields.
-
-The v3.9.0 schema contains **61 relational tables** and **38 explicit indexes**. Fresh installs create schema v9 directly. The reference initialization also adds the two audit-chain columns to an existing audit table when absent and backfills blank legacy hashes in sequence. Production PostgreSQL upgrades should still be managed through an approved migration framework rather than relying on application startup as the long-term migration strategy.
-
-
-## Schema v6 planning tables
-
-- `approval_delegations` — temporary user-to-user approval authority with module/effective-date scope.
-- `asset_health_snapshots` — persisted point-in-time health score, band and factor breakdown for each asset.
-
-The live asset-health endpoint recalculates from current transactional state; snapshots are persisted on explicit recalculation and automation runs.
-
-
-## Schema v7 — workforce and planning readiness
-
-Schema v7 adds `crafts`, `technician_profiles`, `shift_templates`, `technician_shift_assignments`, `technician_absences`, `work_order_requirements` and `work_order_craft_requirements`. These records keep resource availability and planned material/craft demand normalized instead of embedding schedules or spare lists in free-text work-order fields.
-
-
-## v3.8 execution tables
-
-- `inventory_reservations` — work-order-specific material reservation, issued quantity and release state.
-- `dispatch_assignments` — technician dispatch lifecycle, ETA and field arrival timestamps.
-- `asset_outages` — explicit asset downtime/outage evidence linked to assets, sites and optionally work orders.
-
-Indexes support active reservation lookup by work/item, dispatch lookup by technician/work, and outage analysis by asset/site and timestamp. Reserved stock is protected from generic issue/transfer transactions so allocated work cannot be silently starved by unrelated stock movements.
+Live PostgreSQL runtime compatibility is now CI-proven for representative read/write workflows. The next database-lifecycle milestone is a dedicated migration framework for upgrading arbitrary existing production schemas, including reversible versioned migrations and upgrade rehearsal tests. EUAS v4.0.0 does not claim that milestone is complete.
