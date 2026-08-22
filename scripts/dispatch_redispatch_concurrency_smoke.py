@@ -23,6 +23,27 @@ from app.dispatch_store import (
 WORKERS = 8
 
 
+def create_technician(conn, suffix: str) -> int:
+    role = conn.execute("SELECT id FROM roles WHERE code='technician'").fetchone()
+    seed_hash = conn.execute('SELECT password_hash FROM users ORDER BY id LIMIT 1').fetchone()
+    if not role or not seed_hash:
+        raise RuntimeError('redispatch smoke requires seeded roles/users')
+    cur = conn.execute(
+        '''INSERT INTO users(
+             username,password_hash,full_name,email,role_id,active,created_at
+           ) VALUES(?,?,?,?,?,1,?)''',
+        (
+            f'pg-redispatch-tech-{suffix}',
+            seed_hash['password_hash'],
+            f'PG Redispatch Technician {suffix}',
+            f'pg-redispatch-tech-{suffix}@example.test',
+            role['id'],
+            now(),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
 def main() -> None:
     suffix = uuid.uuid4().hex[:10]
     with db() as conn:
@@ -32,14 +53,10 @@ def main() -> None:
             """SELECT u.id,u.full_name,r.code role FROM users u
                JOIN roles r ON r.id=u.role_id WHERE u.username='omar'"""
         ).fetchone()
-        tech = conn.execute(
-            """SELECT u.id FROM users u JOIN roles r ON r.id=u.role_id
-               WHERE r.code='technician' AND u.active=1 ORDER BY u.id LIMIT 1"""
-        ).fetchone()
-        if not user or not tech:
-            raise RuntimeError('redispatch smoke requires seeded admin and technician')
+        if not user:
+            raise RuntimeError('redispatch smoke requires seeded admin')
         user = dict(user)
-        tech_id = int(tech['id'])
+        tech_id = create_technician(conn, suffix)
         work = conn.execute(
             '''INSERT INTO work_orders(
                  wo_no,title,priority,status,work_type,requested_by,assigned_to,
