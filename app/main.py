@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
 
 from . import application as _application
 
@@ -18,9 +19,16 @@ for _name, _value in vars(_application).items():
 from .auth import (
     current_user,
     hash_password,
+    require_permissions,
     require_roles,
     verify_password,
     verify_password_with_upgrade,
+)
+from .authorization import (
+    authorization_snapshot,
+    ensure_permission_catalog,
+    permission_codes_for_role,
+    replace_role_permissions,
 )
 from .auth_store import (
     CLIENT_LOGIN_MAX_FAILURES,
@@ -52,10 +60,14 @@ _DUMMY_PASSWORD_HASH = (
 )
 
 
+class RolePermissionsIn(BaseModel):
+    permissions: list[str] = Field(default_factory=list)
+
+
 # Run the v10 authentication migration after the established application
-# initializer has created/upgraded the base schema, but before the service is
-# exposed to requests. Failure aborts application startup rather than serving a
-# partially migrated authentication model.
+# initializer has created/upgraded the base schema, then seed the additive
+# permission catalog. Failure aborts startup rather than serving a partially
+# migrated authentication/authorization model.
 _original_lifespan = app.router.lifespan_context
 
 
@@ -64,6 +76,7 @@ async def _security_lifespan(app_instance):
     async with _original_lifespan(app_instance):
         with db() as conn:
             ensure_auth_schema(conn)
+            ensure_permission_catalog(conn)
         yield
 
 
@@ -83,7 +96,8 @@ def _remove_route(path: str, methods: set[str]) -> None:
 
 # Replace only routes whose semantics depend on raw session tokens, in-memory
 # throttling, or session revocation. All other application routes remain the
-# original registered handlers.
+# original registered handlers and receive authorization overlays through the
+# shared require_roles() dependency.
 for _path, _methods in (
     ('/api/auth/login', {'POST'}),
     ('/api/auth/logout', {'POST'}),
@@ -291,6 +305,15 @@ def list_sessions(user=Depends(current_user)):
     ]
 
 
+@app.get('/api/auth/permissions')
+def my_permissions(user=Depends(current_user)):
+    return {
+        'role': user['role'],
+        'role_name': user['role_name'],
+        'permissions': list(user.get('permissions', [])),
+    }
+
+
 @app.post('/api/auth/sessions/{session_id}/revoke')
 def revoke_one_session(session_id: int, user=Depends(current_user)):
     with db() as conn:
@@ -343,6 +366,47 @@ def revoke_all_session_route(user=Depends(current_user)):
             {'revoked': revoked},
         )
     return {'ok': True, 'revoked': revoked, 'current_session_revoked': True}
+
+
+@app.get('/api/admin/permissions')
+def admin_permissions(user=Depends(require_permissions('admin.permissions.manage'))):
+    with db() as conn:
+        return authorization_snapshot(conn)
+
+
+@app.put('/api/admin/roles/{role_code}/permissions')
+def update_role_permissions(
+    role_code: str,
+    body: RolePermissionsIn,
+    user=Depends(require_permissions('admin.permissions.manage')),
+):
+    with db() as conn:
+        old = permission_codes_for_role(conn, role_code)
+        try:
+            updated = replace_role_permissions(conn, role_code, body.permissions)
+        except KeyError:
+            raise HTTPException(404, 'Role not found')
+        except ValueError as exc:
+            message = str(exc)
+            if message == 'protected_admin_permission':
+                raise HTTPException(
+                    409,
+                    'The admin role must retain admin.permissions.manage to prevent authorization lockout',
+                )
+            if message.startswith('unknown_permissions:'):
+                unknown = message.split(':', 1)[1]
+                raise HTTPException(400, f'Unknown permissions: {unknown}')
+            raise
+        audit(
+            conn,
+            user['id'],
+            'ROLE_PERMISSIONS_UPDATE',
+            'Administration',
+            role_code,
+            old,
+            updated,
+        )
+    return {'role': role_code, 'permissions': updated}
 
 
 @app.patch('/api/admin/users/{user_id}/status')
@@ -418,9 +482,12 @@ for _export in (
     'logout',
     'change_password',
     'list_sessions',
+    'my_permissions',
     'revoke_one_session',
     'revoke_other_session_route',
     'revoke_all_session_route',
+    'admin_permissions',
+    'update_role_permissions',
     'set_user_status',
     'metrics',
 ):
