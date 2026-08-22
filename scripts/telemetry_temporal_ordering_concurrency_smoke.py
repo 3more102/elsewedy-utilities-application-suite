@@ -36,7 +36,10 @@ def _admin_and_asset(conn):
 def _seed_channel(conn, suffix: str):
     user, asset_id = _admin_and_asset(conn)
     stamp = now()
-    code = f'TEL-PG-TEMP-{suffix}'
+    # Production telemetry ingestion normalizes channel codes to uppercase.
+    # Raw SQL setup must honor that invariant because PostgreSQL text equality
+    # is case-sensitive (unlike relying on any SQLite collation behavior).
+    code = f'TEL-PG-TEMP-{suffix}'.upper()
     cursor = conn.execute(
         '''INSERT INTO telemetry_channels(
              channel_code,asset_id,name,metric_type,unit,source_system,
