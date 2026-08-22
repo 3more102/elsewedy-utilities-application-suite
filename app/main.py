@@ -36,7 +36,7 @@ from .auth_store import (
     clear_login_failures,
     client_login_scope_digest,
     create_session,
-    ensure_auth_schema,
+    initialize_auth_database,
     list_sessions as list_auth_sessions,
     login_scope_digest,
     record_login_failure,
@@ -64,18 +64,19 @@ class RolePermissionsIn(BaseModel):
     permissions: list[str] = Field(default_factory=list)
 
 
-# Run the v10 authentication migration after the established application
-# initializer has created/upgraded the base schema, then seed the additive
-# permission catalog. Failure aborts startup rather than serving a partially
-# migrated authentication/authorization model.
+# Initialize the base schema under its historical v9 marker, then run the v10
+# auth migration which writes marker 10 only after its DDL/data migration has
+# succeeded. The established application lifespan is then entered to preserve
+# its backfill and scheduler lifecycle; its repeated base init is idempotent and
+# cannot pre-claim v10 because the secure migration has already completed.
 _original_lifespan = app.router.lifespan_context
 
 
 @asynccontextmanager
 async def _security_lifespan(app_instance):
+    initialize_auth_database(hash_password)
     async with _original_lifespan(app_instance):
         with db() as conn:
-            ensure_auth_schema(conn)
             ensure_permission_catalog(conn)
         yield
 
