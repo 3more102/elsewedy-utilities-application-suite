@@ -7,45 +7,162 @@ from collections.abc import Iterable
 # control and therefore cannot broaden access beyond the route's legacy role
 # whitelist.
 PERMISSION_CATALOG: dict[str, tuple[str, tuple[str, ...]]] = {
-    'admin.permissions.manage': ('Manage role permission grants', ('admin',)),
-    'admin.users.manage': ('Manage user accounts and activation state', ('admin',)),
-    'admin.backup.download': ('Download administrative database backups', ('admin',)),
-    'operations.automation.run': ('Run the automation engine', ('admin', 'maintenance_manager')),
-    'operations.automation.read': ('Read automation status and run history', ('admin', 'maintenance_manager', 'executive')),
-    'observability.metrics.read': ('Read application observability metrics', ('admin', 'maintenance_manager', 'executive')),
-    'audit.read': ('Read the audit trail', ('admin', 'maintenance_manager', 'executive')),
-    'audit.export': ('Export audit records', ('admin', 'maintenance_manager', 'executive')),
-    'assets.create': ('Create assets', ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor')),
-    'assets.update': ('Update asset records', ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor')),
-    'assets.delete': ('Delete unreferenced assets', ('admin', 'asset_manager')),
-    'assets.health.recalculate': ('Recalculate asset health portfolio scores', ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor')),
-    'assets.field.update': ('Update asset field condition and meter values', ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician')),
-    'assets.meter.reading.write': ('Post asset meter readings', ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician')),
-    'work.create': ('Create work orders', ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor')),
-    'work.update': ('Update work orders', ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor')),
-    'work.transition': ('Execute work-order workflow transitions', ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician')),
-    'work.material.plan': ('Plan work-order material requirements', ('admin', 'maintenance_manager', 'planner', 'supervisor', 'storekeeper')),
-    'work.material.reserve': ('Reserve inventory for work orders', ('admin', 'maintenance_manager', 'planner', 'supervisor', 'storekeeper')),
-    'work.craft.plan': ('Plan craft requirements for work orders', ('admin', 'maintenance_manager', 'planner', 'supervisor')),
-    'work.labor.post': ('Post labor against work orders', ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician')),
-    'work.material.issue': ('Issue materials against work orders', ('admin', 'maintenance_manager', 'planner', 'storekeeper', 'technician')),
-    'work.notes.write': ('Add work-order notes', ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician')),
-    'work.tasks.manage': ('Update work-order task completion state', ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician')),
-    'work.dispatch': ('Dispatch technicians to work orders', ('admin', 'maintenance_manager', 'planner', 'supervisor')),
-    'inventory.create': ('Create inventory items', ('admin', 'storekeeper', 'maintenance_manager')),
-    'inventory.transaction.post': ('Post quantity-changing inventory transactions', ('admin', 'maintenance_manager', 'planner', 'storekeeper', 'technician')),
-    'inventory.reorder.scan': ('Run the inventory reorder scan', ('admin', 'storekeeper', 'maintenance_manager', 'procurement')),
-    'procurement.requisition.create': ('Create purchase requisitions', ('admin', 'storekeeper', 'maintenance_manager', 'procurement', 'planner')),
-    'procurement.requisition.submit': ('Submit purchase requisitions for approval', ('admin', 'storekeeper', 'maintenance_manager', 'procurement', 'planner')),
-    'procurement.requisition.approve': ('Approve submitted purchase requisitions', ('admin', 'maintenance_manager', 'procurement')),
-    'procurement.quotation.create': ('Record procurement quotations', ('admin', 'maintenance_manager', 'procurement')),
-    'procurement.purchase_order.create': ('Create purchase orders from approved requisitions', ('admin', 'maintenance_manager', 'procurement')),
-    'procurement.purchase_order.receive': ('Receive purchase orders into inventory', ('admin', 'procurement', 'storekeeper')),
-    'hse.incident.create': ('Create HSE incident records', ('admin', 'hse', 'maintenance_manager')),
-    'hse.incident.update': ('Update HSE incident records and state', ('admin', 'hse', 'maintenance_manager')),
-    'projects.create': ('Create projects', ('admin', 'project_manager', 'maintenance_manager')),
-    'projects.tasks.create': ('Create project tasks', ('admin', 'project_manager', 'maintenance_manager')),
-    'projects.tasks.update': ('Update project tasks and progress', ('admin', 'project_manager', 'maintenance_manager')),
+    'admin.permissions.manage': (
+        'Manage role permission grants',
+        ('admin',),
+    ),
+    'admin.users.manage': (
+        'Manage user accounts and activation state',
+        ('admin',),
+    ),
+    'admin.backup.download': (
+        'Download administrative database backups',
+        ('admin',),
+    ),
+    'operations.automation.run': (
+        'Run the automation engine',
+        ('admin', 'maintenance_manager'),
+    ),
+    'operations.automation.read': (
+        'Read automation status and run history',
+        ('admin', 'maintenance_manager', 'executive'),
+    ),
+    'observability.metrics.read': (
+        'Read application observability metrics',
+        ('admin', 'maintenance_manager', 'executive'),
+    ),
+    'audit.read': (
+        'Read the audit trail',
+        ('admin', 'maintenance_manager', 'executive'),
+    ),
+    'audit.export': (
+        'Export audit records',
+        ('admin', 'maintenance_manager', 'executive'),
+    ),
+    'assets.create': (
+        'Create assets',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'assets.update': (
+        'Update asset records',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'assets.delete': (
+        'Delete unreferenced assets',
+        ('admin', 'asset_manager'),
+    ),
+    'assets.health.recalculate': (
+        'Recalculate asset health portfolio scores',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'assets.field.update': (
+        'Update asset field condition and meter values',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'assets.meter.reading.write': (
+        'Post asset meter readings',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.create': (
+        'Create work orders',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'work.update': (
+        'Update work orders',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'work.transition': (
+        'Execute work-order workflow transitions',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.material.plan': (
+        'Plan work-order material requirements',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'storekeeper'),
+    ),
+    'work.material.reserve': (
+        'Reserve inventory for work orders',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'storekeeper'),
+    ),
+    'work.craft.plan': (
+        'Plan craft requirements for work orders',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'work.labor.post': (
+        'Post labor against work orders',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.material.issue': (
+        'Issue materials against work orders',
+        ('admin', 'maintenance_manager', 'planner', 'storekeeper', 'technician'),
+    ),
+    'work.notes.write': (
+        'Add work-order notes',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.tasks.manage': (
+        'Update work-order task completion state',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.dispatch': (
+        'Dispatch technicians to work orders',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'inventory.create': (
+        'Create inventory items',
+        ('admin', 'storekeeper', 'maintenance_manager'),
+    ),
+    'inventory.transaction.post': (
+        'Post quantity-changing inventory transactions',
+        ('admin', 'maintenance_manager', 'planner', 'storekeeper', 'technician'),
+    ),
+    'inventory.reorder.scan': (
+        'Run the inventory reorder scan',
+        ('admin', 'storekeeper', 'maintenance_manager', 'procurement'),
+    ),
+    'procurement.requisition.create': (
+        'Create purchase requisitions',
+        ('admin', 'storekeeper', 'maintenance_manager', 'procurement', 'planner'),
+    ),
+    'procurement.requisition.submit': (
+        'Submit purchase requisitions for approval',
+        ('admin', 'storekeeper', 'maintenance_manager', 'procurement', 'planner'),
+    ),
+    'procurement.requisition.approve': (
+        'Approve submitted purchase requisitions',
+        ('admin', 'maintenance_manager', 'procurement'),
+    ),
+    'procurement.quotation.create': (
+        'Record procurement quotations',
+        ('admin', 'maintenance_manager', 'procurement'),
+    ),
+    'procurement.purchase_order.create': (
+        'Create purchase orders from approved requisitions',
+        ('admin', 'maintenance_manager', 'procurement'),
+    ),
+    'procurement.purchase_order.receive': (
+        'Receive purchase orders into inventory',
+        ('admin', 'procurement', 'storekeeper'),
+    ),
+    'hse.incident.create': (
+        'Create HSE incident records',
+        ('admin', 'hse', 'maintenance_manager'),
+    ),
+    'hse.incident.update': (
+        'Update HSE incident records and state',
+        ('admin', 'hse', 'maintenance_manager'),
+    ),
+    'projects.create': (
+        'Create projects',
+        ('admin', 'project_manager', 'maintenance_manager'),
+    ),
+    'projects.tasks.create': (
+        'Create project tasks',
+        ('admin', 'project_manager', 'maintenance_manager'),
+    ),
+    'projects.tasks.update': (
+        'Update project tasks and progress',
+        ('admin', 'project_manager', 'maintenance_manager'),
+    ),
 }
 
 # FastAPI's matched route template is used for parameterized paths. Each entry
@@ -127,25 +244,39 @@ def ensure_permission_catalog(conn) -> dict:
     """
     created_permissions = 0
     created_grants = 0
-    role_ids = {row['code']: row['id'] for row in conn.execute('SELECT id,code FROM roles').fetchall()}
+    role_ids = {
+        row['code']: row['id']
+        for row in conn.execute('SELECT id,code FROM roles').fetchall()
+    }
 
     for code, (name, default_roles) in PERMISSION_CATALOG.items():
-        cur = conn.execute('INSERT OR IGNORE INTO permissions(code,name) VALUES(?,?)', (code, name))
+        cur = conn.execute(
+            'INSERT OR IGNORE INTO permissions(code,name) VALUES(?,?)',
+            (code, name),
+        )
         inserted = bool(int(cur.rowcount or 0))
         if not inserted:
             continue
         created_permissions += 1
-        permission = conn.execute('SELECT id FROM permissions WHERE code=?', (code,)).fetchone()
+        permission = conn.execute(
+            'SELECT id FROM permissions WHERE code=?', (code,)
+        ).fetchone()
         if not permission:
             raise RuntimeError(f'permission catalog insert failed for {code}')
         for role_code in default_roles:
             role_id = role_ids.get(role_code)
             if role_id is None:
                 continue
-            grant = conn.execute('INSERT OR IGNORE INTO role_permissions(role_id,permission_id) VALUES(?,?)', (role_id, permission['id']))
+            grant = conn.execute(
+                'INSERT OR IGNORE INTO role_permissions(role_id,permission_id) VALUES(?,?)',
+                (role_id, permission['id']),
+            )
             created_grants += int(bool(int(grant.rowcount or 0)))
 
-    return {'permissions_created': created_permissions, 'grants_created': created_grants}
+    return {
+        'permissions_created': created_permissions,
+        'grants_created': created_grants,
+    }
 
 
 def permission_codes_for_user(conn, user_id: int) -> list[str]:
@@ -174,7 +305,9 @@ def permission_codes_for_role(conn, role_code: str) -> list[str]:
     return [str(row['code']) for row in rows]
 
 
-def has_permissions(granted: Iterable[str], required: Iterable[str], *, require_all: bool = True) -> bool:
+def has_permissions(
+    granted: Iterable[str], required: Iterable[str], *, require_all: bool = True
+) -> bool:
     granted_set = set(granted)
     required_set = set(required)
     if not required_set:
@@ -191,15 +324,26 @@ def permission_for_route(method: str, route_path: str | None) -> str | None:
 
 
 def authorization_snapshot(conn) -> dict:
-    permissions = [{'code': row['code'], 'name': row['name']} for row in conn.execute('SELECT code,name FROM permissions ORDER BY code').fetchall()]
+    permissions = [
+        {'code': row['code'], 'name': row['name']}
+        for row in conn.execute('SELECT code,name FROM permissions ORDER BY code').fetchall()
+    ]
     roles = []
     for role in conn.execute('SELECT code,name FROM roles ORDER BY code').fetchall():
-        roles.append({'code': role['code'], 'name': role['name'], 'permissions': permission_codes_for_role(conn, role['code'])})
+        roles.append(
+            {
+                'code': role['code'],
+                'name': role['name'],
+                'permissions': permission_codes_for_role(conn, role['code']),
+            }
+        )
     return {'permissions': permissions, 'roles': roles}
 
 
 def replace_role_permissions(conn, role_code: str, permission_codes: Iterable[str]) -> list[str]:
-    role = conn.execute('SELECT id,code FROM roles WHERE code=?', (role_code,)).fetchone()
+    role = conn.execute(
+        'SELECT id,code FROM roles WHERE code=?', (role_code,)
+    ).fetchone()
     if not role:
         raise KeyError('role_not_found')
 
@@ -215,5 +359,8 @@ def replace_role_permissions(conn, role_code: str, permission_codes: Iterable[st
 
     conn.execute('DELETE FROM role_permissions WHERE role_id=?', (role['id'],))
     for code in requested:
-        conn.execute('INSERT INTO role_permissions(role_id,permission_id) VALUES(?,?)', (role['id'], known[code]))
+        conn.execute(
+            'INSERT INTO role_permissions(role_id,permission_id) VALUES(?,?)',
+            (role['id'], known[code]),
+        )
     return requested
