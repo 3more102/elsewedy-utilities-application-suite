@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, HTTPException, Request
@@ -14,7 +15,13 @@ for _name, _value in vars(_application).items():
     if not _name.startswith('__'):
         globals()[_name] = _value
 
-from .auth import current_user, require_roles, verify_password, verify_password_with_upgrade
+from .auth import (
+    current_user,
+    hash_password,
+    require_roles,
+    verify_password,
+    verify_password_with_upgrade,
+)
 from .auth_store import (
     active_session_count,
     clear_login_failures,
@@ -369,3 +376,25 @@ def metrics(user=Depends(require_roles('admin', 'maintenance_manager', 'executiv
     if not replaced:
         lines.append(f'euas_active_sessions {count}')
     return '\n'.join(lines) + '\n'
+
+
+# Preserve the historical ``app.main`` module identity for callers that mutate
+# module-level deployment settings in tests or embedding code. The application
+# module owns the original functions, so aliasing the public module name back to
+# it ensures monkeypatches such as EVENT_WEBHOOK_URL continue to affect those
+# functions while the FastAPI router retains the hardened handlers registered
+# above.
+for _export in (
+    'login',
+    'logout',
+    'change_password',
+    'list_sessions',
+    'revoke_one_session',
+    'revoke_other_session_route',
+    'revoke_all_session_route',
+    'set_user_status',
+    'metrics',
+):
+    setattr(_application, _export, globals()[_export])
+_application.app = app
+sys.modules[__name__] = _application
