@@ -15,6 +15,7 @@ from app.database import db, now
 from app.dispatch_store import (
     DispatchAssignmentConflict,
     assign_dispatch_atomic,
+    ensure_dispatch_assignment_lock,
     load_dispatch_work_snapshot,
 )
 
@@ -87,6 +88,7 @@ def main() -> None:
     suffix = uuid.uuid4().hex[:10]
     with db() as conn:
         ensure_audit_chain_lock(conn)
+        ensure_dispatch_assignment_lock(conn)
         admin = conn.execute(
             """SELECT u.id,u.full_name,r.code role FROM users u
                JOIN roles r ON r.id=u.role_id WHERE u.username='omar'"""
