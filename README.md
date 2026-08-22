@@ -4,7 +4,7 @@
 
 **Developed by Omar & Seif**
 
-EUAS is an original enterprise asset, maintenance, utility-operations and field-service platform for electrical, water, infrastructure and facilities environments. It is a runnable reference application—not a static mockup—and includes authentication, relational data, business workflows, APIs, responsive UI, realistic demo data, automated regression coverage and container/local deployment paths.
+EUAS is an original **suite of integrated enterprise applications** for asset management, maintenance, utility operations, field service, inventory, procurement, HSE, projects, governance and operational intelligence across electrical, water, infrastructure and facilities environments. It is a runnable multi-app reference suite—not one monolithic application—and includes authentication, relational data, business workflows, APIs, responsive UI, realistic demo data, automated regression coverage and container/local deployment paths.
 
 > EUAS uses its own branding, data model, UI, workflows and source implementation. It is not based on proprietary EAM/CMMS source code.
 
@@ -101,11 +101,13 @@ The screenshots are representative management-demo captures from the EUAS v3.x i
 
 ---
 
-## Core Capabilities
+## Application Suite
 
-EUAS integrates these applications inside one suite:
+EUAS is organized as a **launchpad of integrated applications** sharing identity, authorization, data, workflows, audit, notifications and reporting while retaining distinct operational responsibilities.
 
-- **Home / Application Launchpad** — unified entry point for operational applications.
+The suite currently includes:
+
+- **Home / Application Launchpad** — unified entry point for all EUAS apps.
 - **Executive Dashboard** — assets, availability, work, PM, inventory, procurement, HSE, cost, MTBF and MTTR KPIs.
 - **Asset Management** — asset hierarchy, condition, criticality, location, vendor, warranty, meter data, health score/history, maintenance history, lifecycle timeline and dossier snapshots.
 - **Work Management** — corrective, preventive, emergency, inspection and project work with lifecycle, assignment, checklists, labor, materials, notes, attachments and signatures.
@@ -190,12 +192,12 @@ The data is connected across Dashboard → GIS → Asset → Work → Field Serv
 
 ```text
 ┌──────────────────────────────────────────────────────────┐
-│                 EUAS Responsive Web / PWA                │
-│  Launchpad · Dashboard · Assets · Work · Field · HSE    │
+│                 EUAS Application Suite UI                │
+│ Launchpad · Assets · Work · Inventory · HSE · GIS · ... │
 └──────────────────────────┬───────────────────────────────┘
                            │ HTTPS / JSON / Multipart
 ┌──────────────────────────▼───────────────────────────────┐
-│                     FastAPI API Layer                    │
+│              Shared FastAPI Service Layer                │
 │ Auth · RBAC · Capabilities · Workflows · Reports        │
 │ Notifications · Audit · SLA · Events · Analytics        │
 └──────────────────────────┬───────────────────────────────┘
@@ -206,6 +208,8 @@ The data is connected across Dashboard → GIS → Asset → Work → Field Serv
 │ Schema/indexes · concurrency controls · attachment store │
 └──────────────────────────────────────────────────────────┘
 ```
+
+The current reference implementation deploys the integrated apps through one shared web/API runtime, but the **product model is a suite of apps**, not one application. The shared runtime provides common identity, permissions, data consistency, audit, workflows and integrations across those apps.
 
 EUAS defaults to **SQLite** for zero-infrastructure local use. Setting `EUAS_DATABASE_URL` selects the PostgreSQL runtime adapter. The repository includes a PostgreSQL Docker Compose deployment and required live PostgreSQL 16 CI validation.
 
@@ -410,7 +414,7 @@ The CI workflow additionally runs the real PostgreSQL concurrency smokes listed 
 | `EUAS_DB_PATH` | SQLite database path | `./euas.db` |
 | `EUAS_DATABASE_URL` | PostgreSQL connection URL | unset |
 | `EUAS_ENV` | deployment environment label | `development` |
-| `EUAS_VERSION` | reported application version | `3.9.0` |
+| `EUAS_VERSION` | reported suite version | `3.9.0` |
 | `EUAS_SESSION_HOURS` | server-side session lifetime | `12` |
 | `EUAS_MAX_UPLOAD_MB` | upload size limit | `25` |
 | `EUAS_AUTOMATION_INTERVAL_MINUTES` | scheduler interval; `0` disables | `0` |
@@ -424,7 +428,7 @@ See `.env.example` for the complete configuration surface.
 
 ## Repository Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — system design
+- [ARCHITECTURE.md](ARCHITECTURE.md) — suite/system design
 - [DATABASE.md](DATABASE.md) — database/runtime adapter
 - [AUTHORIZATION.md](AUTHORIZATION.md) — capability and role model
 - [SECURITY.md](SECURITY.md) — security controls and hardening guidance
@@ -450,4 +454,4 @@ The current hardening program continues to prioritize demonstrated integrity/sec
 
 ## Independence / Branding
 
-EUAS is an independent application. It does not contain proprietary source code, protected graphics, proprietary text or copied layouts from other commercial EAM/CMMS products. Its architecture, data model, workflows, branding and source implementation are original to this project.
+EUAS is an independent **suite of integrated applications**. It does not contain proprietary source code, protected graphics, proprietary text or copied layouts from other commercial EAM/CMMS products. Its architecture, data model, workflows, branding and source implementation are original to this project.
