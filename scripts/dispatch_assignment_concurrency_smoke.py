@@ -93,14 +93,10 @@ def main() -> None:
             """SELECT u.id,u.full_name,r.code role FROM users u
                JOIN roles r ON r.id=u.role_id WHERE u.username='omar'"""
         ).fetchone()
-        tech = conn.execute(
-            """SELECT u.id FROM users u JOIN roles r ON r.id=u.role_id
-               WHERE r.code='technician' AND u.active=1 ORDER BY u.id LIMIT 1"""
-        ).fetchone()
-        if not admin or not tech:
-            raise RuntimeError('dispatch smoke requires seeded admin and technician')
+        if not admin:
+            raise RuntimeError('dispatch smoke requires seeded admin')
         user = dict(admin)
-        tech_id = int(tech['id'])
+        tech_id = create_technician(conn, suffix + '-B')
 
         # One technician, many eligible work orders: exactly one assignment wins.
         work_ids = []
