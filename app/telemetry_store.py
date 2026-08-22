@@ -43,8 +43,9 @@ def _event_instant(value: str | datetime) -> datetime:
         parsed = datetime.fromisoformat(text)
 
     if parsed.tzinfo is None:
-        local_tz = datetime.now().astimezone().tzinfo
-        parsed = parsed.replace(tzinfo=local_tz)
+        # ``astimezone()`` on a naive datetime applies the host's local timezone
+        # for that event date, including the correct historical DST offset.
+        parsed = parsed.astimezone()
     return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
@@ -176,8 +177,6 @@ def evaluate_telemetry_alarm_atomic(
                     'alarm_no': active['alarm_no'],
                     'severity': severity,
                 }
-            # The alarm row is locked by this transaction, so a failed guarded
-            # update means it no longer represents an active generation.
             active = None
 
         number = _application.next_no(
