@@ -8,6 +8,7 @@ import uuid
 from fastapi.testclient import TestClient
 
 from app import application as _application
+from app import main as main_module
 from app import outbox_store
 from app.authorization import PERMISSION_CATALOG, ROUTE_PERMISSION_OVERLAY
 from app.database import db, now
@@ -318,6 +319,8 @@ def test_processor_and_retry_route_are_installed_without_authorization_widening(
     with TestClient(app):
         assert _application._process_outbox is _defer_outbox
         assert _application._execute_automation is execute_automation_postcommit
+        assert main_module._process_outbox is _defer_outbox
+        assert main_module._execute_automation is execute_automation_postcommit
         route_key = ('POST', '/api/events/outbox/{event_id}/retry')
         assert ROUTE_PERMISSION_OVERLAY[route_key] == 'integrations.outbox.retry'
         assert tuple(PERMISSION_CATALOG['integrations.outbox.retry'][1]) == OUTBOX_RETRY_ROLES
