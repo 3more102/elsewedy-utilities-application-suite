@@ -39,18 +39,26 @@ def _event_instant(value: str | datetime) -> datetime:
     return parsed
 
 
-def _is_temporally_current(captured_at: str, last_reading_at: str | None) -> bool:
-    """Return true only when captured_at is strictly newer than live state.
+def _is_temporally_current(
+    captured_at: str,
+    last_reading_at: str | None,
+    *,
+    allow_equal: bool = False,
+) -> bool:
+    """Decide whether a reading may advance the live channel generation.
 
-    Equal event timestamps are intentionally not allowed to mutate the current
-    channel/alarm generation. There is no event-time ordering between two such
-    readings, so the first serialized arrival remains the live representative
-    and later equal-time arrivals are retained as historical evidence only.
+    Explicit event timestamps use strict ordering: an equal instant is treated
+    as replay/historical evidence and cannot duplicate alarm side effects.
+    Readings that omit captured_at inherit server arrival time; because the
+    historical ``now()`` format has second resolution, equal generated values
+    retain legacy arrival-order behavior via ``allow_equal``.
     """
     if not last_reading_at:
         return True
     try:
-        return _event_instant(captured_at) > _event_instant(last_reading_at)
+        captured = _event_instant(captured_at)
+        current = _event_instant(last_reading_at)
+        return captured > current or (allow_equal and captured == current)
     except (TypeError, ValueError):
         # Incoming capture values are validated before this helper. If legacy
         # state contains an invalid timestamp, allow the valid incoming reading
@@ -90,10 +98,11 @@ def _lock_and_load_channel(conn, channel_code: str) -> dict:
 def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
     """Persist every reading while advancing live state only by event time.
 
-    Delayed or equal-time readings remain queryable in telemetry_readings but
-    cannot regress telemetry_channels.last_* or mutate the active alarm state.
-    The per-channel row lock makes this invariant deterministic under concurrent
-    PostgreSQL ingestion regardless of request arrival order.
+    Delayed or explicit equal-time readings remain queryable in
+    telemetry_readings but cannot regress telemetry_channels.last_* or mutate
+    active alarm state. Untimestamped readings preserve legacy arrival-order
+    behavior. The per-channel row lock makes the invariant deterministic under
+    concurrent PostgreSQL ingestion.
     """
     summary = {
         'accepted': 0,
@@ -107,6 +116,7 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
 
     for reading in body.readings:
         channel_code = reading.channel_code.strip().upper()
+        explicit_capture = reading.captured_at is not None
         captured = reading.captured_at or now()
         try:
             _event_instant(captured)
@@ -134,7 +144,11 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
         )
         summary['accepted'] += 1
 
-        if not _is_temporally_current(captured, channel.get('last_reading_at')):
+        if not _is_temporally_current(
+            captured,
+            channel.get('last_reading_at'),
+            allow_equal=not explicit_capture,
+        ):
             summary['historical'] += 1
             summary['results'].append(
                 {
