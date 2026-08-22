@@ -24,6 +24,7 @@ EUAS includes security controls appropriate for a runnable reference deployment.
 - API responses default to `Cache-Control: no-store`.
 - GitHub CodeQL scans Python with the `security-extended` query suite on pushes, pull requests and a weekly schedule.
 - `pip-audit` checks the resolved Python dependency environment for known vulnerability advisories.
+- Trivy scans the built EUAS container image and fails on fixable high/critical OS or library vulnerabilities.
 - Dependabot monitors both Python packages and GitHub Actions for version updates.
 
 ## Password-hash migration contract
@@ -52,12 +53,13 @@ For internet-facing or multi-replica production deployments, the next session-ha
 
 ## Continuous security validation
 
-The dedicated `EUAS Security` workflow contains two independent controls:
+The dedicated `EUAS Security` workflow contains three independent controls:
 
 - **CodeQL / Python** performs static security analysis and publishes supported findings to GitHub code scanning.
 - **Python dependency audit** installs the application dependency set and runs `pip-audit`; known vulnerable resolved dependencies fail the job.
+- **Container image scan** builds the production Dockerfile and runs Trivy against OS and library packages; fixable high/critical findings fail the job.
 
-The workflow runs for `main`, pull requests targeting `main`, manual dispatches, and on a weekly schedule. Dependabot separately proposes updates for pip dependencies and GitHub Actions.
+The Trivy GitHub Action is pinned to a full release commit SHA rather than a movable tag. The workflow runs for `main`, pull requests targeting `main`, manual dispatches, and on a weekly schedule. Dependabot separately proposes updates for pip dependencies and GitHub Actions.
 
 Security scanning complements, but does not replace, penetration testing, runtime monitoring, infrastructure hardening, secret management, malware scanning for uploads, or deployment-specific threat modeling.
 
@@ -72,7 +74,7 @@ Security scanning complements, but does not replace, penetration testing, runtim
 7. Store secrets in a secrets manager instead of `.env` files.
 8. Restrict database/storage network access to application identities only.
 9. Forward audit logs, request IDs, metrics and authentication events to centralized SIEM/observability platforms.
-10. Add container-image scanning and deployment-target DAST to the existing CodeQL and dependency-audit CI controls before internet-facing deployment.
+10. Add deployment-target DAST and periodic penetration testing alongside the existing CodeQL, dependency and container-image scans before internet-facing deployment.
 11. Review CSP and remove `unsafe-inline` by migrating the remaining generated inline event handlers to delegated listeners before strict CSP enforcement.
 12. Maintain tested backup, restore, retention and disaster-recovery RPO/RTO policies.
 
