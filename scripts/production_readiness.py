@@ -130,7 +130,7 @@ def run_database_checks() -> list[Check]:
         "work_orders",
         "inventory_items",
         "audit_logs",
-        "automation_runs",
+        "job_runs",
         "event_outbox",
         "telemetry_channels",
         "telemetry_readings",
