@@ -13,7 +13,8 @@ EUAS includes security controls appropriate for a runnable reference deployment.
 - Configurable server-side session expiry (`EUAS_SESSION_HOURS`).
 - Logout, single-session revocation, revoke-other-sessions and revoke-all-sessions are enforced server-side.
 - Password changes revoke all other sessions for that user; account deactivation revokes all active sessions.
-- Login throttling is database-backed, scoped by a one-way digest of normalized account/client context, and uses temporary progressive backoff instead of permanent account locking.
+- Login throttling is database-backed with one-way account/client and client-wide scopes, and uses temporary progressive backoff instead of permanent account locking.
+- Missing or disabled login principals execute a current-work-factor dummy password verification to reduce simple account-enumeration timing differences.
 - Role-based authorization is enforced at API endpoints.
 - User-controlled profile fields are server validated.
 - Upload allow-list and configurable maximum attachment size.
@@ -52,15 +53,17 @@ Current sessions are stored in `auth_sessions`. The bearer value returned to the
 
 Each current session includes a non-secret session ID, user ID, creation time, last-seen time, expiry, optional revocation time and a coarse client label. The label is derived from the User-Agent for usability and is not intended as a fingerprint. EUAS does not persist client IP addresses as session metadata.
 
-Schema v10 retains the historical `sessions` table only as a compatibility landing zone for rolling upgrades. Startup migrates legacy rows into `auth_sessions` by hashing the existing bearer value and deleting the raw legacy row. Session resolution also supports one-row lazy migration so a valid session created by an older application instance can survive a mixed-version deployment without forced logout. New logins never write raw bearer tokens into the legacy table.
+Schema v10 retains the historical `sessions` table only as a compatibility landing zone for rolling upgrades. Startup migrates legacy rows into `auth_sessions` by hashing the existing bearer value and deleting the raw legacy row. Session resolution also supports one-row lazy migration so a valid session created by an older application instance can survive a mixed-version deployment without forced logout. The migration insert is conflict-safe so concurrent replicas can observe the same historical row without creating duplicate digest sessions. New logins never write raw bearer tokens into the legacy table.
 
 Expired and revoked sessions are rejected. Revoked rows remain available for database-level operational evidence until normal retention/maintenance removes them; the bearer itself cannot be recovered from the stored digest.
 
 ## Login throttling
 
-Failed-login state is stored in `auth_login_throttle`, so it survives process restarts and is shared by application workers or replicas using the same database. The stored key is a SHA-256 digest of the normalized username and client host; the throttle table does not retain the raw account identifier or client address.
+Failed-login state is stored in `auth_login_throttle`, so it survives process restarts and is shared by application workers or replicas using the same database. EUAS maintains two one-way scopes: an account-plus-client scope for repeated attacks against one principal and a wider client-only scope that limits username rotation from the same client. Both keys are SHA-256 digests; the throttle table does not retain the raw account identifier or client address.
 
-EUAS uses a rolling five-minute failure window. Repeated failures trigger temporary progressive backoff starting after the configured threshold used by the application, rather than permanently locking an account. Successful authentication clears the matching failure state. Authentication failures continue to use the same generic invalid-credentials response so the API does not disclose whether an account exists.
+EUAS uses a rolling five-minute failure window. The account/client scope begins temporary backoff after five failures, while the wider client scope has a higher threshold to reduce denial-of-service risk for shared client networks. Repeated failures increase the temporary backoff up to a bounded maximum instead of permanently locking an account. A successful authentication clears its account/client failure state but deliberately does not erase the wider client abuse history.
+
+Authentication failures continue to use the same generic invalid-credentials response so the API does not disclose whether an account exists. Missing and disabled principals still execute one PBKDF2 verification at the current work factor against a fixed non-secret dummy verifier, reducing the obvious timing difference between unknown accounts and valid-account password checks.
 
 For very large multi-region deployments, a purpose-built shared rate-limit service such as Redis or a gateway-native limiter may provide better throughput and abuse analytics, but process-local memory is not the source of truth for the current EUAS limiter.
 
