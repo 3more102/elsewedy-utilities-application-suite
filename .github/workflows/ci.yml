@@ -98,5 +98,8 @@ jobs:
       - name: Run strict production readiness gate
         run: python scripts/production_readiness.py --strict-production --require-postgres --check-db
 
+      - name: Run PostgreSQL inventory concurrency smoke
+        run: python scripts/inventory_concurrency_smoke.py
+
       - name: Run live PostgreSQL HTTP smoke
         run: python scripts/postgres_smoke_test.py

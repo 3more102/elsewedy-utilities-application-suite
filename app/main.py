@@ -47,6 +47,12 @@ from .auth_store import (
 )
 from .config import SESSION_HOURS
 from .database import db
+from .inventory_store import (
+    InventoryConcurrencyConflict,
+    adjust_stock_if_unchanged,
+    increment_stock,
+    issue_unreserved_stock,
+)
 
 app = _application.app
 _legacy_metrics = _application.metrics
@@ -95,10 +101,10 @@ def _remove_route(path: str, methods: set[str]) -> None:
     ]
 
 
-# Replace only routes whose semantics depend on raw session tokens, in-memory
-# throttling, or session revocation. All other application routes remain the
-# original registered handlers and receive authorization overlays through the
-# shared require_roles() dependency.
+# Replace only routes whose semantics depend on hardened security/session or
+# transaction behavior. All other application routes remain the original
+# registered handlers and receive authorization overlays through the shared
+# require_roles() dependency.
 for _path, _methods in (
     ('/api/auth/login', {'POST'}),
     ('/api/auth/logout', {'POST'}),
@@ -106,6 +112,7 @@ for _path, _methods in (
     ('/api/auth/sessions', {'GET'}),
     ('/api/auth/sessions/revoke-others', {'POST'}),
     ('/api/admin/users/{user_id}/status', {'PATCH'}),
+    ('/api/inventory/{item_id}/transaction', {'POST'}),
     ('/api/metrics', {'GET'}),
 ):
     _remove_route(_path, _methods)
@@ -454,6 +461,163 @@ def set_user_status(
     return {'ok': True, 'active': body.active, 'sessions_revoked': revoked}
 
 
+@app.post('/api/inventory/{item_id}/transaction')
+def inventory_tx(
+    item_id: int,
+    body: _application.InventoryTxIn,
+    user=Depends(require_roles(*INV_ROLES)),
+):
+    """Apply stock mutations without read-modify-write lost updates."""
+    with db() as conn:
+        item = get_or_404(
+            conn,
+            'SELECT * FROM inventory_items WHERE id=?',
+            (item_id,),
+            'Item not found',
+        )
+        tx = body.tx_type.upper()
+        quantity = float(body.quantity)
+
+        try:
+            if tx == 'ISSUE':
+                amount = abs(quantity)
+                old_stock, new_stock = issue_unreserved_stock(conn, item_id, amount)
+                quantity = -amount
+            elif tx in ('RETURN', 'RECEIPT'):
+                quantity = abs(quantity)
+                old_stock, new_stock = increment_stock(conn, item_id, quantity)
+            elif tx == 'ADJUSTMENT':
+                target_stock = quantity
+                old_stock, new_stock = adjust_stock_if_unchanged(
+                    conn,
+                    item_id,
+                    float(item['current_stock']),
+                    target_stock,
+                )
+                quantity = new_stock - old_stock
+            elif tx == 'TRANSFER':
+                if not body.to_warehouse_id:
+                    raise HTTPException(400, 'Destination warehouse required')
+                if body.to_warehouse_id == item['warehouse_id']:
+                    raise HTTPException(400, 'Destination warehouse must be different')
+
+                amount = abs(quantity)
+                old_stock, new_stock = issue_unreserved_stock(conn, item_id, amount)
+                quantity = -amount
+
+                destination = conn.execute(
+                    '''SELECT * FROM inventory_items
+                       WHERE warehouse_id=? AND name=? AND category=?''',
+                    (body.to_warehouse_id, item['name'], item['category']),
+                ).fetchone()
+                if destination:
+                    increment_stock(conn, destination['id'], amount)
+                    destination_id = destination['id']
+                else:
+                    destination_no = next_no(
+                        conn, 'inventory_items', 'item_no', 'ITM-', 1000
+                    )
+                    created = conn.execute(
+                        '''INSERT INTO inventory_items(
+                             item_no,name,description,category,warehouse_id,
+                             current_stock,reserved_stock,min_level,max_level,
+                             reorder_point,unit_price,unit,vendor_id,bin
+                           ) VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?)''',
+                        (
+                            destination_no,
+                            item['name'],
+                            item['description'],
+                            item['category'],
+                            body.to_warehouse_id,
+                            amount,
+                            item['min_level'],
+                            item['max_level'],
+                            item['reorder_point'],
+                            item['unit_price'],
+                            item['unit'],
+                            item['vendor_id'],
+                            item['bin'],
+                        ),
+                    )
+                    destination_id = created.lastrowid
+
+                conn.execute(
+                    '''INSERT INTO inventory_transactions(
+                         item_id,tx_type,quantity,from_warehouse_id,
+                         to_warehouse_id,reference,user_id,created_at
+                       ) VALUES(?,?,?,?,?,?,?,?)''',
+                    (
+                        destination_id,
+                        'TRANSFER',
+                        amount,
+                        item['warehouse_id'],
+                        body.to_warehouse_id,
+                        body.reference or item['item_no'],
+                        user['id'],
+                        now(),
+                    ),
+                )
+            else:
+                raise HTTPException(400, 'Invalid transaction type')
+        except KeyError:
+            raise HTTPException(404, 'Item not found')
+        except InventoryConcurrencyConflict as exc:
+            if str(exc) == 'insufficient_unreserved_stock':
+                message = (
+                    'Insufficient unreserved stock; reserved material cannot be '
+                    'issued or transferred'
+                )
+            else:
+                message = 'Inventory stock changed concurrently; retry the adjustment'
+            raise HTTPException(409, message)
+
+        current = conn.execute(
+            '''SELECT current_stock,reserved_stock,reorder_point
+               FROM inventory_items WHERE id=?''',
+            (item_id,),
+        ).fetchone()
+        new_stock = float(current['current_stock'])
+
+        conn.execute(
+            '''INSERT INTO inventory_transactions(
+                 item_id,tx_type,quantity,from_warehouse_id,to_warehouse_id,
+                 work_order_id,reference,user_id,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?)''',
+            (
+                item_id,
+                tx,
+                quantity,
+                item['warehouse_id'],
+                body.to_warehouse_id,
+                body.work_order_id,
+                body.reference,
+                user['id'],
+                now(),
+            ),
+        )
+        audit(
+            conn,
+            user['id'],
+            tx,
+            'Inventory',
+            item['item_no'],
+            old_stock,
+            new_stock,
+        )
+        if new_stock - float(current['reserved_stock']) <= float(current['reorder_point']):
+            notify(
+                conn,
+                'Inventory below reorder point',
+                f"{item['item_no']} — {item['name']} is below reorder point",
+                'Warning',
+                None,
+                'storekeeper',
+                'inventory',
+                item['item_no'],
+            )
+        return {'ok': True, 'current_stock': new_stock}
+
+
 @app.get('/api/metrics', response_class=PlainTextResponse)
 def metrics(user=Depends(require_roles('admin', 'maintenance_manager', 'executive'))):
     text = _legacy_metrics(user)
@@ -490,6 +654,7 @@ for _export in (
     'admin_permissions',
     'update_role_permissions',
     'set_user_status',
+    'inventory_tx',
     'metrics',
 ):
     setattr(_application, _export, globals()[_export])
