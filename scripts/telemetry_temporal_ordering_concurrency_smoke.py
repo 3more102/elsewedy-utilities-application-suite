@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
 
 from app import application as _application
 from app.audit_store import ensure_audit_chain_lock
-from app.database import db, now
+from app.database import db
 from app.main import app  # noqa: F401 - install production compatibility composition
 from app.telemetry_store import ingest_telemetry_atomic
 
@@ -19,30 +19,55 @@ from app.telemetry_store import ingest_telemetry_atomic
 ROUNDS = 8
 
 
-def _admin_and_asset(conn):
-    ensure_audit_chain_lock(conn)
-    user = conn.execute(
-        """SELECT u.id,u.full_name,r.code role FROM users u
-           JOIN roles r ON r.id=u.role_id WHERE u.username='omar'"""
-    ).fetchone()
-    asset = conn.execute('SELECT id FROM assets ORDER BY id LIMIT 1').fetchone()
-    if not user or not asset:
-        raise RuntimeError('telemetry temporal smoke requires seeded admin and asset')
-    return dict(user), int(asset['id'])
+def _admin_and_asset():
+    with db() as conn:
+        ensure_audit_chain_lock(conn)
+        user = conn.execute(
+            """SELECT u.id,u.full_name,r.code role FROM users u
+               JOIN roles r ON r.id=u.role_id WHERE u.username='omar'"""
+        ).fetchone()
+        asset = conn.execute('SELECT id FROM assets ORDER BY id LIMIT 1').fetchone()
+        if not user or not asset:
+            raise RuntimeError('telemetry temporal smoke requires seeded admin and asset')
+        return dict(user), int(asset['id'])
 
 
-def _seed_channel(conn, suffix: str):
-    user, asset_id = _admin_and_asset(conn)
-    stamp = now()
+def _seed_channel(suffix: str):
+    """Create the channel through the production Telemetry app path."""
+    user, asset_id = _admin_and_asset()
     code = f'TEL-PG-TEMP-{suffix}'
-    cursor = conn.execute(
-        '''INSERT INTO telemetry_channels(
-             channel_code,asset_id,name,metric_type,unit,source_system,
-             warning_high,critical_high,active,created_at,updated_at
-           ) VALUES(?,?,?,'Current','A','CI',50,75,1,?,?)''',
-        (code, asset_id, f'PostgreSQL temporal channel {suffix}', stamp, stamp),
+    body = _application.TelemetryChannelIn(
+        channel_code=code,
+        asset_id=asset_id,
+        name=f'PostgreSQL temporal channel {suffix}',
+        metric_type='Current',
+        unit='A',
+        source_system='CI',
+        warning_high=50,
+        critical_high=75,
+        active=True,
     )
-    return user, int(cursor.lastrowid), code
+    created = _application.create_telemetry_channel(body, user)
+    channel_id = int(created['id'])
+
+    # Prove the production create transaction is visible to an independent
+    # connection before any workers start. This keeps fixture failures distinct
+    # from the temporal-ordering invariant under test.
+    with db() as probe:
+        visible = probe.execute(
+            '''SELECT id,channel_code,active FROM telemetry_channels
+               WHERE id=? AND channel_code=?''',
+            (channel_id, code),
+        ).fetchone()
+    if not visible:
+        raise RuntimeError(
+            f'production telemetry channel creation was not committed: id={channel_id} code={code}'
+        )
+    if int(visible['active']) != 1:
+        raise RuntimeError(
+            f'production telemetry channel creation yielded inactive row: {dict(visible)!r}'
+        )
+    return user, channel_id, code
 
 
 def _body(code: str, value: float, captured_at: str):
@@ -137,8 +162,7 @@ def main() -> None:
     for round_no in range(ROUNDS):
         # Older normal vs newer critical: durable state must be the newer
         # critical generation regardless of which transaction takes the lock first.
-        with db() as conn:
-            user, channel_id, code = _seed_channel(conn, f'{suffix}-CRIT-{round_no}')
+        user, channel_id, code = _seed_channel(f'{suffix}-CRIT-{round_no}')
         _parallel_two(code, user, (20.0, older_at), (80.0, newer_at))
         channel, readings, active, _ = _evidence(channel_id)
         if readings != 2:
@@ -153,8 +177,7 @@ def main() -> None:
         # Older critical vs newer normal: the delayed old reading may open first
         # and then be cleared, or may be historical immediately, but it can never
         # remain the current state after the newer normal reading commits.
-        with db() as conn:
-            user, channel_id, code = _seed_channel(conn, f'{suffix}-NORMAL-{round_no}')
+        user, channel_id, code = _seed_channel(f'{suffix}-NORMAL-{round_no}')
         _parallel_two(code, user, (90.0, older_at), (20.0, newer_at))
         channel, readings, active, _ = _evidence(channel_id)
         if readings != 2:
@@ -167,8 +190,7 @@ def main() -> None:
         # Equal captured timestamps have no event-time successor relation. One
         # serialized arrival becomes live and the other must remain historical;
         # this must never create a second alarm occurrence.
-        with db() as conn:
-            user, channel_id, code = _seed_channel(conn, f'{suffix}-EQUAL-{round_no}')
+        user, channel_id, code = _seed_channel(f'{suffix}-EQUAL-{round_no}')
         results = _parallel_two(code, user, (80.0, equal_at), (95.0, equal_at))
         channel, readings, active, all_alarms = _evidence(channel_id)
         if readings != 2 or sum(int(x['historical']) for x in results) != 1:
