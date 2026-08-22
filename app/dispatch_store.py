@@ -60,7 +60,6 @@ def load_dispatch_work_snapshot(conn, wo_id: int) -> dict:
 
 
 def _lock_assignment_coordinator(conn) -> None:
-    ensure_dispatch_assignment_lock(conn)
     locked = conn.execute(
         'UPDATE dispatch_assignment_lock SET guard=guard WHERE id=1'
     )
