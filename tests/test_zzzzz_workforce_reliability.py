@@ -1,5 +1,6 @@
 from datetime import date, timedelta
 from fastapi.testclient import TestClient
+from app.database import db, now
 from app.main import app
 
 
@@ -22,15 +23,27 @@ def test_workforce_parts_and_reliability_planning():
         tech_rows=techs.json()
         assert len(tech_rows)>=2
         assert all(t['craft_code']=='ELEC-HV' for t in tech_rows)
+        tech2=next(t for t in tech_rows if t['username']=='tech2')
+
+        # Create one approved absence on a guaranteed scheduled weekday. The
+        # reference seed uses date.today()+14 and can land on a weekend,
+        # making a capacity-variation assertion depend on the CI calendar.
+        absence_day=date.today()+timedelta(days=7)
+        while absence_day.weekday()>=5:
+            absence_day+=timedelta(days=1)
+        with db() as conn:
+            admin_id=conn.execute("SELECT id FROM users WHERE username='omar'").fetchone()['id']
+            conn.execute('''INSERT INTO technician_absences(user_id,start_date,end_date,absence_type,hours_per_day,status,notes,created_by,created_at)
+                            VALUES(?,?,?,?,?,'Approved',?,?,?)''',
+                         (tech2['user_id'],absence_day.isoformat(),absence_day.isoformat(),'CI Regression Leave',8,
+                          'Calendar-safe workforce capacity regression',admin_id,now()))
 
         capacity=client.get('/api/workforce/capacity',headers=admin,params={'site_id':ncs['id'],'weeks':5})
         assert capacity.status_code==200,capacity.text
         weeks=capacity.json()['weeks']
         assert weeks and all(w['source']=='workforce_schedule' for w in weeks)
-        # Seeded tech2 leave occurs roughly two weeks ahead and must reduce one weekly bucket.
         assert min(w['capacity_hours'] for w in weeks) < max(w['capacity_hours'] for w in weeks)
 
-        tech2=next(t for t in tech_rows if t['username']=='tech2')
         changed=client.put(f"/api/workforce/technicians/{tech2['user_id']}",headers=admin,json={
             'craft_id':tech2['craft_id'],'home_site_id':ncs['id'],'weekly_hours':40,'efficiency_pct':50,'active':True
         })
