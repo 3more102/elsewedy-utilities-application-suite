@@ -67,9 +67,9 @@ def adjust_stock_if_unchanged(
     return float(expected_stock), float(target_stock)
 
 
-# ``app.main`` already imports this focused transaction module as part of its
-# compatibility façade. Install production hardening extensions here so the
-# monolithic application does not need broad rewrites. Every installer is
+# ``app.main`` already imports this focused transaction module as part of the
+# shared EUAS suite runtime. Install production-hardening extensions here so
+# individual app domains can evolve without broad rewrites. Every installer is
 # idempotent and preserves historical role authorization.
 from .alarm_authorization import (
     install_alarm_lifecycle_authorization,
@@ -85,6 +85,7 @@ from .inspection_store import install_inspection_submission_route
 from .outbox_store import install_outbox_atomicity
 from .pm_startup import install_pm_generation_startup
 from .procurement_store import install_procurement_routes
+from .reorder_store import install_reorder_generation_atomicity
 from .reservation_authorization import install_reservation_authorization_contract
 from .reservation_store import install_reservation_routes
 from .transfer_startup import install_inventory_transfer_startup
@@ -102,6 +103,7 @@ install_inventory_transfer_startup()
 install_work_order_number_startup()
 install_pm_generation_startup()
 install_outbox_atomicity()
+install_reorder_generation_atomicity()
 install_procurement_routes()
 install_atomic_approval_route()
 install_reservation_routes()
