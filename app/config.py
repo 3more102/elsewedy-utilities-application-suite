@@ -10,7 +10,7 @@ UPLOAD_DIR = BASE_DIR / 'uploads'
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 APP_NAME = 'Elsewedy Utilities Application Suite'
-APP_VERSION = os.getenv('EUAS_VERSION', '3.9.0')
+APP_VERSION = os.getenv('EUAS_VERSION', '4.0.0')
 ENVIRONMENT = os.getenv('EUAS_ENV', 'development').lower()
 SESSION_HOURS = max(1, int(os.getenv('EUAS_SESSION_HOURS', '12')))
 MAX_UPLOAD_MB = max(1, int(os.getenv('EUAS_MAX_UPLOAD_MB', '25')))
