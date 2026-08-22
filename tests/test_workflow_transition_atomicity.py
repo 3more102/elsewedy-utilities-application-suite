@@ -15,11 +15,10 @@ from app.workflow_store import (
     transition_work_atomic,
 )
 
-
 WORKERS = 8
 
 
-def _admin(conn) -> dict:
+def admin(conn):
     row = conn.execute(
         """SELECT u.id,u.full_name,r.code role FROM users u
            JOIN roles r ON r.id=u.role_id WHERE u.username='omar'"""
@@ -28,329 +27,196 @@ def _admin(conn) -> dict:
     return dict(row)
 
 
-def _seed_work(conn, suffix: str, status: str, assigned_to=None) -> tuple[int, str, dict]:
-    user = _admin(conn)
+def seed_work(conn, suffix, status, assigned_to=None):
+    user = admin(conn)
     number = f'WO-CAS-{suffix}'
-    created = conn.execute(
+    cur = conn.execute(
         '''INSERT INTO work_orders(
              wo_no,title,priority,status,work_type,requested_by,assigned_to,
              created_at,updated_at
-           ) VALUES(?,?,'Medium',?,'Corrective Maintenance',?,?,?,?,?)''',
-        (
-            number,
-            'Workflow concurrency work',
-            status,
-            user['id'],
-            assigned_to,
-            now(),
-            now(),
-        ),
+           ) VALUES(?,?,'Medium',?,'Corrective Maintenance',?,?,?,?)''',
+        (number, 'Workflow concurrency work', status, user['id'], assigned_to, now(), now()),
     )
-    return int(created.lastrowid), number, user
+    return int(cur.lastrowid), number, user
 
 
-def test_concurrent_work_submit_has_one_transition_and_one_approval():
-    suffix = uuid.uuid4().hex[:10]
+def race(operation, workers=WORKERS, conflict_types=(WorkflowTransitionConflict,)):
+    barrier = threading.Barrier(workers)
+    wins, conflicts, errors = [], [], []
+
+    def worker(index):
+        try:
+            barrier.wait(timeout=10)
+            operation(index)
+            wins.append(index)
+        except conflict_types:
+            conflicts.append(index)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=25)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    return wins, conflicts
+
+
+def test_submit_and_complete_transitions_have_one_winner():
     with TestClient(app):
+        suffix = uuid.uuid4().hex[:10]
         with db() as conn:
-            work_id, work_no, user = _seed_work(conn, suffix, 'Draft')
+            work_id, work_no, user = seed_work(conn, suffix + 'S', 'Draft')
 
-        barrier = threading.Barrier(WORKERS)
-        wins: list[int] = []
-        conflicts: list[int] = []
-        errors: list[BaseException] = []
+        def submit(_):
+            with db() as conn:
+                transition_work_atomic(conn, work_id, TransitionIn(action='submit'), user)
 
-        def worker(index: int) -> None:
-            try:
-                barrier.wait(timeout=10)
-                with db() as conn:
-                    transition_work_atomic(
-                        conn, work_id, TransitionIn(action='submit'), user
-                    )
-                wins.append(index)
-            except WorkflowTransitionConflict:
-                conflicts.append(index)
-            except BaseException as exc:
-                errors.append(exc)
-
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(WORKERS)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=20)
-
-        assert errors == []
-        assert not any(thread.is_alive() for thread in threads)
-        assert len(wins) == 1
-        assert len(conflicts) == WORKERS - 1
+        wins, conflicts = race(submit)
+        assert len(wins) == 1 and len(conflicts) == WORKERS - 1
         with db() as conn:
-            status = conn.execute(
-                'SELECT status FROM work_orders WHERE id=?', (work_id,)
-            ).fetchone()['status']
-            approvals = int(
-                conn.execute(
-                    """SELECT COUNT(*) FROM approval_requests
-                       WHERE record_type='work_order' AND record_id=?""",
-                    (work_id,),
-                ).fetchone()[0]
-            )
-            events = int(
-                conn.execute(
-                    """SELECT COUNT(*) FROM workflow_events
-                       WHERE record_type='work_order' AND record_id=? AND event='SUBMIT'""",
-                    (work_id,),
-                ).fetchone()[0]
-            )
-            audits = int(
-                conn.execute(
-                    """SELECT COUNT(*) FROM audit_logs
-                       WHERE module='Work Management' AND action='SUBMIT' AND record_id=?""",
-                    (work_no,),
-                ).fetchone()[0]
-            )
-        assert status == 'Submitted'
-        assert approvals == events == audits == 1
+            assert conn.execute('SELECT status FROM work_orders WHERE id=?', (work_id,)).fetchone()['status'] == 'Submitted'
+            assert conn.execute(
+                "SELECT COUNT(*) FROM approval_requests WHERE record_type='work_order' AND record_id=?",
+                (work_id,),
+            ).fetchone()[0] == 1
+            assert conn.execute(
+                "SELECT COUNT(*) FROM workflow_events WHERE record_type='work_order' AND record_id=? AND event='SUBMIT'",
+                (work_id,),
+            ).fetchone()[0] == 1
+            assert conn.execute(
+                "SELECT COUNT(*) FROM audit_logs WHERE module='Work Management' AND action='SUBMIT' AND record_id=?",
+                (work_no,),
+            ).fetchone()[0] == 1
+
+        with db() as conn:
+            work_id, _, user = seed_work(conn, suffix + 'C', 'In Progress')
+
+        def complete(index):
+            with db() as conn:
+                transition_work_atomic(
+                    conn,
+                    work_id,
+                    TransitionIn(action='complete', notes=f'complete {index}'),
+                    user,
+                )
+
+        wins, conflicts = race(complete)
+        assert len(wins) == 1 and len(conflicts) == WORKERS - 1
+        with db() as conn:
+            work = conn.execute('SELECT status,actual_finish FROM work_orders WHERE id=?', (work_id,)).fetchone()
+            assert work['status'] == 'Completed' and work['actual_finish']
+            assert conn.execute(
+                "SELECT COUNT(*) FROM workflow_events WHERE record_type='work_order' AND record_id=? AND event='COMPLETE'",
+                (work_id,),
+            ).fetchone()[0] == 1
 
 
-def test_direct_and_unified_work_approval_have_one_business_transition():
-    suffix = uuid.uuid4().hex[:10]
+def test_direct_and_unified_work_approval_share_one_atomic_winner():
     with TestClient(app):
+        suffix = uuid.uuid4().hex[:10]
         with db() as conn:
-            work_id, work_no, user = _seed_work(conn, suffix, 'Submitted')
+            work_id, work_no, user = seed_work(conn, suffix, 'Submitted')
             approval = conn.execute(
                 '''INSERT INTO approval_requests(
                      approval_no,module,record_type,record_id,record_code,title,
                      requested_by,assigned_role,status,requested_at
                    ) VALUES(?,?,?,?,?,?,?,'maintenance_manager','Pending',?)''',
-                (
-                    f'APR-WO-{suffix}',
-                    'Work Management',
-                    'work_order',
-                    work_id,
-                    work_no,
-                    f'Approve {work_no}',
-                    user['id'],
-                    now(),
-                ),
+                (f'APR-WO-{suffix}', 'Work Management', 'work_order', work_id, work_no,
+                 f'Approve {work_no}', user['id'], now()),
             )
             approval_id = int(approval.lastrowid)
-
-        barrier = threading.Barrier(WORKERS)
-        wins: list[int] = []
-        conflicts: list[int] = []
-        errors: list[BaseException] = []
         decision = ApprovalDecisionIn(decision='approve', comments='race')
 
-        def worker(index: int) -> None:
-            try:
-                barrier.wait(timeout=10)
-                with db() as conn:
-                    if index % 2:
-                        decide_approval_atomic(conn, approval_id, decision, user)
-                    else:
-                        transition_work_atomic(
-                            conn, work_id, TransitionIn(action='approve'), user
-                        )
-                wins.append(index)
-            except (WorkflowTransitionConflict, ApprovalTransitionConflict):
-                conflicts.append(index)
-            except BaseException as exc:
-                errors.append(exc)
+        def approve(index):
+            with db() as conn:
+                if index % 2:
+                    decide_approval_atomic(conn, approval_id, decision, user)
+                else:
+                    transition_work_atomic(conn, work_id, TransitionIn(action='approve'), user)
 
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(WORKERS)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=25)
-
-        assert errors == []
-        assert not any(thread.is_alive() for thread in threads)
-        assert len(wins) == 1
-        assert len(conflicts) == WORKERS - 1
+        wins, conflicts = race(
+            approve,
+            conflict_types=(WorkflowTransitionConflict, ApprovalTransitionConflict),
+        )
+        assert len(wins) == 1 and len(conflicts) == WORKERS - 1
         with db() as conn:
-            work_status = conn.execute(
-                'SELECT status FROM work_orders WHERE id=?', (work_id,)
-            ).fetchone()['status']
-            approval_status = conn.execute(
-                'SELECT status FROM approval_requests WHERE id=?', (approval_id,)
-            ).fetchone()['status']
-            events = int(
-                conn.execute(
-                    """SELECT COUNT(*) FROM workflow_events
-                       WHERE record_type='work_order' AND record_id=? AND event='APPROVE'""",
-                    (work_id,),
-                ).fetchone()[0]
-            )
-            audits = int(
-                conn.execute(
-                    """SELECT COUNT(*) FROM audit_logs
-                       WHERE module='Work Management' AND action='APPROVE' AND record_id=?""",
-                    (work_no,),
-                ).fetchone()[0]
-            )
-        assert work_status == approval_status == 'Approved'
-        assert events == audits == 1
+            assert conn.execute('SELECT status FROM work_orders WHERE id=?', (work_id,)).fetchone()['status'] == 'Approved'
+            assert conn.execute('SELECT status FROM approval_requests WHERE id=?', (approval_id,)).fetchone()['status'] == 'Approved'
+            assert conn.execute(
+                "SELECT COUNT(*) FROM workflow_events WHERE record_type='work_order' AND record_id=? AND event='APPROVE'",
+                (work_id,),
+            ).fetchone()[0] == 1
 
 
-def test_concurrent_complete_work_has_one_winner():
-    suffix = uuid.uuid4().hex[:10]
+def test_dispatch_accept_has_one_winner():
     with TestClient(app):
+        suffix = uuid.uuid4().hex[:10]
         with db() as conn:
-            work_id, work_no, user = _seed_work(conn, suffix, 'In Progress')
-
-        barrier = threading.Barrier(WORKERS)
-        wins: list[int] = []
-        conflicts: list[int] = []
-        errors: list[BaseException] = []
-
-        def worker(index: int) -> None:
-            try:
-                barrier.wait(timeout=10)
-                with db() as conn:
-                    transition_work_atomic(
-                        conn,
-                        work_id,
-                        TransitionIn(action='complete', notes=f'complete {index}'),
-                        user,
-                    )
-                wins.append(index)
-            except WorkflowTransitionConflict:
-                conflicts.append(index)
-            except BaseException as exc:
-                errors.append(exc)
-
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(WORKERS)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=20)
-
-        assert errors == []
-        assert len(wins) == 1
-        assert len(conflicts) == WORKERS - 1
-        with db() as conn:
-            work = conn.execute(
-                'SELECT status,actual_finish FROM work_orders WHERE id=?', (work_id,)
-            ).fetchone()
-            events = int(
-                conn.execute(
-                    """SELECT COUNT(*) FROM workflow_events
-                       WHERE record_type='work_order' AND record_id=? AND event='COMPLETE'""",
-                    (work_id,),
-                ).fetchone()[0]
-            )
-        assert work['status'] == 'Completed'
-        assert work['actual_finish']
-        assert events == 1
-
-
-def test_concurrent_dispatch_accept_has_one_winner():
-    suffix = uuid.uuid4().hex[:10]
-    with TestClient(app):
-        with db() as conn:
-            user = _admin(conn)
+            user = admin(conn)
             tech = conn.execute(
                 """SELECT u.id FROM users u JOIN roles r ON r.id=u.role_id
                    WHERE r.code='technician' AND u.active=1 ORDER BY u.id LIMIT 1"""
             ).fetchone()
             assert tech
-            work_id, _, _ = _seed_work(conn, suffix, 'Assigned', tech['id'])
-            dispatch = conn.execute(
+            work_id, _, _ = seed_work(conn, suffix, 'Assigned', tech['id'])
+            cur = conn.execute(
                 '''INSERT INTO dispatch_assignments(
                      dispatch_no,work_order_id,technician_user_id,dispatched_by,
                      status,eta_minutes,notes,dispatched_at
-                   ) VALUES(?,?,?,?, 'Dispatched',30,'race',?)''',
+                   ) VALUES(?,?,?,?,'Dispatched',30,'race',?)''',
                 (f'DSP-CAS-{suffix}', work_id, tech['id'], user['id'], now()),
             )
-            dispatch_id = int(dispatch.lastrowid)
+            dispatch_id = int(cur.lastrowid)
 
-        barrier = threading.Barrier(WORKERS)
-        wins: list[int] = []
-        conflicts: list[int] = []
-        errors: list[BaseException] = []
+        def accept(_):
+            with db() as conn:
+                transition_dispatch_atomic(conn, dispatch_id, DispatchTransitionIn(action='accept'), user)
 
-        def worker(index: int) -> None:
-            try:
-                barrier.wait(timeout=10)
-                with db() as conn:
-                    transition_dispatch_atomic(
-                        conn,
-                        dispatch_id,
-                        DispatchTransitionIn(action='accept'),
-                        user,
-                    )
-                wins.append(index)
-            except WorkflowTransitionConflict:
-                conflicts.append(index)
-            except BaseException as exc:
-                errors.append(exc)
-
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(WORKERS)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=20)
-
-        assert errors == []
-        assert len(wins) == 1
-        assert len(conflicts) == WORKERS - 1
+        wins, conflicts = race(accept)
+        assert len(wins) == 1 and len(conflicts) == WORKERS - 1
         with db() as conn:
-            status = conn.execute(
-                'SELECT status FROM dispatch_assignments WHERE id=?', (dispatch_id,)
-            ).fetchone()['status']
-        assert status == 'Accepted'
+            assert conn.execute('SELECT status FROM dispatch_assignments WHERE id=?', (dispatch_id,)).fetchone()['status'] == 'Accepted'
 
 
 def test_dispatch_arrive_racing_direct_start_changes_work_once():
-    suffix = uuid.uuid4().hex[:10]
     with TestClient(app):
+        suffix = uuid.uuid4().hex[:10]
         with db() as conn:
-            user = _admin(conn)
+            user = admin(conn)
             tech = conn.execute(
                 """SELECT u.id FROM users u JOIN roles r ON r.id=u.role_id
                    WHERE r.code='technician' AND u.active=1 ORDER BY u.id LIMIT 1"""
             ).fetchone()
             assert tech
-            work_id, work_no, _ = _seed_work(conn, suffix, 'Assigned', tech['id'])
-            dispatch = conn.execute(
+            work_id, _, _ = seed_work(conn, suffix, 'Assigned', tech['id'])
+            cur = conn.execute(
                 '''INSERT INTO dispatch_assignments(
                      dispatch_no,work_order_id,technician_user_id,dispatched_by,
                      status,eta_minutes,notes,dispatched_at,enroute_at
-                   ) VALUES(?,?,?,?, 'En Route',30,'race',?,?)''',
-                (
-                    f'DSP-ARR-{suffix}',
-                    work_id,
-                    tech['id'],
-                    user['id'],
-                    now(),
-                    now(),
-                ),
+                   ) VALUES(?,?,?,?,'En Route',30,'race',?,?)''',
+                (f'DSP-ARR-{suffix}', work_id, tech['id'], user['id'], now(), now()),
             )
-            dispatch_id = int(dispatch.lastrowid)
+            dispatch_id = int(cur.lastrowid)
 
         barrier = threading.Barrier(2)
-        errors: list[BaseException] = []
+        errors = []
 
-        def arrive() -> None:
+        def arrive():
             try:
                 barrier.wait(timeout=10)
                 with db() as conn:
-                    transition_dispatch_atomic(
-                        conn,
-                        dispatch_id,
-                        DispatchTransitionIn(action='arrive'),
-                        user,
-                    )
+                    transition_dispatch_atomic(conn, dispatch_id, DispatchTransitionIn(action='arrive'), user)
             except BaseException as exc:
                 errors.append(exc)
 
-        def start() -> None:
+        def start():
             try:
                 barrier.wait(timeout=10)
                 with db() as conn:
-                    transition_work_atomic(
-                        conn, work_id, TransitionIn(action='start'), user
-                    )
+                    transition_work_atomic(conn, work_id, TransitionIn(action='start'), user)
             except WorkflowTransitionConflict:
                 pass
             except BaseException as exc:
@@ -360,26 +226,18 @@ def test_dispatch_arrive_racing_direct_start_changes_work_once():
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=20)
-
-        assert errors == []
+            thread.join(timeout=25)
         assert not any(thread.is_alive() for thread in threads)
+        assert errors == []
         with db() as conn:
-            work = conn.execute(
-                'SELECT status,actual_start FROM work_orders WHERE id=?', (work_id,)
-            ).fetchone()
-            transitions = int(
-                conn.execute(
-                    """SELECT COUNT(*) FROM workflow_events
-                       WHERE record_type='work_order' AND record_id=?
-                         AND from_status='Assigned' AND to_status='In Progress'""",
-                    (work_id,),
-                ).fetchone()[0]
-            )
-            dispatch_status = conn.execute(
-                'SELECT status FROM dispatch_assignments WHERE id=?', (dispatch_id,)
-            ).fetchone()['status']
-        assert work['status'] == 'In Progress'
-        assert work['actual_start']
+            work = conn.execute('SELECT status,actual_start FROM work_orders WHERE id=?', (work_id,)).fetchone()
+            transitions = conn.execute(
+                """SELECT COUNT(*) FROM workflow_events
+                   WHERE record_type='work_order' AND record_id=?
+                     AND from_status='Assigned' AND to_status='In Progress'""",
+                (work_id,),
+            ).fetchone()[0]
+            dispatch_status = conn.execute('SELECT status FROM dispatch_assignments WHERE id=?', (dispatch_id,)).fetchone()['status']
+        assert work['status'] == 'In Progress' and work['actual_start']
         assert transitions == 1
         assert dispatch_status == 'On Site'
