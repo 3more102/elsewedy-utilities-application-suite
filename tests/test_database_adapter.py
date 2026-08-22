@@ -25,6 +25,18 @@ def test_postgres_translation_escapes_literal_percent_for_psycopg():
     assert ignored == "INSERT INTO demo(name,pattern) VALUES(%s, 'PM%%') ON CONFLICT DO NOTHING"
 
 
+def test_postgres_translation_types_standalone_null_checks():
+    sql = _pg_sql(
+        'SELECT id FROM notifications WHERE ((user_id=?) OR (user_id IS NULL AND ? IS NULL)) '
+        'AND ((role_code=?) OR (role_code IS NULL AND ? IS NULL))'
+    )
+    assert sql == (
+        'SELECT id FROM notifications WHERE ((user_id=%s) OR '
+        '(user_id IS NULL AND CAST(%s AS TEXT) IS NULL)) AND '
+        '((role_code=%s) OR (role_code IS NULL AND CAST(%s AS TEXT) IS NULL))'
+    )
+
+
 def test_postgres_cursor_supports_sqlite_style_iteration():
     class Column:
         def __init__(self, name):
