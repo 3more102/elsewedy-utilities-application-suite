@@ -13,6 +13,7 @@ from .database import db, now
 
 
 OUTBOX_RETRY_ROLES = ('admin', 'maintenance_manager')
+_legacy_execute_automation = _application._execute_automation
 
 
 def _rowcount_one(cursor) -> bool:
@@ -48,12 +49,15 @@ def _claim_delivery(conn, snapshot: dict) -> dict | None:
 
 
 def process_outbox_atomic(conn) -> dict:
-    """Deliver eligible outbox events with one concurrent sender per generation.
+    """Deliver eligible committed outbox events with one sender per generation.
 
-    This prevents duplicate sends caused by simultaneous automation workers. It
-    intentionally retains at-least-once crash semantics: if the process dies
-    after the remote endpoint accepts the POST but before the database commits,
-    the stable X-EUAS-Event-ID remains the receiver-side deduplication key.
+    Callers must enter this after the business transaction that created events
+    has committed. The automation wrapper below enforces that boundary.
+
+    Concurrent duplicate sends are prevented, but crash semantics remain
+    intentionally at-least-once: if the process dies after the remote endpoint
+    accepts the POST but before delivery status commits, the stable
+    X-EUAS-Event-ID is the receiver-side deduplication key.
     """
     items = [
         dict(row)
@@ -82,31 +86,31 @@ def process_outbox_atomic(conn) -> dict:
             skipped += 1
             continue
 
-        body = json.dumps(
-            {
-                'event_no': item['event_no'],
-                'event_type': item['event_type'],
-                'aggregate_type': item['aggregate_type'],
-                'aggregate_id': item['aggregate_id'],
-                'payload': json.loads(item['payload_json']),
-                'created_at': item['created_at'],
-            },
-            ensure_ascii=False,
-        ).encode()
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': 'EUAS/' + _application.APP_VERSION,
-            'X-EUAS-Event': item['event_type'],
-            'X-EUAS-Event-ID': item['event_no'],
-        }
-        if _application.EVENT_WEBHOOK_SECRET:
-            headers['X-EUAS-Signature'] = 'sha256=' + hmac.new(
-                _application.EVENT_WEBHOOK_SECRET.encode(),
-                body,
-                hashlib.sha256,
-            ).hexdigest()
-
         try:
+            body = json.dumps(
+                {
+                    'event_no': item['event_no'],
+                    'event_type': item['event_type'],
+                    'aggregate_type': item['aggregate_type'],
+                    'aggregate_id': item['aggregate_id'],
+                    'payload': json.loads(item['payload_json']),
+                    'created_at': item['created_at'],
+                },
+                ensure_ascii=False,
+            ).encode()
+            headers = {
+                'Content-Type': 'application/json',
+                'User-Agent': 'EUAS/' + _application.APP_VERSION,
+                'X-EUAS-Event': item['event_type'],
+                'X-EUAS-Event-ID': item['event_no'],
+            }
+            if _application.EVENT_WEBHOOK_SECRET:
+                headers['X-EUAS-Signature'] = 'sha256=' + hmac.new(
+                    _application.EVENT_WEBHOOK_SECRET.encode(),
+                    body,
+                    hashlib.sha256,
+                ).hexdigest()
+
             request = _application.urllib_request.Request(
                 _application.EVENT_WEBHOOK_URL,
                 data=body,
@@ -133,6 +137,54 @@ def process_outbox_atomic(conn) -> dict:
             failed += 1
 
     return {'delivered': delivered, 'failed': failed, 'skipped': skipped}
+
+
+def _defer_outbox(_conn) -> dict:
+    """Legacy automation hook: never deliver before its payload commits."""
+    return {'delivered': 0, 'failed': 0, 'skipped': 0}
+
+
+def execute_automation_postcommit(
+    conn,
+    actor_id: int,
+    trigger_source: str = 'manual',
+    as_of: str | None = None,
+):
+    """Run business automation first, commit it, then dispatch committed events."""
+    result = _legacy_execute_automation(conn, actor_id, trigger_source, as_of)
+    if result.get('status') != 'Succeeded':
+        return result
+
+    # The historical executor has released its savepoint and recorded the
+    # successful job result, but the outer db() context has not committed yet.
+    # Commit here before any network call so every dispatched event references
+    # durable business state.
+    conn.commit()
+
+    outbox = {'delivered': 0, 'failed': 0, 'skipped': 0}
+    try:
+        outbox = process_outbox_atomic(conn)
+        summary = dict(result.get('summary') or {})
+        summary['outbox_delivered'] = outbox['delivered']
+        summary['outbox_failed'] = outbox['failed']
+        summary['outbox_skipped'] = outbox['skipped']
+        conn.execute(
+            'UPDATE job_runs SET summary_json=? WHERE id=?',
+            (json.dumps(summary), result['id']),
+        )
+        # Persist delivery attempts/status independently from the already
+        # committed business payload. The enclosing db() context may commit
+        # again; that is harmless for both adapters.
+        conn.commit()
+        result = dict(result)
+        result['summary'] = summary
+    except Exception:
+        # A processor/database failure must never retroactively mark committed
+        # business automation as failed. Roll back only the post-commit delivery
+        # transaction; eligible events remain queued for a later attempt.
+        conn.rollback()
+        _application.logger.exception('EUAS post-commit outbox delivery failed')
+    return result
 
 
 def retry_outbox_event_atomic(conn, event_id: int, user: dict) -> dict:
@@ -191,13 +243,17 @@ def retry_outbox_event_atomic(conn, event_id: int, user: dict) -> dict:
 
 
 def install_outbox_atomicity() -> None:
-    """Install the atomic processor and preserve the historical retry API."""
+    """Install post-commit delivery and preserve the historical retry API."""
     app = _application.app
     marker = '_euas_outbox_delivery_atomicity'
     if getattr(app.state, marker, False):
         return
 
-    _application._process_outbox = process_outbox_atomic
+    # Legacy automation still calls this global internally. Deferring here and
+    # replacing _execute_automation below guarantees no webhook occurs before
+    # its business transaction commits.
+    _application._process_outbox = _defer_outbox
+    _application._execute_automation = execute_automation_postcommit
 
     path = '/api/events/outbox/{event_id}/retry'
     app.router.routes[:] = [
