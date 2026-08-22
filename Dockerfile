@@ -6,9 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Refresh the pinned Debian base to current security packages and remove two
-# vulnerable Python packages inherited from the base image before application
-# dependencies are installed. Keep package-manager indexes out of the layer.
+# Refresh the pinned Debian base to current security packages and replace two
+# vulnerable Python packages inherited from the base image. Package indexes are
+# removed in the same layer so they are not retained in the runtime image.
 RUN apt-get update \
     && apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/* \
@@ -19,10 +19,15 @@ RUN apt-get update \
 RUN groupadd --system euas \
     && useradd --system --gid euas --home /app euas
 
-COPY requirements.txt .
-RUN python -m pip install --no-cache-dir -r requirements.txt
+# Production installs only runtime dependencies. Test tooling remains in the
+# developer/CI requirements file and is deliberately excluded from the image.
+COPY requirements-runtime.txt .
+RUN python -m pip install --no-cache-dir -r requirements-runtime.txt
 
-COPY --chown=euas:euas . .
+# Copy only the files required by the running FastAPI application instead of the
+# repository, CI metadata, tests and engineering documentation.
+COPY --chown=euas:euas app ./app
+COPY --chown=euas:euas static ./static
 RUN mkdir -p /app/data /app/uploads \
     && chown -R euas:euas /app/data /app/uploads
 
