@@ -54,9 +54,12 @@ def test_postgres_generated_id_is_statement_local_not_session_lastval():
 
         def execute(self, sql, args=()):
             self.raw.statements.append((sql, tuple(args or ())))
-            if sql.startswith('SELECT pg_get_serial_sequence'):
+            if 'FROM information_schema.columns' in sql:
                 table = args[0]
-                self.result = (f'{table}_id_seq',)
+                if table in {'pg_ci_parent', 'pg_ci_audit'}:
+                    self.result = (f"nextval('{table}_id_seq'::regclass)", 'NO')
+                else:
+                    self.result = None
             elif sql.startswith('INSERT INTO pg_ci_parent'):
                 assert sql.endswith('RETURNING id')
                 self.result = (41,)
@@ -85,10 +88,12 @@ def test_postgres_generated_id_is_statement_local_not_session_lastval():
     conn = PostgresConnection(raw)
     parent = conn.execute('INSERT INTO pg_ci_parent(name) VALUES(?)', ('parent',))
     audit = conn.execute('INSERT INTO pg_ci_audit(action) VALUES(?)', ('CREATE',))
+    bridge = conn.execute('INSERT INTO pg_ci_bridge(left_id,right_id) VALUES(?,?)', (1, 2))
 
     assert parent.lastrowid == 41
     assert audit.lastrowid == 900
     assert parent.lastrowid == 41
+    assert bridge.lastrowid is None
 
 
 def test_postgres_cursor_supports_sqlite_style_iteration():
