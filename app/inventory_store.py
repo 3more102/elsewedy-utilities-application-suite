@@ -76,6 +76,8 @@ from .alarm_store import install_alarm_work_order_route
 from .approval_store import install_atomic_approval_route
 from .dispatch_startup import install_dispatch_assignment_startup
 from .dispatch_store import install_dispatch_assignment_route
+from .inspection_authorization import install_inspection_authorization_contract
+from .inspection_store import install_inspection_submission_route
 from .pm_startup import install_pm_generation_startup
 from .procurement_store import install_procurement_routes
 from .reservation_authorization import install_reservation_authorization_contract
@@ -88,6 +90,7 @@ from .workflow_store import install_workflow_transition_routes
 install_reservation_authorization_contract()
 install_workflow_authorization_contract()
 install_alarm_work_order_authorization()
+install_inspection_authorization_contract()
 install_dispatch_assignment_startup()
 install_inventory_transfer_startup()
 install_work_order_number_startup()
@@ -98,3 +101,4 @@ install_reservation_routes()
 install_workflow_transition_routes()
 install_dispatch_assignment_route()
 install_alarm_work_order_route()
+install_inspection_submission_route()
