@@ -68,11 +68,13 @@ def adjust_stock_if_unchanged(
 
 
 # ``app.main`` already imports this focused transaction module as part of its
-# compatibility façade. Install state-machine replacements here so the
-# monolithic application does not need a large rewrite; both installers are
-# idempotent and preserve public paths and historical authorization behavior.
+# compatibility façade. Install state-machine and reservation replacements here
+# so the monolithic application does not need a large rewrite. All installers
+# are idempotent and preserve public paths and historical role authorization.
 from .approval_store import install_atomic_approval_route
 from .procurement_store import install_procurement_routes
+from .reservation_store import install_reservation_routes
 
 install_procurement_routes()
 install_atomic_approval_route()
+install_reservation_routes()
