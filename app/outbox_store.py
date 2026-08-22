@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import sys
 
 from fastapi import Depends, HTTPException
 
@@ -254,6 +255,14 @@ def install_outbox_atomicity() -> None:
     # its business transaction commits.
     _application._process_outbox = _defer_outbox
     _application._execute_automation = execute_automation_postcommit
+
+    # app.main copies application symbols before importing the compatibility
+    # bootstrap that reaches this installer. Synchronize those two exports in
+    # place so operational scripts importing app.main cannot bypass hardening.
+    main_module = sys.modules.get(f'{__package__}.main')
+    if main_module is not None:
+        setattr(main_module, '_process_outbox', _defer_outbox)
+        setattr(main_module, '_execute_automation', execute_automation_postcommit)
 
     path = '/api/events/outbox/{event_id}/retry'
     app.router.routes[:] = [
