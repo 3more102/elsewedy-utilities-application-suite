@@ -33,6 +33,17 @@ def ensure_dispatch_assignment_lock(conn) -> None:
     )
 
 
+def _active_dispatch_ids(conn, wo_id: int) -> tuple[int, ...]:
+    rows = conn.execute(
+        '''SELECT id FROM dispatch_assignments
+           WHERE work_order_id=?
+             AND status IN ('Dispatched','Accepted','En Route','On Site')
+           ORDER BY id''',
+        (wo_id,),
+    ).fetchall()
+    return tuple(int(row['id']) for row in rows)
+
+
 def load_dispatch_work_snapshot(conn, wo_id: int) -> dict:
     work = conn.execute('SELECT * FROM work_orders WHERE id=?', (wo_id,)).fetchone()
     if not work:
@@ -42,6 +53,9 @@ def load_dispatch_work_snapshot(conn, wo_id: int) -> dict:
         raise DispatchAssignmentConflict(
             'Work order must be Approved or Assigned before dispatch'
         )
+    # The active-dispatch generation distinguishes a genuinely later re-dispatch
+    # from two concurrent requests that captured the same Assigned work state.
+    work['_dispatch_active_ids'] = _active_dispatch_ids(conn, wo_id)
     return work
 
 
@@ -71,33 +85,34 @@ def _lock_and_load_technician(conn, technician_user_id: int) -> dict:
     return dict(tech)
 
 
-def _lock_active_dispatches_for_work(conn, wo_id: int) -> None:
-    rows = conn.execute(
-        '''SELECT id FROM dispatch_assignments
-           WHERE work_order_id=?
-             AND status IN ('Dispatched','Accepted','En Route','On Site')
-           ORDER BY id''',
-        (wo_id,),
-    ).fetchall()
-    for row in rows:
+def _lock_active_dispatches_for_work(conn, wo_id: int) -> tuple[int, ...]:
+    ids = _active_dispatch_ids(conn, wo_id)
+    for dispatch_id in ids:
         conn.execute(
             'UPDATE dispatch_assignments SET status=status WHERE id=?',
-            (row['id'],),
+            (dispatch_id,),
         )
+    # A transition may have completed/cancelled an existing row while this
+    # transaction waited for its lock, so compare the fresh active generation.
+    return _active_dispatch_ids(conn, wo_id)
 
 
 def assign_dispatch_atomic(conn, work_snapshot: dict, body, user: dict) -> dict:
     """Create/reassign a dispatch without stale availability or work overwrites.
 
     Lock order is coordinator -> technician -> active dispatch row(s) -> work row
-    -> audit lock. The initial work snapshot is intentionally captured before the
-    coordinator so concurrent requests against the same historical work state can
-    be rejected by the final compare-and-swap claim rather than silently overwrite
-    one another.
+    -> audit lock. The initial work and active-dispatch generation are captured
+    before the coordinator so requests based on the same historical assignment
+    cannot silently replace each other.
     """
     _lock_assignment_coordinator(conn)
     tech = _lock_and_load_technician(conn, body.technician_user_id)
-    _lock_active_dispatches_for_work(conn, work_snapshot['id'])
+    current_dispatch_ids = _lock_active_dispatches_for_work(conn, work_snapshot['id'])
+    expected_dispatch_ids = tuple(work_snapshot.get('_dispatch_active_ids', ()))
+    if current_dispatch_ids != expected_dispatch_ids:
+        raise DispatchAssignmentConflict(
+            'Dispatch assignment changed before this request could be claimed'
+        )
 
     busy = conn.execute(
         '''SELECT d.dispatch_no,w.wo_no
