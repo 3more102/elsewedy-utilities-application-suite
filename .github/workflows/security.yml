@@ -64,3 +64,24 @@ jobs:
 
       - name: Audit installed Python environment
         run: python -m pip_audit --local
+
+  container-scan:
+    name: Container image vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build EUAS image
+        run: docker build --pull --tag euas-security:${{ github.sha }} .
+
+      - name: Scan image for high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: "euas-security:${{ github.sha }}"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
