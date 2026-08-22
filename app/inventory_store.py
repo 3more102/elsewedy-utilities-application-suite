@@ -65,3 +65,12 @@ def adjust_stock_if_unchanged(
             raise KeyError('item_not_found')
         raise InventoryConcurrencyConflict('stock_changed')
     return float(expected_stock), float(target_stock)
+
+
+# ``app.main`` already imports this focused transaction module as part of its
+# compatibility façade. Install the procurement transition replacements here so
+# the monolithic application does not need a large rewrite; the installer is
+# idempotent and preserves the public route paths and legacy role dependencies.
+from .procurement_store import install_procurement_routes
+
+install_procurement_routes()
