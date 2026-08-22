@@ -2,14 +2,31 @@ from __future__ import annotations
 
 import json
 
+from .config import DB_BACKEND
 from .database import audit_digest, now
 
 
 AUDIT_LOCK_ID = 1
+# Stable PostgreSQL advisory-lock key used only while bootstrapping the
+# singleton audit-chain lock table/row. Steady-state audit appends synchronize
+# on the database row itself, not on this advisory lock.
+AUDIT_BOOTSTRAP_LOCK_KEY = 1_169_982_291
 
 
 def ensure_audit_chain_lock(conn) -> None:
-    """Create the singleton row used to serialize audit-chain appends."""
+    """Create the singleton row used to serialize audit-chain appends.
+
+    PostgreSQL's ``CREATE TABLE IF NOT EXISTS`` is not a substitute for
+    serializing simultaneous first-start DDL across multiple replicas. A
+    transaction-scoped advisory lock protects that one bootstrap window. SQLite
+    already serializes schema writers through its database locking semantics.
+    """
+    if DB_BACKEND == 'postgresql':
+        conn.execute(
+            'SELECT pg_advisory_xact_lock(?)',
+            (AUDIT_BOOTSTRAP_LOCK_KEY,),
+        )
+
     conn.execute(
         '''CREATE TABLE IF NOT EXISTS audit_chain_lock(
              id INTEGER PRIMARY KEY,
