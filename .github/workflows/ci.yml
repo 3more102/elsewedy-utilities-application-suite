@@ -110,5 +110,8 @@ jobs:
       - name: Run PostgreSQL reservation concurrency smoke
         run: python scripts/reservation_concurrency_smoke.py
 
+      - name: Run PostgreSQL workflow concurrency smoke
+        run: python scripts/workflow_concurrency_smoke.py
+
       - name: Run live PostgreSQL HTTP smoke
         run: python scripts/postgres_smoke_test.py
