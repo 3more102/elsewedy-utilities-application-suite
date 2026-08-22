@@ -15,6 +15,15 @@ from app.main import app
 
 
 MUTATION_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
+REQUIRED_BUSINESS_DOMAINS = {
+    'assets',
+    'work_management',
+    'inventory',
+    'procurement',
+    'hse',
+    'projects',
+    'sla_governance',
+}
 
 
 def _api_routes() -> list[APIRoute]:
@@ -100,6 +109,15 @@ def test_overlay_defaults_exactly_match_legacy_route_roles():
             f'{method} {path}: {permission} defaults {sorted(default_roles)} '
             f'do not match legacy route roles {sorted(legacy_roles)}'
         )
+
+
+def test_required_business_domains_remain_under_mutation_contract():
+    """A migrated domain cannot silently be removed from structural coverage."""
+    configured = set(CAPABILITY_ENFORCED_MUTATION_PREFIXES)
+    assert REQUIRED_BUSINESS_DOMAINS <= configured, (
+        'missing migrated business domains: '
+        f'{sorted(REQUIRED_BUSINESS_DOMAINS - configured)}'
+    )
 
 
 def test_migrated_business_mutations_cannot_be_added_without_contract():
