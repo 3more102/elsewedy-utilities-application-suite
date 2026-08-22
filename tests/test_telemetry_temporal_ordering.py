@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from app import telemetry_store
 from app.database import db
 from app.main import app
 
@@ -193,6 +194,40 @@ def test_equivalent_timezone_instant_is_not_a_new_live_generation():
         assert float(state['last_value']) == 20
         assert state['last_reading_at'] == first_at
         assert active_alarms(channel_id) == []
+        assert reading_count(channel_id) == 2
+
+
+def test_untimestamped_readings_in_same_server_second_remain_live(monkeypatch):
+    code = 'TEL-TEMP-SERVER-TIME-TIE'
+    fixed_now = '2026-08-23T01:59:59'
+
+    with TestClient(app) as client:
+        headers = auth(client)
+        channel_id = create_channel(client, headers, code)
+        monkeypatch.setattr(telemetry_store, 'now', lambda: fixed_now)
+
+        normal = client.post(
+            '/api/telemetry/ingest',
+            headers=headers,
+            json={'readings': [{'channel_code': code, 'value': 20, 'quality': 'Good'}]},
+        )
+        warning = client.post(
+            '/api/telemetry/ingest',
+            headers=headers,
+            json={'readings': [{'channel_code': code, 'value': 60, 'quality': 'Good'}]},
+        )
+
+        assert normal.status_code == 200, normal.text
+        assert normal.json()['normal'] == 1
+        assert warning.status_code == 200, warning.text
+        assert warning.json()['historical'] == 0
+        assert warning.json()['alarms_opened'] == 1
+        assert warning.json()['results'][0]['severity'] == 'Warning'
+
+        state = channel_state(channel_id)
+        assert float(state['last_value']) == 60
+        assert state['last_reading_at'] == fixed_now
+        assert len(active_alarms(channel_id)) == 1
         assert reading_count(channel_id) == 2
 
 
