@@ -101,5 +101,8 @@ jobs:
       - name: Run PostgreSQL inventory concurrency smoke
         run: python scripts/inventory_concurrency_smoke.py
 
+      - name: Run PostgreSQL audit concurrency smoke
+        run: python scripts/audit_concurrency_smoke.py
+
       - name: Run live PostgreSQL HTTP smoke
         run: python scripts/postgres_smoke_test.py
