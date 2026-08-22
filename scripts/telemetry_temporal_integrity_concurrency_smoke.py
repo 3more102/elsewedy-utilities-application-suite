@@ -37,7 +37,7 @@ def _bootstrap() -> tuple[dict, int]:
 
 def _seed_channel(conn, asset_id: int, suffix: str) -> tuple[int, str]:
     stamp = now()
-    code = f'TEL-PG-TEMP-{suffix}'
+    code = f'TEL-PG-TEMP-{suffix}'.upper()
     created = conn.execute(
         '''INSERT INTO telemetry_channels(
              channel_code,asset_id,name,metric_type,unit,source_system,
