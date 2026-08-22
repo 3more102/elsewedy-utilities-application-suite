@@ -5,6 +5,7 @@ import hashlib
 from fastapi.testclient import TestClient
 
 from app.auth import LEGACY_PBKDF2_ROUNDS, PBKDF2_ALGORITHM, PBKDF2_ROUNDS
+from app.authorization import permission_codes_for_role, replace_role_permissions
 from app.auth_store import login_scope_digest, token_digest
 from app.database import db, now
 from app.main import app
@@ -220,3 +221,104 @@ def test_account_deactivation_revokes_sessions_at_rest():
                 (token_digest(target_token),),
             ).fetchone()
             assert row is not None and row['revoked_at']
+
+
+def test_permission_revocation_is_immediate_for_existing_session():
+    with TestClient(app) as client:
+        login = client.post(
+            '/api/auth/login', json={'username': 'omar', 'password': 'EUAS@2026'}
+        )
+        assert login.status_code == 200, login.text
+        token = login.json()['token']
+        headers = _bearer(token)
+
+        mine = client.get('/api/auth/permissions', headers=headers)
+        assert mine.status_code == 200, mine.text
+        assert 'admin.permissions.manage' in mine.json()['permissions']
+        assert 'observability.metrics.read' in mine.json()['permissions']
+
+        catalog = client.get('/api/admin/permissions', headers=headers)
+        assert catalog.status_code == 200, catalog.text
+        admin_role = next(x for x in catalog.json()['roles'] if x['code'] == 'admin')
+        original = list(admin_role['permissions'])
+        narrowed = [x for x in original if x != 'observability.metrics.read']
+
+        try:
+            changed = client.put(
+                '/api/admin/roles/admin/permissions',
+                headers=headers,
+                json={'permissions': narrowed},
+            )
+            assert changed.status_code == 200, changed.text
+            assert 'observability.metrics.read' not in changed.json()['permissions']
+
+            # No re-login is required: current_user reloads grants on each request.
+            denied = client.get('/api/metrics', headers=headers)
+            assert denied.status_code == 403, denied.text
+
+            refreshed = client.get('/api/auth/permissions', headers=headers)
+            assert 'observability.metrics.read' not in refreshed.json()['permissions']
+        finally:
+            # Restore through the database helper even if an assertion fails so
+            # authorization state cannot leak into unrelated regression tests.
+            with db() as conn:
+                replace_role_permissions(conn, 'admin', original)
+
+        restored = client.get('/api/metrics', headers=headers)
+        assert restored.status_code == 200, restored.text
+
+
+def test_permission_overlay_cannot_expand_legacy_role_access():
+    with TestClient(app) as client:
+        admin_login = client.post(
+            '/api/auth/login', json={'username': 'omar', 'password': 'EUAS@2026'}
+        )
+        exec_login = client.post(
+            '/api/auth/login', json={'username': 'exec', 'password': 'Viewer@2026'}
+        )
+        assert admin_login.status_code == 200 and exec_login.status_code == 200
+        admin_headers = _bearer(admin_login.json()['token'])
+        exec_headers = _bearer(exec_login.json()['token'])
+
+        with db() as conn:
+            original = permission_codes_for_role(conn, 'executive')
+        expanded = sorted(set(original) | {'operations.automation.run'})
+
+        try:
+            changed = client.put(
+                '/api/admin/roles/executive/permissions',
+                headers=admin_headers,
+                json={'permissions': expanded},
+            )
+            assert changed.status_code == 200, changed.text
+            assert 'operations.automation.run' in changed.json()['permissions']
+
+            # The old route role allow-list still wins; the capability is only
+            # an additional narrowing control during this migration stage.
+            denied = client.post('/api/automation/run', headers=exec_headers)
+            assert denied.status_code == 403, denied.text
+        finally:
+            with db() as conn:
+                replace_role_permissions(conn, 'executive', original)
+
+
+def test_admin_permission_management_cannot_remove_its_own_recovery_grant():
+    with TestClient(app) as client:
+        login = client.post(
+            '/api/auth/login', json={'username': 'omar', 'password': 'EUAS@2026'}
+        )
+        assert login.status_code == 200, login.text
+        headers = _bearer(login.json()['token'])
+        catalog = client.get('/api/admin/permissions', headers=headers).json()
+        admin_role = next(x for x in catalog['roles'] if x['code'] == 'admin')
+        unsafe = [x for x in admin_role['permissions'] if x != 'admin.permissions.manage']
+
+        rejected = client.put(
+            '/api/admin/roles/admin/permissions',
+            headers=headers,
+            json={'permissions': unsafe},
+        )
+        assert rejected.status_code == 409, rejected.text
+
+        with db() as conn:
+            assert 'admin.permissions.manage' in permission_codes_for_role(conn, 'admin')
