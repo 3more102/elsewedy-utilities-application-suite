@@ -5,14 +5,15 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 
-from .config import SCHEMA_VERSION
 from .database import now
 
+BASE_SCHEMA_VERSION = 9
+AUTH_SCHEMA_VERSION = 10
 SESSION_TOKEN_BYTES = 48
 SESSION_TOUCH_INTERVAL_SECONDS = 300
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_FAILURES = 5
-CLIENT_LOGIN_MAX_FAILURES = 20
+CLIENT_LOGIN_MAX_FAILURES = 50
 LOGIN_LOCK_BASE_SECONDS = 30
 LOGIN_LOCK_MAX_SECONDS = 5 * 60
 
@@ -104,7 +105,9 @@ def ensure_auth_schema(conn) -> dict:
 
     The legacy ``sessions`` table is intentionally retained as an empty
     compatibility landing zone for rolling upgrades. Any legacy rows found at
-    startup are converted to one-way SHA-256 digests and then deleted.
+    startup are converted to one-way SHA-256 digests and then deleted. The v10
+    marker is written only after all auth DDL/data migration work succeeds in
+    this transaction.
     """
     conn.executescript('''
     CREATE TABLE IF NOT EXISTS auth_sessions(
@@ -145,9 +148,29 @@ def ensure_auth_schema(conn) -> dict:
 
     conn.execute(
         'INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)',
-        (SCHEMA_VERSION, now()),
+        (AUTH_SCHEMA_VERSION, now()),
     )
     return {'legacy_sessions_migrated': migrated}
+
+
+def initialize_auth_database(hash_password) -> dict:
+    """Initialize base schema v9, then advance to auth schema v10 safely.
+
+    The legacy initializer still owns the large base schema. Temporarily
+    pinning its marker to v9 prevents it from claiming v10 before the auth
+    migration has run. This helper is used by non-ASGI entrypoints.
+    """
+    from . import database as database_module
+
+    previous_version = database_module.SCHEMA_VERSION
+    database_module.SCHEMA_VERSION = BASE_SCHEMA_VERSION
+    try:
+        database_module.init_db(hash_password)
+    finally:
+        database_module.SCHEMA_VERSION = previous_version
+
+    with database_module.db() as conn:
+        return ensure_auth_schema(conn)
 
 
 def create_session(
