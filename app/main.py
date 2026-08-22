@@ -39,6 +39,7 @@ from .config import SESSION_HOURS
 from .database import db
 
 app = _application.app
+_legacy_metrics = _application.metrics
 
 
 # Run the v10 authentication migration after the established application
@@ -362,7 +363,7 @@ def set_user_status(
 
 @app.get('/api/metrics', response_class=PlainTextResponse)
 def metrics(user=Depends(require_roles('admin', 'maintenance_manager', 'executive'))):
-    text = _application.metrics(user)
+    text = _legacy_metrics(user)
     with db() as conn:
         count = active_session_count(conn)
     lines = []
