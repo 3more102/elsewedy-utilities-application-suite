@@ -26,7 +26,7 @@ def _seed_channel(conn, suffix: str) -> tuple[int, str, dict]:
     asset = conn.execute('SELECT id FROM assets ORDER BY id LIMIT 1').fetchone()
     assert asset
     stamp = now()
-    code = f'TEL-TEMP-{suffix}'
+    code = f'TEL-TEMP-{suffix}'.upper()
     created = conn.execute(
         '''INSERT INTO telemetry_channels(
              channel_code,asset_id,name,metric_type,unit,source_system,
