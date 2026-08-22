@@ -1,6 +1,6 @@
 # EUAS v3.9.0 — Utility Operations Intelligence
 
-EUAS v3.9.0 adds an operational telemetry and alarm layer for electrical, water and infrastructure assets.
+EUAS v3.9.0 includes the operational telemetry and alarm application for electrical, water and infrastructure assets inside the wider EUAS application suite.
 
 ## Telemetry channels
 
@@ -8,13 +8,23 @@ Each channel is linked to an asset and stores a channel code, metric type, engin
 
 ## Ingestion
 
-`POST /api/telemetry/ingest` accepts timestamped readings with value, quality and source. Each reading is persisted in `telemetry_readings`; the associated channel is updated with its latest reading state.
+`POST /api/telemetry/ingest` accepts timestamped readings with value, quality and source. **Every accepted reading is persisted** in `telemetry_readings`, including delayed or replayed historical samples.
+
+Current channel/alarm state follows **capture/event time**, not network arrival time:
+
+- the channel row is serialized before its current-state snapshot is evaluated;
+- only a reading strictly newer than the stored `last_reading_at` advances `last_value`, `last_quality`, `last_reading_at` and threshold/alarm state;
+- an older reading is retained as historical evidence but cannot regress the channel's latest fields, clear a newer active alarm, or reopen an alarm after a newer normal sample;
+- a reading at the same event instant, including an equivalent instant expressed with another timezone offset, is also retained as historical evidence and cannot duplicate alarm occurrences or side effects;
+- ISO-8601 timestamps with offsets or `Z` are normalized for temporal comparison.
+
+The ingest response includes a `historical` count and reports non-current samples with `action: historical`.
 
 This is a **SCADA-style authenticated API ingestion interface**. The release does not claim a live OPC-UA, Modbus, IEC 61850, MQTT broker or vendor-SCADA connector. Those protocols should be implemented as gateway/integration adapters that call the EUAS ingestion boundary.
 
 ## Threshold evaluation
 
-Configured critical thresholds are evaluated before warning thresholds. A violation opens an operational alarm or updates the existing Open/Acknowledged alarm for that channel. Returning to normal automatically marks the active alarm Cleared. This is transparent deterministic threshold logic, not machine-learning anomaly detection.
+Configured critical thresholds are evaluated before warning thresholds. A temporally current violation opens an operational alarm or updates the existing Open/Acknowledged alarm for that channel. A temporally current return to normal automatically marks the active alarm Cleared. Historical/replayed readings do not mutate current alarm state. This is transparent deterministic threshold logic, not machine-learning anomaly detection.
 
 ## Alarm lifecycle
 
@@ -26,7 +36,16 @@ An authorized user can convert an alarm into one corrective work order. The work
 
 ## Operations views
 
-The Telemetry & Alarms application shows channel health, stale channels, current readings and the alarm queue. Executive Dashboard, Operations, Asset Detail, Global Search, CSV exports and Prometheus-style metrics consume the same records.
+The **Telemetry & Alarms application** shows channel health, stale channels, current readings and the alarm queue. Other EUAS applications—Executive Dashboard, Utilities Operations, Asset Management, Analytics and related connected views—consume the same governed records through the suite's shared service/data layer.
+
+## Concurrency guarantee
+
+PostgreSQL current-state mutation is serialized per telemetry channel. Concurrent old/new samples therefore converge on the newest capture instant regardless of which request reaches the service first. PostgreSQL multi-session CI races cover both important schedules:
+
+1. newer critical + older normal → the newer critical channel/alarm state remains current;
+2. newer normal + older critical → the delayed critical sample cannot leave a current alarm open.
+
+Both readings remain in history in either schedule. Equal-instant replays are persisted but do not create a second live generation.
 
 ## Production integration path
 
