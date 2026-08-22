@@ -68,15 +68,19 @@ def adjust_stock_if_unchanged(
 
 
 # ``app.main`` already imports this focused transaction module as part of its
-# compatibility façade. Install state-machine, reservation, and authorization
-# extensions here so the monolithic application does not need a large rewrite.
-# All installers are idempotent and preserve historical role authorization.
+# compatibility façade. Install production hardening extensions here so the
+# monolithic application does not need broad rewrites. Every installer is
+# idempotent and preserves historical role authorization.
 from .approval_store import install_atomic_approval_route
 from .procurement_store import install_procurement_routes
 from .reservation_authorization import install_reservation_authorization_contract
 from .reservation_store import install_reservation_routes
+from .workflow_authorization import install_workflow_authorization_contract
+from .workflow_store import install_workflow_transition_routes
 
 install_reservation_authorization_contract()
+install_workflow_authorization_contract()
 install_procurement_routes()
 install_atomic_approval_route()
 install_reservation_routes()
+install_workflow_transition_routes()
