@@ -1,10 +1,10 @@
 import hashlib
 import secrets
-from datetime import datetime
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException
 
+from .auth_store import resolve_session
 from .database import db
 from .postgres_compat import apply_postgres_compat
 
@@ -96,14 +96,12 @@ def current_user(authorization: Optional[str] = Header(default=None)):
     if not token:
         raise HTTPException(401, 'Authentication required')
     with db() as conn:
-        row = conn.execute('''
-            SELECT u.id,u.username,u.full_name,u.email,r.code role,r.name role_name,u.active
-            FROM sessions s JOIN users u ON u.id=s.user_id JOIN roles r ON r.id=u.role_id
-            WHERE s.token=? AND s.expires_at>?
-        ''', (token, datetime.now().isoformat())).fetchone()
-        if not row or not row['active']:
+        row = resolve_session(conn, token)
+        if not row:
             raise HTTPException(401, 'Invalid or expired session')
-        return dict(row)
+        # Session identity is non-secret and lets route handlers revoke the
+        # authenticated session without ever re-querying by a raw bearer token.
+        return row
 
 
 def require_roles(*roles):

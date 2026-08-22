@@ -1,3 +1,4 @@
+import hashlib
 import os, sys
 from pathlib import Path
 
@@ -202,13 +203,17 @@ def test_euas_end_to_end():
         denied = client.post('/api/assets', headers=viewer, json={'name': 'Forbidden', 'category': 'QA', 'criticality': 'Low', 'condition': 'Good', 'status': 'Operating'})
         assert denied.status_code == 403
 
-        # Session expiry is enforced server-side.
+        # Session expiry is enforced server-side against the digest-backed row.
         exp = client.post('/api/auth/login', json={'username': 'omar', 'password': 'EUAS@2026'})
         assert exp.status_code == 200
         expired_token = exp.json()['token']
+        expired_digest = hashlib.sha256(expired_token.encode('utf-8')).hexdigest()
         import sqlite3
         with sqlite3.connect(TEST_DB) as conn:
-            conn.execute("UPDATE sessions SET expires_at='2000-01-01T00:00:00' WHERE token=?", (expired_token,))
+            conn.execute(
+                "UPDATE auth_sessions SET expires_at='2000-01-01T00:00:00' WHERE token_digest=?",
+                (expired_digest,),
+            )
             conn.commit()
         expired = client.get('/api/auth/me', headers={'Authorization': f'Bearer {expired_token}'})
         assert expired.status_code == 401

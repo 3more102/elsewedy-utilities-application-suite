@@ -6,20 +6,21 @@ EUAS includes security controls appropriate for a runnable reference deployment.
 
 - Versioned PBKDF2-HMAC-SHA256 password hashes with per-user random salts.
 - New and changed passwords use a 600,000-iteration work factor.
-- Legacy EUAS password hashes remain verifiable during migration; the authentication library detects hashes that require an upgrade.
+- Legacy EUAS password hashes remain verifiable and are upgraded after a successful login without requiring a password reset.
 - Malformed password-hash values fail closed instead of raising authentication-path parsing exceptions.
-- Cryptographically random bearer sessions stored server-side.
+- Bearer tokens are generated with cryptographically secure randomness and only a SHA-256 digest is retained in the current server-side session store.
+- Sessions have non-secret IDs, creation/last-seen/expiry timestamps, revocation state and a coarse client label.
 - Configurable server-side session expiry (`EUAS_SESSION_HOURS`).
-- Login throttling after repeated failed attempts for the same client/user pair.
-- Role-based authorization enforced at API endpoints.
-- User activation/deactivation with immediate session revocation.
-- Password change requires the current password and a stronger replacement password.
-- Changing a password revokes all other sessions for that user.
+- Logout, single-session revocation, revoke-other-sessions and revoke-all-sessions are enforced server-side.
+- Password changes revoke all other sessions for that user; account deactivation revokes all active sessions.
+- Login throttling is database-backed with one-way account/client and client-wide scopes, and uses temporary progressive backoff instead of permanent account locking.
+- Missing or disabled login principals execute a current-work-factor dummy password verification to reduce simple account-enumeration timing differences.
+- Role-based authorization is enforced at API endpoints.
 - User-controlled profile fields are server validated.
 - Upload allow-list and configurable maximum attachment size.
 - Randomized stored attachment names; original names are retained only as metadata/download names.
 - Foreign-key enforcement and transactional rollback for database writes.
-- Audit records for authentication and important business changes.
+- Audit records for authentication and important business changes; passwords and raw bearer tokens are not included in those events.
 - Security response headers: request ID, `nosniff`, frame denial, referrer policy, permissions policy and Content Security Policy.
 - API responses default to `Cache-Control: no-store`.
 - GitHub CodeQL scans Python with the `security-extended` query suite on pushes, pull requests and a weekly schedule.
@@ -42,15 +43,35 @@ EUAS also recognizes the historical format:
 <salt>$<digest>
 ```
 
-Historical hashes are verified with the legacy 180,000-iteration work factor. The authentication library exposes `password_needs_upgrade()` and `verify_password_with_upgrade()` so login flows can replace valid legacy or lower-work-factor hashes without requiring a password reset.
+Historical hashes are verified with the legacy 180,000-iteration work factor. `password_needs_upgrade()` identifies obsolete representations and `verify_password_with_upgrade()` returns a replacement current hash only after the supplied password verifies successfully.
 
-The repository currently preserves compatibility with existing credentials. New users and password changes are written using the current versioned format. Login-time persistence of upgrade hashes is a separate integration step and must be validated across both SQLite and PostgreSQL before activation.
+The login flow persists that replacement in the same successful authentication transaction. New users and password changes are always written using the current versioned format. No plaintext password is persisted or logged.
 
-## Session-storage status
+## Session lifecycle and storage
 
-Bearer sessions are currently server-side and expire according to `EUAS_SESSION_HOURS`. The current database schema stores the bearer token value directly in the session table so the existing web/API clients remain compatible.
+Current sessions are stored in `auth_sessions`. The bearer value returned to the client is high-entropy random material; EUAS stores only its SHA-256 digest because random session tokens do not require a slow password-hashing function. Authentication hashes the presented bearer and looks up the digest. Raw bearer tokens are not included in session-list responses, audit events or metrics.
 
-For internet-facing or multi-replica production deployments, the next session-hardening step is to store only a one-way token digest, preserve a non-secret session identifier for user-facing session management, and move rate-limit state to a shared persistent store. These controls should be migrated atomically with login, logout, password-change and session-revocation paths so active-session semantics remain correct.
+Each current session includes a non-secret session ID, user ID, creation time, last-seen time, expiry, optional revocation time and a coarse client label. The label is derived from the User-Agent for usability and is not intended as a fingerprint. EUAS does not persist client IP addresses as session metadata.
+
+Schema v10 retains the historical `sessions` table only as a compatibility landing zone for rolling upgrades. Startup migrates legacy rows into `auth_sessions` by hashing the existing bearer value and deleting the raw legacy row. Session resolution also supports one-row lazy migration so a valid session created by an older application instance can survive a mixed-version deployment without forced logout. The migration insert is conflict-safe so concurrent replicas can observe the same historical row without creating duplicate digest sessions. New logins never write raw bearer tokens into the legacy table.
+
+Expired and revoked sessions are rejected. Revoked rows remain available for database-level operational evidence until normal retention/maintenance removes them; the bearer itself cannot be recovered from the stored digest.
+
+## Login throttling
+
+Failed-login state is stored in `auth_login_throttle`, so it survives process restarts and is shared by application workers or replicas using the same database. EUAS maintains two one-way scopes: an account-plus-client scope for repeated attacks against one principal and a wider client-only scope that limits username rotation from the same client. Both keys are SHA-256 digests; the throttle table does not retain the raw account identifier or client address.
+
+EUAS uses a rolling five-minute failure window. The account/client scope begins temporary backoff after five failures, while the wider client scope has a higher threshold to reduce denial-of-service risk for shared client networks. Repeated failures increase the temporary backoff up to a bounded maximum instead of permanently locking an account. A successful authentication clears its account/client failure state but deliberately does not erase the wider client abuse history.
+
+Authentication failures continue to use the same generic invalid-credentials response so the API does not disclose whether an account exists. Missing and disabled principals still execute one PBKDF2 verification at the current work factor against a fixed non-secret dummy verifier, reducing the obvious timing difference between unknown accounts and valid-account password checks.
+
+For very large multi-region deployments, a purpose-built shared rate-limit service such as Redis or a gateway-native limiter may provide better throughput and abuse analytics, but process-local memory is not the source of truth for the current EUAS limiter.
+
+## Authentication transport and CSRF
+
+The current API authenticates with an `Authorization: Bearer` header. It does not place the authentication bearer in a browser cookie. Traditional cookie-CSRF tokens are therefore not part of the current authentication design. If EUAS later introduces cookie-based authentication, the cookie and state-changing request model must be reviewed together for `HttpOnly`, `Secure`, `SameSite`, expiry/domain/path policy and CSRF protection before that mode is enabled.
+
+Production traffic must still be protected with TLS so bearer credentials cannot be observed in transit.
 
 ## Continuous security validation
 
@@ -64,7 +85,7 @@ The Trivy GitHub Action is pinned to a full release commit SHA rather than a mov
 
 The production image installs a runtime-only dependency set and copies only the application and static assets needed by FastAPI, excluding test tooling and repository engineering metadata from the runtime filesystem.
 
-Security scanning complements, but does not replace, penetration testing, runtime monitoring, infrastructure hardening, secret management, malware scanning for uploads, or deployment-specific threat modeling.
+The PostgreSQL integration smoke exercises the live authentication path and validates digest-backed session persistence plus legacy-session migration on the configured PostgreSQL target. Security scanning complements, but does not replace, penetration testing, runtime monitoring, infrastructure hardening, secret management, malware scanning for uploads, or deployment-specific threat modeling.
 
 ## Production hardening checklist
 
@@ -72,7 +93,7 @@ Security scanning complements, but does not replace, penetration testing, runtim
 2. Replace demo accounts/passwords before exposing the service to any network.
 3. Integrate corporate SSO (OIDC/SAML/Entra ID or equivalent) and MFA.
 4. Move persistence to PostgreSQL HA and managed/object attachment storage.
-5. Store session token digests rather than raw bearer tokens and use Redis or another shared store for distributed rate limiting when running multiple API replicas.
+5. For high-scale or multi-region deployments, consider a dedicated shared rate-limit service while retaining server-side session revocation semantics.
 6. Run malware scanning and content inspection on uploaded documents.
 7. Store secrets in a secrets manager instead of `.env` files.
 8. Restrict database/storage network access to application identities only.

@@ -2,11 +2,12 @@
 
 Requires EUAS_DATABASE_URL to point at an already-running PostgreSQL instance.
 The script starts EUAS in a child Uvicorn process and validates startup,
-authentication, representative reads, generated-ID writes, telemetry/alarm
-persistence, automation and metrics.
+authentication, digest-backed session storage/migration, representative reads,
+generated-ID writes, telemetry/alarm persistence, automation and metrics.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -14,6 +15,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,7 +80,7 @@ def main() -> int:
 
         assert health['status'] == 'ok'
         assert health['database_backend'] == 'postgresql'
-        assert health['schema_version'] >= 9
+        assert health['schema_version'] >= 10
         assert headers.get('X-Request-ID')
         assert headers.get('X-Content-Type-Options') == 'nosniff'
 
@@ -92,6 +94,48 @@ def main() -> int:
         )
         assert status == 200 and login['user']['role'] == 'admin'
         token = login['token']
+        digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+        # Prove the live PostgreSQL store contains only the one-way token digest.
+        import psycopg
+
+        with psycopg.connect(url) as pg:
+            with pg.cursor() as cur:
+                cur.execute('SELECT id,user_id,token_digest,revoked_at FROM auth_sessions WHERE token_digest=%s', (digest,))
+                stored_session = cur.fetchone()
+                assert stored_session is not None
+                session_id, admin_user_id, stored_digest, revoked_at = stored_session
+                assert stored_digest == digest and stored_digest != token and revoked_at is None
+                cur.execute('SELECT COUNT(*) FROM sessions WHERE token=%s', (token,))
+                assert cur.fetchone()[0] == 0
+
+                # Seed one historical plaintext session to prove populated-v9
+                # compatibility on the real production database backend. The
+                # next authenticated request must migrate it to a digest row and
+                # delete the raw token without forcing the user to log in again.
+                legacy_token = 'pg-ci-legacy-session-token-' + str(int(time.time() * 1000))
+                created = datetime.now().isoformat(timespec='seconds')
+                expires = (datetime.now() + timedelta(hours=1)).isoformat(timespec='seconds')
+                cur.execute(
+                    'INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(%s,%s,%s,%s)',
+                    (legacy_token, admin_user_id, created, expires),
+                )
+            pg.commit()
+
+        status, _, legacy_me = request('/api/auth/me', token=legacy_token)
+        assert status == 200 and legacy_me['username'] == 'omar'
+        legacy_digest = hashlib.sha256(legacy_token.encode('utf-8')).hexdigest()
+        with psycopg.connect(url) as pg:
+            with pg.cursor() as cur:
+                cur.execute('SELECT COUNT(*) FROM sessions WHERE token=%s', (legacy_token,))
+                assert cur.fetchone()[0] == 0
+                cur.execute('SELECT COUNT(*) FROM auth_sessions WHERE token_digest=%s', (legacy_digest,))
+                assert cur.fetchone()[0] == 1
+
+        status, _, sessions = request('/api/auth/sessions', token=token)
+        assert status == 200
+        assert any(int(item['session_id']) == int(session_id) and item['current'] for item in sessions)
+        assert all('token' not in item and 'token_digest' not in item for item in sessions)
 
         status, _, dashboard = request('/api/dashboard', token=token)
         assert status == 200 and dashboard['kpis']['total_assets'] >= 1
@@ -171,11 +215,13 @@ def main() -> int:
 
         status, _, metrics = request('/api/metrics', token=token)
         assert status == 200 and 'euas_requests_total' in metrics
+        assert 'euas_active_sessions ' in metrics
 
         print(
             f"PASS EUAS PostgreSQL smoke: version={health['version']} "
             f"assets={dashboard['kpis']['total_assets']} work_id={work_id} "
-            f"channel_id={channel_id} alarm_id={alarm_id} backend={health['database_backend']}"
+            f"session_id={session_id} channel_id={channel_id} alarm_id={alarm_id} "
+            f"backend={health['database_backend']}"
         )
         return 0
     finally:
