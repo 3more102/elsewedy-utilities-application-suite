@@ -2,8 +2,9 @@ import hashlib
 import secrets
 from typing import Optional
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 
+from .authorization import has_permissions, permission_codes_for_user, permission_for_route
 from .auth_store import resolve_session
 from .database import db
 from .postgres_compat import apply_postgres_compat
@@ -101,12 +102,42 @@ def current_user(authorization: Optional[str] = Header(default=None)):
             raise HTTPException(401, 'Invalid or expired session')
         # Session identity is non-secret and lets route handlers revoke the
         # authenticated session without ever re-querying by a raw bearer token.
-        return row
+        principal = dict(row)
+        # Effective permissions are loaded on every authenticated request rather
+        # than cached in the session. Grant/revocation changes therefore become
+        # effective immediately across workers that share the database.
+        principal['permissions'] = permission_codes_for_user(conn, principal['id'])
+        return principal
 
 
 def require_roles(*roles):
-    def check(user=Depends(current_user)):
+    """Preserve legacy role allow-lists and apply route-specific permission overlays.
+
+    The role check remains first and authoritative for compatibility. A mapped
+    capability can only narrow access for an already-allowed role; it can never
+    grant a role access to a route that the legacy policy denied.
+    """
+    def check(request: Request, user=Depends(current_user)):
         if user['role'] not in roles:
             raise HTTPException(403, 'Insufficient permissions')
+        route = request.scope.get('route')
+        route_path = getattr(route, 'path', None)
+        permission = permission_for_route(request.method, route_path)
+        if permission and not has_permissions(user.get('permissions', ()), (permission,)):
+            raise HTTPException(403, 'Insufficient permissions')
         return user
+    return check
+
+
+def require_permissions(*permissions: str, require_all: bool = True):
+    """Require database-backed capability codes for new permission-native APIs."""
+    required = tuple(permissions)
+
+    def check(user=Depends(current_user)):
+        if not has_permissions(
+            user.get('permissions', ()), required, require_all=require_all
+        ):
+            raise HTTPException(403, 'Insufficient permissions')
+        return user
+
     return check
