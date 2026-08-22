@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException
 
@@ -25,18 +25,6 @@ def _rowcount_one(cursor) -> bool:
     return int(cursor.rowcount or 0) == 1
 
 
-def _implicit_capture_time() -> str:
-    """Generate an arrival-time capture marker with sub-second precision.
-
-    The historical ``now()`` helper intentionally records only whole seconds.
-    Telemetry can ingest multiple live readings in one second, so using that
-    value as event time would make later implicit readings look like equal-time
-    replays. Keep the established local-naive timestamp shape while adding the
-    precision required for strict temporal ordering.
-    """
-    return datetime.now().isoformat(timespec='microseconds')
-
-
 def _event_instant(value: str | datetime) -> datetime:
     """Normalize an ISO-8601 capture value to a comparable UTC-naive instant."""
     if isinstance(value, datetime):
@@ -49,6 +37,25 @@ def _event_instant(value: str | datetime) -> datetime:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
+
+
+def _implicit_capture_time(last_reading_at: str | None) -> str:
+    """Create an arrival-time marker guaranteed to advance live channel state.
+
+    The historical ``now()`` helper records whole seconds, while telemetry can
+    legitimately ingest several live samples in one second. For readings whose
+    device does not supply event time, use serialized arrival order and ensure
+    the generated marker is strictly newer than the channel's previous marker.
+    """
+    candidate = datetime.now()
+    if last_reading_at:
+        try:
+            previous = _event_instant(last_reading_at)
+            if candidate <= previous:
+                candidate = previous + timedelta(microseconds=1)
+        except (TypeError, ValueError):
+            pass
+    return candidate.isoformat(timespec='microseconds')
 
 
 def _is_temporally_current(captured_at: str, last_reading_at: str | None) -> bool:
@@ -64,9 +71,9 @@ def _is_temporally_current(captured_at: str, last_reading_at: str | None) -> boo
     try:
         return _event_instant(captured_at) > _event_instant(last_reading_at)
     except (TypeError, ValueError):
-        # Incoming capture values are validated before this helper. If legacy
-        # state contains an invalid timestamp, allow the valid incoming reading
-        # to repair the channel's latest-state marker instead of freezing it.
+        # Explicit incoming capture values are validated before this helper. If
+        # legacy state contains an invalid timestamp, allow a valid reading to
+        # repair the channel's latest-state marker instead of freezing it.
         return True
 
 
@@ -102,10 +109,11 @@ def _lock_and_load_channel(conn, channel_code: str) -> dict:
 def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
     """Persist every reading while advancing live state only by event time.
 
-    Delayed or equal-time readings remain queryable in telemetry_readings but
-    cannot regress telemetry_channels.last_* or mutate the active alarm state.
-    The per-channel row lock makes this invariant deterministic under concurrent
-    PostgreSQL ingestion regardless of request arrival order.
+    Delayed or equal-time explicit readings remain queryable in
+    telemetry_readings but cannot regress telemetry_channels.last_* or mutate
+    the active alarm state. Readings without device event time use serialized
+    arrival order. The per-channel row lock makes both rules deterministic under
+    concurrent PostgreSQL ingestion.
     """
     summary = {
         'accepted': 0,
@@ -119,16 +127,20 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
 
     for reading in body.readings:
         channel_code = reading.channel_code.strip().upper()
-        captured = reading.captured_at or _implicit_capture_time()
-        try:
-            _event_instant(captured)
-        except (TypeError, ValueError):
-            raise HTTPException(
-                400,
-                f'Invalid captured_at for telemetry channel {channel_code}',
-            )
+        explicit_capture = reading.captured_at
+        if explicit_capture is not None:
+            try:
+                _event_instant(explicit_capture)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    400,
+                    f'Invalid captured_at for telemetry channel {channel_code}',
+                )
 
         channel = _lock_and_load_channel(conn, channel_code)
+        captured = explicit_capture or _implicit_capture_time(
+            channel.get('last_reading_at')
+        )
         source = reading.source or channel['source_system'] or 'Manual'
         conn.execute(
             '''INSERT INTO telemetry_readings(
