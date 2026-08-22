@@ -39,11 +39,78 @@ PERMISSION_CATALOG: dict[str, tuple[str, tuple[str, ...]]] = {
         'Export audit records',
         ('admin', 'maintenance_manager', 'executive'),
     ),
+    'assets.create': (
+        'Create assets',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'assets.update': (
+        'Update asset records',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'assets.delete': (
+        'Delete unreferenced assets',
+        ('admin', 'asset_manager'),
+    ),
+    'assets.health.recalculate': (
+        'Recalculate asset health portfolio scores',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'assets.field.update': (
+        'Update asset field condition and meter values',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'assets.meter.reading.write': (
+        'Post asset meter readings',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.create': (
+        'Create work orders',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'work.update': (
+        'Update work orders',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'work.transition': (
+        'Execute work-order workflow transitions',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.material.plan': (
+        'Plan work-order material requirements',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'storekeeper'),
+    ),
+    'work.material.reserve': (
+        'Reserve inventory for work orders',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'storekeeper'),
+    ),
+    'work.craft.plan': (
+        'Plan craft requirements for work orders',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
+    'work.labor.post': (
+        'Post labor against work orders',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.material.issue': (
+        'Issue materials against work orders',
+        ('admin', 'maintenance_manager', 'planner', 'storekeeper', 'technician'),
+    ),
+    'work.notes.write': (
+        'Add work-order notes',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.tasks.manage': (
+        'Update work-order task completion state',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor', 'technician'),
+    ),
+    'work.dispatch': (
+        'Dispatch technicians to work orders',
+        ('admin', 'maintenance_manager', 'planner', 'supervisor'),
+    ),
 }
 
-# This map is intentionally limited to high-impact routes whose existing role
-# semantics are stable and covered by regression tests. FastAPI's matched route
-# template is used for parameterized paths so a single entry covers every user.
+# FastAPI's matched route template is used for parameterized paths. Each entry
+# adds a capability requirement on top of the route's historical role check.
 ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('POST', '/api/admin/users'): 'admin.users.manage',
     ('PATCH', '/api/admin/users/{user_id}/status'): 'admin.users.manage',
@@ -54,6 +121,40 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('GET', '/api/metrics'): 'observability.metrics.read',
     ('GET', '/api/audit'): 'audit.read',
     ('GET', '/api/exports/audit.csv'): 'audit.export',
+    ('POST', '/api/assets'): 'assets.create',
+    ('PATCH', '/api/assets/{asset_id}'): 'assets.update',
+    ('DELETE', '/api/assets/{asset_id}'): 'assets.delete',
+    ('POST', '/api/assets/health/recalculate'): 'assets.health.recalculate',
+    ('POST', '/api/field/assets/{asset_id}/condition-meter'): 'assets.field.update',
+    ('POST', '/api/meters/{meter_id}/readings'): 'assets.meter.reading.write',
+    ('POST', '/api/work-orders'): 'work.create',
+    ('PATCH', '/api/work-orders/{wo_id}'): 'work.update',
+    ('POST', '/api/work-orders/{wo_id}/transition'): 'work.transition',
+    ('POST', '/api/work-orders/{wo_id}/requirements'): 'work.material.plan',
+    ('DELETE', '/api/work-orders/{wo_id}/requirements/{requirement_id}'): 'work.material.plan',
+    ('POST', '/api/work-orders/{wo_id}/reservations'): 'work.material.reserve',
+    ('POST', '/api/work-orders/{wo_id}/reserve-all'): 'work.material.reserve',
+    ('POST', '/api/work-orders/{wo_id}/craft-requirements'): 'work.craft.plan',
+    ('POST', '/api/work-orders/{wo_id}/labor'): 'work.labor.post',
+    ('POST', '/api/work-orders/{wo_id}/materials'): 'work.material.issue',
+    ('POST', '/api/work-orders/{wo_id}/notes'): 'work.notes.write',
+    ('POST', '/api/work-orders/{wo_id}/tasks/{task_id}/toggle'): 'work.tasks.manage',
+    ('POST', '/api/work-orders/{wo_id}/dispatch'): 'work.dispatch',
+}
+
+# Once a business route family is listed here, every state-changing route in
+# that family must either have a capability overlay or an explicit narrowly
+# documented exemption. This lets CI reject newly added unprotected mutations.
+CAPABILITY_ENFORCED_MUTATION_PREFIXES: dict[str, tuple[str, ...]] = {
+    'assets': ('/api/assets', '/api/field/assets', '/api/meters'),
+    'work_management': ('/api/work-orders',),
+}
+
+CAPABILITY_MUTATION_EXEMPTIONS: dict[tuple[str, str], str] = {
+    ('POST', '/api/assets/{asset_id}/dossier'): (
+        'Creates an immutable report snapshot for an authenticated reader; '
+        'it does not mutate the asset business record.'
+    ),
 }
 
 PROTECTED_ADMIN_PERMISSION = 'admin.permissions.manage'
