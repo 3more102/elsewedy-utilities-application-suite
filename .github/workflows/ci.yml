@@ -134,5 +134,8 @@ jobs:
       - name: Run PostgreSQL alarm lifecycle concurrency smoke
         run: python scripts/alarm_lifecycle_concurrency_smoke.py
 
+      - name: Run PostgreSQL business-number concurrency smoke
+        run: python scripts/business_number_concurrency_smoke.py
+
       - name: Run live PostgreSQL HTTP smoke
         run: python scripts/postgres_smoke_test.py

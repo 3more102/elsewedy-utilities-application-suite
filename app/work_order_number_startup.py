@@ -15,7 +15,7 @@ WORK_ORDER_NUMBER_BOOTSTRAP_LOCK_KEY = 1_169_982_301
 
 
 def initialize_work_order_number_support(conn) -> None:
-    """Create the WO-number coordinator safely across simultaneous replicas."""
+    """Create shared business-number coordination storage safely across replicas."""
     if DB_BACKEND == 'postgresql':
         conn.execute(
             'SELECT pg_advisory_xact_lock(?)',
@@ -25,15 +25,15 @@ def initialize_work_order_number_support(conn) -> None:
 
 
 def install_work_order_number_startup() -> None:
-    """Install the allocator immediately and initialize its lock before serving."""
+    """Install the shared number allocator and initialize it before serving."""
     app = _application.app
     marker = '_euas_work_order_number_startup'
     if getattr(app.state, marker, False):
         return
 
     # Existing application functions resolve ``next_no`` from the application
-    # module at call time. Replacing that one global protects manual, PM, alarm,
-    # inspection, and other future work-order creators without rewriting them.
+    # module at call time. The compatibility name remains unchanged, but the
+    # installed wrapper now protects every generated business-number family.
     install_work_order_number_allocator()
     original_lifespan = app.router.lifespan_context
 
