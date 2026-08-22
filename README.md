@@ -15,10 +15,10 @@ EUAS is an original **suite of integrated enterprise applications** for asset ma
 The latest **verified `main` checkpoint** is:
 
 ```text
-main: d0d2cc14760860f2abdaf91fd1b91e82e39e60d6
+main: 61e30e9c9d0f80c6476945a8df479dcbebbe329f
 ```
 
-That commit is the GitHub-verified merge of PR #35, **Serialize generated business-number allocation**.
+That commit is the GitHub-verified merge of PR #36, **Make integration outbox delivery concurrency-safe**.
 
 The production-hardening program completed through that checkpoint includes:
 
@@ -35,16 +35,17 @@ The production-hardening program completed through that checkpoint includes:
 | Inspections | Terminal/idempotent inspection submission and one corrective work order for concurrent failing submissions |
 | Alarm Lifecycle | Atomic acknowledge/close transitions that cannot regress a closed alarm or duplicate close evidence |
 | Business Numbers | Global deadlock-safe generated-number coordinator protecting `WO-`, `JOB-`, `PM-`, `APR-` and other `next_no()` families |
+| Integration Outbox | Exact-generation delivery claims, generation-aware retry, post-commit webhook dispatch and explicit at-least-once crash semantics |
 
 ### Active development
 
 The current development branch is:
 
 ```text
-dev/outbox-delivery-atomicity
+dev/reorder-generation-atomicity
 ```
 
-It contains **unmerged work** for integration-event outbox delivery concurrency and retry coordination. It is intentionally **not described as complete or production-verified until its exact branch head passes the full CI/security matrix and is merged**.
+It contains **unmerged work** to make automatic low-stock replenishment generation concurrency-safe across simultaneous automation runs. It is intentionally **not described as complete or production-verified until its exact branch head passes the full CI/security matrix and is merged**.
 
 ---
 
@@ -69,13 +70,14 @@ Every promoted hardening PR is validated against its exact head before merge. Th
 - inspection submission concurrency smoke
 - alarm lifecycle concurrency smoke
 - business-number concurrency smoke
+- outbox-delivery concurrency smoke
 - live PostgreSQL HTTP smoke
 - CodeQL Python security analysis
 - `pip-audit`
 - production container build/health smoke
 - Trivy HIGH/CRITICAL vulnerability gate
 
-This replaces the older README statement that live PostgreSQL was unavailable. **Live PostgreSQL 16 is now part of required CI evidence.**
+**Live PostgreSQL 16 is part of required CI evidence.**
 
 ---
 
@@ -247,6 +249,7 @@ Production hardening deliberately targets PostgreSQL read-committed races and mu
 - deadlock-safe inventory transfer
 - serialized audit-chain head updates
 - globally serialized generated business-number allocation
+- post-commit integration-event delivery with one sender per event generation
 - business mutation and its audit/workflow/approval/inventory side effects remain in the same transaction
 
 The regression suite contains both deterministic SQLite tests and real PostgreSQL multi-session concurrency smokes with bounded thread joins to expose deadlocks.
