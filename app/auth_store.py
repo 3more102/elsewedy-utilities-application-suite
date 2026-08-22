@@ -63,6 +63,36 @@ def client_label(user_agent: str) -> str:
     return f'{browser} on {platform}' if platform else browser
 
 
+def _ensure_legacy_digest_row(conn, legacy) -> tuple[int, bool]:
+    """Idempotently materialize one historical raw session as a digest row.
+
+    ``INSERT OR IGNORE`` is translated to PostgreSQL ``ON CONFLICT DO NOTHING``
+    by the repository compatibility layer. That makes concurrent startup/lazy
+    migration safe when two replicas observe the same legacy token.
+    """
+    digest = token_digest(legacy['token'])
+    cur = conn.execute(
+        '''INSERT OR IGNORE INTO auth_sessions(
+             user_id,token_digest,created_at,last_seen_at,expires_at,revoked_at,client_label,user_agent
+           ) VALUES(?,?,?,?,?,NULL,?,?)''',
+        (
+            legacy['user_id'],
+            digest,
+            legacy['created_at'],
+            legacy['created_at'],
+            legacy['expires_at'],
+            'Migrated session',
+            '',
+        ),
+    )
+    row = conn.execute(
+        'SELECT id FROM auth_sessions WHERE token_digest=?', (digest,)
+    ).fetchone()
+    if not row:
+        raise RuntimeError('legacy session digest migration did not materialize a row')
+    return int(row['id']), bool(int(cur.rowcount or 0))
+
+
 def ensure_auth_schema(conn) -> dict:
     """Create auth schema v10 and migrate raw legacy session tokens transactionally.
 
@@ -103,21 +133,8 @@ def ensure_auth_schema(conn) -> dict:
         'SELECT token,user_id,created_at,expires_at FROM sessions'
     ).fetchall()
     for legacy in legacy_rows:
-        digest = token_digest(legacy['token'])
-        existing = conn.execute(
-            'SELECT id FROM auth_sessions WHERE token_digest=?', (digest,)
-        ).fetchone()
-        if not existing:
-            conn.execute(
-                '''INSERT INTO auth_sessions(
-                     user_id,token_digest,created_at,last_seen_at,expires_at,revoked_at,client_label,user_agent
-                   ) VALUES(?,?,?,?,?,NULL,?,?)''',
-                (
-                    legacy['user_id'], digest, legacy['created_at'], legacy['created_at'],
-                    legacy['expires_at'], 'Migrated session', ''
-                ),
-            )
-            migrated += 1
+        _session_id, inserted = _ensure_legacy_digest_row(conn, legacy)
+        migrated += int(inserted)
         conn.execute('DELETE FROM sessions WHERE token=?', (legacy['token'],))
 
     conn.execute(
@@ -168,23 +185,7 @@ def _migrate_one_legacy_session(conn, token: str) -> Optional[int]:
     ).fetchone()
     if not legacy:
         return None
-    digest = token_digest(token)
-    existing = conn.execute(
-        'SELECT id FROM auth_sessions WHERE token_digest=?', (digest,)
-    ).fetchone()
-    if existing:
-        session_id = int(existing['id'])
-    else:
-        cur = conn.execute(
-            '''INSERT INTO auth_sessions(
-                 user_id,token_digest,created_at,last_seen_at,expires_at,revoked_at,client_label,user_agent
-               ) VALUES(?,?,?,?,?,NULL,?,?)''',
-            (
-                legacy['user_id'], digest, legacy['created_at'], legacy['created_at'],
-                legacy['expires_at'], 'Migrated session', ''
-            ),
-        )
-        session_id = int(cur.lastrowid)
+    session_id, _inserted = _ensure_legacy_digest_row(conn, legacy)
     conn.execute('DELETE FROM sessions WHERE token=?', (token,))
     return session_id
 
