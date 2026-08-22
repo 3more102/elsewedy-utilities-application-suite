@@ -23,8 +23,10 @@ from .auth import (
     verify_password_with_upgrade,
 )
 from .auth_store import (
+    CLIENT_LOGIN_MAX_FAILURES,
     active_session_count,
     clear_login_failures,
+    client_login_scope_digest,
     create_session,
     ensure_auth_schema,
     list_sessions as list_auth_sessions,
@@ -40,6 +42,14 @@ from .database import db
 
 app = _application.app
 _legacy_metrics = _application.metrics
+
+# Use a valid current-format PBKDF2 hash for nonexistent/disabled principals so
+# invalid-login timing does not trivially disclose account existence. This is a
+# fixed non-secret verifier value, never a real credential.
+_DUMMY_PASSWORD_HASH = (
+    'pbkdf2_sha256$600000$euas-auth-dummy-salt$'
+    'e1f6335ca2062b517a9280425b46e2ae2f68356c2163fb34ad92b13370b65bf6'
+)
 
 
 # Run the v10 authentication migration after the established application
@@ -95,15 +105,22 @@ def _client_host(request: Request) -> str:
 @app.post('/api/auth/login')
 def login(body: _application.LoginIn, request: Request):
     username = body.username.strip()
-    scope = login_scope_digest(username, _client_host(request))
+    host = _client_host(request)
+    scope = login_scope_digest(username, host)
+    client_scope = client_login_scope_digest(host)
 
     with db() as conn:
-        throttle = throttle_status(conn, scope)
-    if throttle['blocked']:
+        account_throttle = throttle_status(conn, scope)
+        client_throttle = throttle_status(conn, client_scope)
+    if account_throttle['blocked'] or client_throttle['blocked']:
+        retry_after = max(
+            int(account_throttle['retry_after']),
+            int(client_throttle['retry_after']),
+        )
         raise HTTPException(
             429,
             'Too many failed login attempts. Try again later.',
-            headers={'Retry-After': str(throttle['retry_after'])},
+            headers={'Retry-After': str(max(1, retry_after))},
         )
 
     failed = False
@@ -122,9 +139,18 @@ def login(body: _application.LoginIn, request: Request):
             valid, replacement_hash = verify_password_with_upgrade(
                 body.password, row['password_hash']
             )
+        else:
+            # Always execute one current-work-factor password verification for a
+            # missing/disabled principal to reduce account-enumeration timing.
+            verify_password(body.password, _DUMMY_PASSWORD_HASH)
 
         if not valid:
             state = record_login_failure(conn, scope)
+            record_login_failure(
+                conn,
+                client_scope,
+                max_failures=CLIENT_LOGIN_MAX_FAILURES,
+            )
             # Audit failures for known accounts without logging the password,
             # bearer material, client IP, or throttle scope digest.
             if row:
@@ -140,6 +166,8 @@ def login(body: _application.LoginIn, request: Request):
                 )
             failed = True
         else:
+            # A successful authentication clears the account/client pair only;
+            # it deliberately does not erase the wider client abuse history.
             clear_login_failures(conn, scope)
             if replacement_hash:
                 conn.execute(
