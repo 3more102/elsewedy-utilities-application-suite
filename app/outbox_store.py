@@ -169,9 +169,23 @@ def execute_automation_postcommit(
         summary['outbox_delivered'] = outbox['delivered']
         summary['outbox_failed'] = outbox['failed']
         summary['outbox_skipped'] = outbox['skipped']
+        summary['outbox_delivery_phase'] = 'postcommit'
         conn.execute(
             'UPDATE job_runs SET summary_json=? WHERE id=?',
             (json.dumps(summary), result['id']),
+        )
+        # The historical RUN audit belongs to the committed business phase and
+        # therefore records deferred zero counts. Append a second immutable audit
+        # record with the actual post-commit dispatch result so job summary and
+        # audit evidence remain reconcilable without rewriting prior audit rows.
+        append_audit(
+            conn,
+            actor_id,
+            'DISPATCH OUTBOX',
+            'Integration Events',
+            result['run_no'],
+            '',
+            outbox,
         )
         # Persist delivery attempts/status independently from the already
         # committed business payload. The enclosing db() context may commit
