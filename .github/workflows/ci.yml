@@ -122,5 +122,8 @@ jobs:
       - name: Run PostgreSQL inventory transfer concurrency smoke
         run: python scripts/inventory_transfer_concurrency_smoke.py
 
+      - name: Run PostgreSQL PM generation concurrency smoke
+        run: python scripts/pm_generation_concurrency_smoke.py
+
       - name: Run live PostgreSQL HTTP smoke
         run: python scripts/postgres_smoke_test.py
