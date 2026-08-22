@@ -3,6 +3,8 @@ name: Apply EUAS Session Hardening
 on:
   push:
     branches: ["dev/session-token-hardening"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
