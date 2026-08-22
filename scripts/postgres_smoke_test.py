@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -30,11 +31,15 @@ def request(path: str, method: str = 'GET', data=None, token: str | None = None)
     if token:
         headers['Authorization'] = f'Bearer {token}'
     req = urllib.request.Request(BASE + path, data=payload, method=method, headers=headers)
-    with urllib.request.urlopen(req, timeout=8) as response:
-        raw = response.read()
-        ctype = response.headers.get('Content-Type', '')
-        body = json.loads(raw) if 'json' in ctype else raw.decode(errors='replace')
-        return response.status, response.headers, body
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            raw = response.read()
+            ctype = response.headers.get('Content-Type', '')
+            body = json.loads(raw) if 'json' in ctype else raw.decode(errors='replace')
+            return response.status, response.headers, body
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors='replace')
+        raise RuntimeError(f'{method} {path} returned HTTP {exc.code}: {body}') from exc
 
 
 def main() -> int:
@@ -46,13 +51,13 @@ def main() -> int:
     env = os.environ.copy()
     env.setdefault('EUAS_ENV', 'test')
     env['EUAS_AUTOMATION_INTERVAL_MINUTES'] = '0'
+    # Inherit stdout/stderr so any Uvicorn/FastAPI traceback is visible directly
+    # in CI. A failed HTTP smoke must leave enough evidence to diagnose the
+    # backend path instead of only reporting a generic HTTP 500.
     process = subprocess.Popen(
         [sys.executable, '-m', 'uvicorn', 'app.main:app', '--host', HOST, '--port', str(PORT)],
         cwd=ROOT,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
     )
 
     try:
@@ -65,6 +70,8 @@ def main() -> int:
                 if status == 200:
                     break
             except Exception:
+                if process.poll() is not None:
+                    raise RuntimeError(f'EUAS exited during startup with code {process.returncode}')
                 time.sleep(0.5)
         else:
             raise RuntimeError('EUAS did not become healthy against PostgreSQL within 40 seconds')
@@ -112,10 +119,7 @@ def main() -> int:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
-        if process.returncode not in (0, -15, None):
-            output = process.stdout.read() if process.stdout else ''
-            if output:
-                print(output, file=sys.stderr)
+            process.wait(timeout=5)
 
 
 if __name__ == '__main__':
