@@ -5,11 +5,16 @@ import inspect
 from fastapi.routing import APIRoute
 
 from app.authorization import (
+    CAPABILITY_ENFORCED_MUTATION_PREFIXES,
+    CAPABILITY_MUTATION_EXEMPTIONS,
     PERMISSION_CATALOG,
     PROTECTED_ADMIN_PERMISSION,
     ROUTE_PERMISSION_OVERLAY,
 )
 from app.main import app
+
+
+MUTATION_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
 
 
 def _api_routes() -> list[APIRoute]:
@@ -68,6 +73,14 @@ def _declared_permissions(route: APIRoute) -> tuple[str, ...]:
     return permission_sets[0]
 
 
+def _migrated_domains(path: str) -> list[str]:
+    return [
+        domain
+        for domain, prefixes in CAPABILITY_ENFORCED_MUTATION_PREFIXES.items()
+        if any(path.startswith(prefix) for prefix in prefixes)
+    ]
+
+
 def test_every_overlay_targets_a_real_route_and_known_permission():
     assert ROUTE_PERMISSION_OVERLAY, 'permission overlay must not be empty'
     for (method, path), permission in ROUTE_PERMISSION_OVERLAY.items():
@@ -87,6 +100,30 @@ def test_overlay_defaults_exactly_match_legacy_route_roles():
             f'{method} {path}: {permission} defaults {sorted(default_roles)} '
             f'do not match legacy route roles {sorted(legacy_roles)}'
         )
+
+
+def test_migrated_business_mutations_cannot_be_added_without_contract():
+    """Every state-changing route in a migrated family is capability-covered."""
+    seen_exemptions: set[tuple[str, str]] = set()
+    for route in _api_routes():
+        domains = _migrated_domains(route.path)
+        if not domains:
+            continue
+        for method in sorted((route.methods or set()).intersection(MUTATION_METHODS)):
+            key = (method, route.path)
+            if key in CAPABILITY_MUTATION_EXEMPTIONS:
+                reason = CAPABILITY_MUTATION_EXEMPTIONS[key]
+                assert reason.strip(), f'{method} {route.path} exemption needs a reason'
+                seen_exemptions.add(key)
+                continue
+            assert key in ROUTE_PERMISSION_OVERLAY, (
+                f'{method} {route.path} is an unprotected mutation in migrated '
+                f'domain(s) {domains}'
+            )
+
+    assert seen_exemptions == set(CAPABILITY_MUTATION_EXEMPTIONS), (
+        'capability mutation exemptions must resolve to real migrated mutation routes'
+    )
 
 
 def test_permission_management_endpoints_require_protected_recovery_capability():
