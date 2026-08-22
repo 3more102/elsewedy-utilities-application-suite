@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 from app import application as _application
 from app.audit_store import ensure_audit_chain_lock
 from app.database import db
+from app.main import app  # import triggers the production compatibility composition
 from app.pm_startup import initialize_pm_generation_support
 from app.pm_store import generate_due_pm_atomic
 
