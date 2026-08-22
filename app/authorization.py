@@ -163,6 +163,18 @@ PERMISSION_CATALOG: dict[str, tuple[str, tuple[str, ...]]] = {
         'Update project tasks and progress',
         ('admin', 'project_manager', 'maintenance_manager'),
     ),
+    'sla.policy.manage': (
+        'Update service-level policy thresholds and activation',
+        ('admin', 'maintenance_manager'),
+    ),
+    'governance.retention.manage': (
+        'Update data-retention governance policies',
+        ('admin',),
+    ),
+    'integrations.outbox.retry': (
+        'Retry failed integration outbox events',
+        ('admin', 'maintenance_manager'),
+    ),
 }
 
 # FastAPI's matched route template is used for parameterized paths. Each entry
@@ -210,6 +222,9 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('POST', '/api/projects'): 'projects.create',
     ('POST', '/api/projects/{project_id}/tasks'): 'projects.tasks.create',
     ('PATCH', '/api/projects/{project_id}/tasks/{task_id}'): 'projects.tasks.update',
+    ('PATCH', '/api/sla/policies/{policy_id}'): 'sla.policy.manage',
+    ('PATCH', '/api/governance/retention/{policy_id}'): 'governance.retention.manage',
+    ('POST', '/api/events/outbox/{event_id}/retry'): 'integrations.outbox.retry',
 }
 
 # Once a business route family is listed here, every state-changing route in
@@ -222,6 +237,7 @@ CAPABILITY_ENFORCED_MUTATION_PREFIXES: dict[str, tuple[str, ...]] = {
     'procurement': ('/api/procurement',),
     'hse': ('/api/hse',),
     'projects': ('/api/projects',),
+    'sla_governance': ('/api/sla', '/api/governance', '/api/events/outbox'),
 }
 
 CAPABILITY_MUTATION_EXEMPTIONS: dict[tuple[str, str], str] = {
