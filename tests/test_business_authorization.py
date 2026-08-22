@@ -79,7 +79,7 @@ def test_permission_management_rejects_unknown_business_capability():
             headers=admin,
             json={'permissions': sorted(set(original) | {'assets.unknown.escalation'})},
         )
-        assert response.status_code == 409, response.text
+        assert response.status_code == 400, response.text
 
         with db() as conn:
             assert permission_codes_for_role(conn, 'executive') == original
