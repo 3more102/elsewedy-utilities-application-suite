@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import sys
 import threading
 import uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from app.database import db
 from app.inventory_store import (
