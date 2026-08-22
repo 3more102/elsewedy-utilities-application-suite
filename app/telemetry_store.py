@@ -8,6 +8,7 @@ from fastapi import Depends, HTTPException
 from . import application as _application
 from .audit_store import append_audit
 from .auth import require_roles
+from .config import DB_BACKEND
 from .database import db, now
 
 
@@ -78,16 +79,25 @@ def _is_temporally_current(captured_at: str, last_reading_at: str | None) -> boo
 
 
 def _lock_and_load_channel(conn, channel_code: str) -> dict:
+    if DB_BACKEND == 'postgresql':
+        row = conn.execute(
+            '''SELECT * FROM telemetry_channels
+               WHERE channel_code=? AND active=1
+               FOR UPDATE''',
+            (channel_code,),
+        ).fetchone()
+        if not row:
+            raise KeyError(f'Telemetry channel {channel_code} not found or inactive')
+        return dict(row)
+
+    # SQLite has no row-level FOR UPDATE. A no-op write enters its normal write
+    # transaction and keeps the same compatibility behavior for reference mode.
     initial = conn.execute(
         'SELECT id FROM telemetry_channels WHERE channel_code=? AND active=1',
         (channel_code,),
     ).fetchone()
     if not initial:
         raise KeyError(f'Telemetry channel {channel_code} not found or inactive')
-
-    # A no-op row update is portable across the EUAS adapters and serializes all
-    # current-state mutations for one telemetry channel under PostgreSQL. This
-    # gives event-time comparison a stable last_reading_at snapshot.
     locked = conn.execute(
         '''UPDATE telemetry_channels
            SET updated_at=updated_at
@@ -96,7 +106,6 @@ def _lock_and_load_channel(conn, channel_code: str) -> dict:
     )
     if not _rowcount_one(locked):
         raise KeyError(f'Telemetry channel {channel_code} not found or inactive')
-
     row = conn.execute(
         'SELECT * FROM telemetry_channels WHERE id=? AND active=1',
         (initial['id'],),
@@ -112,8 +121,8 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
     Delayed or equal-time explicit readings remain queryable in
     telemetry_readings but cannot regress telemetry_channels.last_* or mutate
     the active alarm state. Readings without device event time use serialized
-    arrival order. The per-channel row lock makes both rules deterministic under
-    concurrent PostgreSQL ingestion.
+    arrival order. PostgreSQL row locking makes both rules deterministic under
+    concurrent ingestion.
     """
     summary = {
         'accepted': 0,
