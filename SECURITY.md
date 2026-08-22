@@ -22,6 +22,11 @@ EUAS includes security controls appropriate for a runnable reference deployment.
 - Audit records for authentication and important business changes.
 - Security response headers: request ID, `nosniff`, frame denial, referrer policy, permissions policy and Content Security Policy.
 - API responses default to `Cache-Control: no-store`.
+- GitHub CodeQL scans Python with the `security-extended` query suite on pushes, pull requests and a weekly schedule.
+- `pip-audit` checks the resolved Python dependency environment for known vulnerability advisories.
+- Trivy scans the built EUAS container image and fails on fixable high/critical OS or library vulnerabilities.
+- The production container is smoke-tested through `/api/health` before vulnerability scanning.
+- Dependabot monitors Python packages, GitHub Actions and the pinned Docker base image for version updates.
 
 ## Password-hash migration contract
 
@@ -47,6 +52,20 @@ Bearer sessions are currently server-side and expire according to `EUAS_SESSION_
 
 For internet-facing or multi-replica production deployments, the next session-hardening step is to store only a one-way token digest, preserve a non-secret session identifier for user-facing session management, and move rate-limit state to a shared persistent store. These controls should be migrated atomically with login, logout, password-change and session-revocation paths so active-session semantics remain correct.
 
+## Continuous security validation
+
+The dedicated `EUAS Security` workflow contains three independent controls:
+
+- **CodeQL / Python** performs static security analysis and publishes supported findings to GitHub code scanning.
+- **Python dependency audit** installs the application dependency set and runs `pip-audit`; known vulnerable resolved dependencies fail the job.
+- **Container build, smoke and image scan** builds the hardened production Dockerfile, boots the non-root image, verifies the health endpoint, and runs Trivy against OS and library packages; fixable high/critical findings fail the job.
+
+The Trivy GitHub Action is pinned to a full release commit SHA rather than a movable tag. The workflow runs for `main`, pull requests targeting `main`, manual dispatches, and on a weekly schedule. Dependabot separately proposes updates for pip dependencies, GitHub Actions and the Docker base image.
+
+The production image installs a runtime-only dependency set and copies only the application and static assets needed by FastAPI, excluding test tooling and repository engineering metadata from the runtime filesystem.
+
+Security scanning complements, but does not replace, penetration testing, runtime monitoring, infrastructure hardening, secret management, malware scanning for uploads, or deployment-specific threat modeling.
+
 ## Production hardening checklist
 
 1. Terminate TLS using an approved ingress/reverse proxy and redirect all HTTP to HTTPS.
@@ -58,7 +77,7 @@ For internet-facing or multi-replica production deployments, the next session-ha
 7. Store secrets in a secrets manager instead of `.env` files.
 8. Restrict database/storage network access to application identities only.
 9. Forward audit logs, request IDs, metrics and authentication events to centralized SIEM/observability platforms.
-10. Add dependency/container/SAST/DAST scanning to CI before internet-facing deployment.
+10. Add deployment-target DAST and periodic penetration testing alongside the existing CodeQL, dependency and container-image scans before internet-facing deployment.
 11. Review CSP and remove `unsafe-inline` by migrating the remaining generated inline event handlers to delegated listeners before strict CSP enforcement.
 12. Maintain tested backup, restore, retention and disaster-recovery RPO/RTO policies.
 
