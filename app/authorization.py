@@ -107,6 +107,42 @@ PERMISSION_CATALOG: dict[str, tuple[str, tuple[str, ...]]] = {
         'Dispatch technicians to work orders',
         ('admin', 'maintenance_manager', 'planner', 'supervisor'),
     ),
+    'inventory.create': (
+        'Create inventory items',
+        ('admin', 'storekeeper', 'maintenance_manager'),
+    ),
+    'inventory.transaction.post': (
+        'Post quantity-changing inventory transactions',
+        ('admin', 'maintenance_manager', 'planner', 'storekeeper', 'technician'),
+    ),
+    'inventory.reorder.scan': (
+        'Run the inventory reorder scan',
+        ('admin', 'storekeeper', 'maintenance_manager', 'procurement'),
+    ),
+    'procurement.requisition.create': (
+        'Create purchase requisitions',
+        ('admin', 'storekeeper', 'maintenance_manager', 'procurement', 'planner'),
+    ),
+    'procurement.requisition.submit': (
+        'Submit purchase requisitions for approval',
+        ('admin', 'storekeeper', 'maintenance_manager', 'procurement', 'planner'),
+    ),
+    'procurement.requisition.approve': (
+        'Approve submitted purchase requisitions',
+        ('admin', 'maintenance_manager', 'procurement'),
+    ),
+    'procurement.quotation.create': (
+        'Record procurement quotations',
+        ('admin', 'maintenance_manager', 'procurement'),
+    ),
+    'procurement.purchase_order.create': (
+        'Create purchase orders from approved requisitions',
+        ('admin', 'maintenance_manager', 'procurement'),
+    ),
+    'procurement.purchase_order.receive': (
+        'Receive purchase orders into inventory',
+        ('admin', 'procurement', 'storekeeper'),
+    ),
 }
 
 # FastAPI's matched route template is used for parameterized paths. Each entry
@@ -140,6 +176,15 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('POST', '/api/work-orders/{wo_id}/notes'): 'work.notes.write',
     ('POST', '/api/work-orders/{wo_id}/tasks/{task_id}/toggle'): 'work.tasks.manage',
     ('POST', '/api/work-orders/{wo_id}/dispatch'): 'work.dispatch',
+    ('POST', '/api/inventory'): 'inventory.create',
+    ('POST', '/api/inventory/{item_id}/transaction'): 'inventory.transaction.post',
+    ('POST', '/api/inventory/reorder-scan'): 'inventory.reorder.scan',
+    ('POST', '/api/procurement/requisitions'): 'procurement.requisition.create',
+    ('POST', '/api/procurement/requisitions/{pr_id}/submit'): 'procurement.requisition.submit',
+    ('POST', '/api/procurement/requisitions/{pr_id}/approve'): 'procurement.requisition.approve',
+    ('POST', '/api/procurement/quotations'): 'procurement.quotation.create',
+    ('POST', '/api/procurement/purchase-orders'): 'procurement.purchase_order.create',
+    ('POST', '/api/procurement/purchase-orders/{po_id}/receive'): 'procurement.purchase_order.receive',
 }
 
 # Once a business route family is listed here, every state-changing route in
@@ -148,6 +193,8 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
 CAPABILITY_ENFORCED_MUTATION_PREFIXES: dict[str, tuple[str, ...]] = {
     'assets': ('/api/assets', '/api/field/assets', '/api/meters'),
     'work_management': ('/api/work-orders',),
+    'inventory': ('/api/inventory',),
+    'procurement': ('/api/procurement',),
 }
 
 CAPABILITY_MUTATION_EXEMPTIONS: dict[tuple[str, str], str] = {
