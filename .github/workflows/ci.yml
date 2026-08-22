@@ -125,5 +125,8 @@ jobs:
       - name: Run PostgreSQL PM generation concurrency smoke
         run: python scripts/pm_generation_concurrency_smoke.py
 
+      - name: Run PostgreSQL alarm work-order concurrency smoke
+        run: python scripts/alarm_work_order_concurrency_smoke.py
+
       - name: Run live PostgreSQL HTTP smoke
         run: python scripts/postgres_smoke_test.py
