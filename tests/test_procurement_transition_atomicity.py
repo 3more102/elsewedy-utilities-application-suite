@@ -5,6 +5,8 @@ import uuid
 
 from fastapi.testclient import TestClient
 
+from app.application import ApprovalDecisionIn
+from app.approval_store import ApprovalTransitionConflict, decide_approval_atomic
 from app.database import db, now
 from app.main import app
 from app.procurement_store import (
@@ -18,10 +20,13 @@ WORKERS = 8
 
 
 def _seed_admin_and_warehouse(conn):
-    user = conn.execute("SELECT id FROM users WHERE username='omar'").fetchone()
+    user = conn.execute(
+        """SELECT u.id,r.code role FROM users u
+           JOIN roles r ON r.id=u.role_id WHERE u.username='omar'"""
+    ).fetchone()
     warehouse = conn.execute('SELECT id FROM warehouses ORDER BY id LIMIT 1').fetchone()
     assert user and warehouse
-    return int(user['id']), int(warehouse['id'])
+    return {'id': int(user['id']), 'role': user['role']}, int(warehouse['id'])
 
 
 def test_concurrent_requisition_approval_has_exactly_one_winner():
@@ -30,7 +35,8 @@ def test_concurrent_requisition_approval_has_exactly_one_winner():
 
     with TestClient(app):
         with db() as conn:
-            actor_id, _ = _seed_admin_and_warehouse(conn)
+            user, _ = _seed_admin_and_warehouse(conn)
+            actor_id = user['id']
             created = conn.execute(
                 '''INSERT INTO purchase_requisitions(
                      pr_no,title,requester_id,status,justification,total_estimate,created_at
@@ -93,6 +99,100 @@ def test_concurrent_requisition_approval_has_exactly_one_winner():
         assert audits == 1
 
 
+def test_direct_and_unified_approval_routes_share_one_atomic_winner():
+    suffix = uuid.uuid4().hex[:10]
+    pr_no = f'PR-XROUTE-{suffix}'
+    approval_no = f'APR-XROUTE-{suffix}'
+
+    with TestClient(app):
+        with db() as conn:
+            user, _ = _seed_admin_and_warehouse(conn)
+            actor_id = user['id']
+            pr = conn.execute(
+                '''INSERT INTO purchase_requisitions(
+                     pr_no,title,requester_id,status,justification,total_estimate,created_at
+                   ) VALUES(?,?,?,'Submitted','cross-route concurrency regression',0,?)''',
+                (pr_no, 'Cross-route approval regression', actor_id, now()),
+            )
+            pr_id = int(pr.lastrowid)
+            approval = conn.execute(
+                '''INSERT INTO approval_requests(
+                     approval_no,module,record_type,record_id,record_code,title,
+                     requested_by,assigned_role,status,requested_at
+                   ) VALUES(?,?,?,?,?,?,?,'procurement','Pending',?)''',
+                (
+                    approval_no,
+                    'Procurement',
+                    'purchase_requisition',
+                    pr_id,
+                    pr_no,
+                    f'Approve {pr_no}',
+                    actor_id,
+                    now(),
+                ),
+            )
+            approval_id = int(approval.lastrowid)
+
+        barrier = threading.Barrier(WORKERS)
+        wins: list[int] = []
+        conflicts: list[int] = []
+        errors: list[BaseException] = []
+        body = ApprovalDecisionIn(decision='approve', comments='race regression')
+
+        def worker(index: int) -> None:
+            try:
+                barrier.wait(timeout=10)
+                with db() as conn:
+                    if index % 2:
+                        decide_approval_atomic(conn, approval_id, body, user)
+                    else:
+                        approve_requisition(conn, pr_id, actor_id)
+                wins.append(index)
+            except (ProcurementTransitionConflict, ApprovalTransitionConflict):
+                conflicts.append(index)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(WORKERS)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == []
+        assert len(wins) == 1
+        assert len(conflicts) == WORKERS - 1
+
+        with db() as conn:
+            pr_status = conn.execute(
+                'SELECT status FROM purchase_requisitions WHERE id=?', (pr_id,)
+            ).fetchone()['status']
+            approval_status = conn.execute(
+                'SELECT status FROM approval_requests WHERE id=?', (approval_id,)
+            ).fetchone()['status']
+            events = int(
+                conn.execute(
+                    '''SELECT COUNT(*) FROM workflow_events
+                       WHERE module='Procurement' AND record_type='purchase_requisition'
+                         AND record_id=? AND event='APPROVE' ''',
+                    (pr_id,),
+                ).fetchone()[0]
+            )
+            audits = int(
+                conn.execute(
+                    '''SELECT COUNT(*) FROM audit_logs
+                       WHERE module='Procurement' AND action='APPROVE' AND record_id=?''',
+                    (pr_no,),
+                ).fetchone()[0]
+            )
+
+        assert pr_status == 'Approved'
+        assert approval_status == 'Approved'
+        assert events == 1
+        assert audits == 1
+
+
 def test_concurrent_purchase_order_receipt_posts_stock_once():
     suffix = uuid.uuid4().hex[:10]
     item_no = f'ITM-RCV-{suffix}'
@@ -103,7 +203,8 @@ def test_concurrent_purchase_order_receipt_posts_stock_once():
 
     with TestClient(app):
         with db() as conn:
-            actor_id, warehouse_id = _seed_admin_and_warehouse(conn)
+            user, warehouse_id = _seed_admin_and_warehouse(conn)
+            actor_id = user['id']
             item = conn.execute(
                 '''INSERT INTO inventory_items(
                      item_no,name,category,warehouse_id,current_stock,reserved_stock,
