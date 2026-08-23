@@ -117,16 +117,19 @@ def run_database_checks() -> list[Check]:
     from app.auth import hash_password
     from app.audit_verification import verify_audit_chain_report
     from app.config import DB_BACKEND, SCHEMA_VERSION
-    from app.database import db, init_db
+    from app.database import db
+    from app.migrations import initialize_database, migration_status
 
     checks: list[Check] = []
     try:
-        init_db(hash_password)
+        initialize_database(hash_password)
     except Exception as exc:  # pragma: no cover - exercised by deployment/CI failures
-        return [Check("database_initialization", "FAIL", f"Schema initialization failed: {exc}")]
+        return [Check("database_initialization", "FAIL", f"Schema migration failed: {exc}")]
 
     critical_tables = {
         "users",
+        "auth_sessions",
+        "auth_login_throttle",
         "assets",
         "work_orders",
         "inventory_items",
@@ -160,6 +163,24 @@ def run_database_checks() -> list[Check]:
             asset_count = int(conn.execute("SELECT COUNT(*) AS n FROM assets").fetchone()[0])
             checks.append(Check("seed_integrity", "PASS" if user_count and asset_count else "FAIL", f"users={user_count}, assets={asset_count}"))
             checks.append(Check("schema_contract", "PASS", f"Application schema contract version={SCHEMA_VERSION}."))
+
+            migration = migration_status(
+                conn,
+                backend=DB_BACKEND,
+                target_version=SCHEMA_VERSION,
+            )
+            checks.append(
+                Check(
+                    "schema_migrations",
+                    "PASS" if migration["ready"] else "FAIL",
+                    (
+                        f"current={migration['current_version']}, target={migration['target_version']}, "
+                        f"pending={migration['pending_versions']}, invalid={migration['invalid_versions']}, "
+                        f"future={migration['future_versions']}."
+                    ),
+                )
+            )
+
             # A deployment must never go live on a database whose tamper-evident
             # audit chain is already broken; this is part of the security gate.
             report = verify_audit_chain_report(conn)
@@ -190,7 +211,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate EUAS deployment readiness.")
     parser.add_argument("--require-postgres", action="store_true", help="Fail unless PostgreSQL is configured.")
     parser.add_argument("--strict-production", action="store_true", help="Require EUAS_ENV=production.")
-    parser.add_argument("--check-db", action="store_true", help="Initialize and validate the configured database.")
+    parser.add_argument("--check-db", action="store_true", help="Initialize/migrate and validate the configured database.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     args = parser.parse_args()
 

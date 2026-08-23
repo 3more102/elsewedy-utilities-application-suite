@@ -49,7 +49,7 @@ def collect_evidence() -> dict:
 
     The collector deliberately ignores any caller production database URL. This
     makes it safe to run in CI and on operator workstations while still executing
-    the real schema initializer and FastAPI composition layer.
+    the real schema bootstrap, registered migrations and FastAPI composition layer.
     """
     with tempfile.TemporaryDirectory(prefix='euas-evidence-') as temp_dir:
         os.environ['EUAS_DB_PATH'] = str(Path(temp_dir) / 'euas-evidence.db')
@@ -60,10 +60,11 @@ def collect_evidence() -> dict:
         # Imports intentionally occur only after isolation environment is fixed.
         from app.auth import hash_password
         from app.config import APP_VERSION, DB_BACKEND, SCHEMA_VERSION
-        from app.database import db, init_db
+        from app.database import db
         from app.main import app
+        from app.migrations import initialize_database
 
-        init_db(hash_password)
+        initialize_database(hash_password)
         api_routes, api_route_methods = _api_route_metrics(app)
         with db() as conn:
             tables = int(
