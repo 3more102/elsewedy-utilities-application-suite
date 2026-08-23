@@ -23,6 +23,7 @@ from apps.hse import is_high_risk, risk_score, validate_hse_status
 from apps.projects import InvalidProjectTask, normalize_task_changes, recalculate_project_progress
 from apps.observability import health_snapshot, readiness_snapshot, request_metrics_snapshot
 from apps.integrations import IntegrationKeyNotFound, create_integration_api_key as create_integration_key_record, list_integration_api_keys, revoke_integration_api_key as revoke_integration_key_record, telemetry_ingest_principal
+from apps.telemetry import TelemetryChannelNotFound, TelemetryValidationError, ingest_batch as ingest_telemetry_batch, quality_summary as _telemetry_quality_summary, readings as telemetry_reading_rows, telemetry_series as _telemetry_series
 from api.middleware import security_headers
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
@@ -482,13 +483,6 @@ def _incident_candidate_distance(conn, incident_id:int, asset_id:int, max_hops:i
     return min(ds) if ds else None
 
 
-def _normalize_quality(value:str) -> str:
-    q=str(value or 'Good').strip().title()
-    if q not in ('Good','Uncertain','Bad'):
-        raise HTTPException(422,"Telemetry quality must be Good, Uncertain or Bad")
-    return q
-
-
 def _active_alarm_suppression(conn, channel:dict, captured_at:str):
     """Return the most specific active suppression window for a telemetry channel."""
     site=_channel_site(conn,channel['asset_id'])
@@ -581,35 +575,6 @@ def _refresh_incidents_for_alarm(conn, alarm_id:int, actor_id:Optional[int]=None
         updated=_refresh_incident(conn,r['incident_id'],actor_id)
         if updated:result.append(updated)
     return result
-
-
-def _telemetry_quality_summary(conn, hours:int=24, site_id:Optional[int]=None):
-    cutoff=(datetime.now()-timedelta(hours=hours)).isoformat(timespec='seconds')
-    sql="""SELECT tr.quality,COUNT(*) count FROM telemetry_readings tr JOIN telemetry_channels tc ON tc.id=tr.channel_id
-      JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id
-      WHERE tr.captured_at>=?""";args=[cutoff]
-    if site_id is not None:sql+=' AND s.id=?';args.append(site_id)
-    sql+=' GROUP BY tr.quality';counts={r['quality']:int(r['count']) for r in conn.execute(sql,args).fetchall()}
-    total=sum(counts.values());good=counts.get('Good',0);bad=counts.get('Bad',0);uncertain=counts.get('Uncertain',0)
-    return {'hours':hours,'total_readings':total,'good':good,'uncertain':uncertain,'bad':bad,
-            'good_percent':round(good/max(total,1)*100,1),'bad_percent':round(bad/max(total,1)*100,1)}
-
-
-def _telemetry_series(conn, channel_id:int, hours:int, bucket_minutes:int):
-    cutoff=datetime.now()-timedelta(hours=hours)
-    data=rows(conn.execute('SELECT value,quality,captured_at FROM telemetry_readings WHERE channel_id=? AND captured_at>=? ORDER BY captured_at',(channel_id,cutoff.isoformat(timespec='seconds'))))
-    buckets={}
-    span=max(1,bucket_minutes)*60
-    for r in data:
-        try:dt=_dt(r['captured_at'])
-        except Exception:continue
-        epoch=int(dt.timestamp());bucket_epoch=epoch-(epoch%span);key=datetime.fromtimestamp(bucket_epoch).isoformat(timespec='seconds')
-        b=buckets.setdefault(key,{'timestamp':key,'values':[],'good':0,'uncertain':0,'bad':0})
-        b['values'].append(float(r['value']));q=str(r['quality']).lower();b[q]=b.get(q,0)+1
-    points=[]
-    for key in sorted(buckets):
-        b=buckets[key];vals=b.pop('values');points.append(b|{'min':min(vals),'max':max(vals),'avg':round(sum(vals)/len(vals),4),'count':len(vals)})
-    return points
 
 
 def _fmea_risk(severity:int, occurrence:int, detectability:int):
@@ -1675,60 +1640,24 @@ def update_telemetry_channel(channel_id:int,body:TelemetryChannelPatch,user=Depe
 
 @app.post('/api/telemetry/ingest')
 def ingest_telemetry(body:TelemetryIngestIn,user=Depends(telemetry_ingest_principal)):
-    summary={'accepted':0,'duplicates':0,'bad_quality':0,'quality_ignored':0,'suppressed':0,'alarms_opened':0,'alarms_updated':0,'alarms_cleared':0,'normal':0,'cbm_events_opened':0,'cbm_events_resolved':0,'cbm_work_orders_created':0,'results':[]}
     with db() as conn:
-        if body.idempotency_key:
-            previous=conn.execute('SELECT * FROM telemetry_ingest_batches WHERE idempotency_key=?',(body.idempotency_key,)).fetchone()
-            if previous:
-                return {'batch_no':previous['batch_no'],'idempotent_replay':True,'accepted':previous['accepted_count'],'duplicates':previous['duplicate_count'],
-                        'bad_quality':previous['bad_quality_count'],'suppressed':previous['suppressed_count'],'alarms_opened':previous['alarms_opened'],
-                        'alarms_updated':previous['alarms_updated'],'alarms_cleared':previous['alarms_cleared'],'cbm_events_opened':previous['cbm_events_opened'],
-                        'cbm_events_resolved':previous['cbm_events_resolved'],'cbm_work_orders_created':previous['cbm_work_orders_created'],'normal':0,'results':[]}
-        batch_no=next_no(conn,'telemetry_ingest_batches','batch_no','TIB-',70001)
-        cur=conn.execute("""INSERT INTO telemetry_ingest_batches(batch_no,source_system,idempotency_key,received_count,ingested_by,started_at)
-          VALUES(?,?,?,?,?,?)""",(batch_no,body.source_system or 'API',body.idempotency_key,len(body.readings),user['id'],now()))
-        batch_id=cur.lastrowid
-        for reading in body.readings:
-            code=reading.channel_code.strip().upper()
-            c=get_or_404(conn,'SELECT * FROM telemetry_channels WHERE channel_code=? AND active=1',(code,),f'Telemetry channel {reading.channel_code} not found or inactive')
-            captured=reading.captured_at or now();source=reading.source or body.source_system or c['source_system'] or 'Manual';quality=_normalize_quality(reading.quality)
-            if reading.external_id:
-                duplicate=conn.execute('SELECT id FROM telemetry_readings WHERE channel_id=? AND external_id=?',(c['id'],reading.external_id)).fetchone()
-                if duplicate:
-                    summary['duplicates']+=1;summary['results'].append({'channel_code':code,'value':reading.value,'action':'duplicate','external_id':reading.external_id});continue
-            reading_cur=conn.execute('INSERT INTO telemetry_readings(channel_id,value,quality,source,captured_at,ingested_at,ingested_by,external_id,batch_id) VALUES(?,?,?,?,?,?,?,?,?)',(c['id'],reading.value,quality,source,captured,now(),user['id'],reading.external_id,batch_id))
-            conn.execute('UPDATE telemetry_channels SET last_value=?,last_quality=?,last_reading_at=?,updated_at=? WHERE id=?',(reading.value,quality,captured,now(),c['id']))
-            summary['accepted']+=1
-            cbm_results=[]
-            if quality!='Good':
-                if quality=='Bad':summary['bad_quality']+=1
-                summary['quality_ignored']+=1
-                result={'action':'quality_ignored','alarm_id':None,'alarm_no':None,'severity':None,'quality':quality}
-            else:
-                result=_evaluate_telemetry_alarm(conn,dict(c),float(reading.value),captured,user['id'])
-                cbm_results=_evaluate_cbm_rules(conn,dict(c),float(reading.value),captured,reading_cur.lastrowid,user['id'])
-                summary['cbm_events_opened']+=sum(1 for x in cbm_results if x['action']=='opened')
-                summary['cbm_events_resolved']+=sum(1 for x in cbm_results if x['action']=='resolved')
-                summary['cbm_work_orders_created']+=sum(1 for x in cbm_results if x.get('work_order'))
-            summary['results'].append({'channel_code':c['channel_code'],'value':reading.value,'quality':quality,'external_id':reading.external_id,'cbm':cbm_results,**result})
-            if result['action'] in ('opened','updated','cleared'):
-                summary['alarms_'+result['action']]+=1
-            elif result['action']=='suppressed':summary['suppressed']+=1
-            elif result['action']=='normal':summary['normal']+=1
-        conn.execute("""UPDATE telemetry_ingest_batches SET accepted_count=?,duplicate_count=?,bad_quality_count=?,alarms_opened=?,alarms_updated=?,alarms_cleared=?,suppressed_count=?,cbm_events_opened=?,cbm_events_resolved=?,cbm_work_orders_created=?,completed_at=? WHERE id=?""",
-          (summary['accepted'],summary['duplicates'],summary['bad_quality'],summary['alarms_opened'],summary['alarms_updated'],summary['alarms_cleared'],summary['suppressed'],summary['cbm_events_opened'],summary['cbm_events_resolved'],summary['cbm_work_orders_created'],now(),batch_id))
-        emit_event(conn,'operations.telemetry.ingested','telemetry',batch_no,{'batch_no':batch_no,'accepted':summary['accepted'],'duplicates':summary['duplicates'],'bad_quality':summary['bad_quality'],'suppressed':summary['suppressed'],'alarms_opened':summary['alarms_opened'],'alarms_updated':summary['alarms_updated'],'alarms_cleared':summary['alarms_cleared'],'cbm_events_opened':summary['cbm_events_opened'],'cbm_work_orders_created':summary['cbm_work_orders_created']})
-        audit(conn,user['id'],'INGEST TELEMETRY','Utilities Operations',batch_no,'',{'accepted':summary['accepted'],'duplicates':summary['duplicates'],'bad_quality':summary['bad_quality'],'suppressed':summary['suppressed'],'alarms_opened':summary['alarms_opened'],'alarms_cleared':summary['alarms_cleared']})
-        return {'batch_no':batch_no,'idempotent_replay':False,**summary}
+        try:
+            return ingest_telemetry_batch(
+                conn,
+                body,
+                actor_id=user['id'],
+                evaluate_alarm=_evaluate_telemetry_alarm,
+                evaluate_cbm=_evaluate_cbm_rules,
+            )
+        except TelemetryChannelNotFound as exc:
+            raise HTTPException(404, str(exc))
+        except TelemetryValidationError as exc:
+            raise HTTPException(422, str(exc))
 
 @app.get('/api/telemetry/readings')
 def telemetry_readings(channel_id:Optional[int]=None,asset_id:Optional[int]=None,hours:int=Query(24,ge=1,le=8760),limit:int=Query(500,ge=1,le=5000),user=Depends(current_user)):
-    cutoff=(datetime.now()-timedelta(hours=hours)).isoformat(timespec='seconds')
-    sql="SELECT tr.*,tc.channel_code,tc.name channel_name,tc.metric_type,tc.unit,a.asset_no,a.name asset_name FROM telemetry_readings tr JOIN telemetry_channels tc ON tc.id=tr.channel_id JOIN assets a ON a.id=tc.asset_id WHERE tr.captured_at>=?";args=[cutoff]
-    if channel_id is not None:sql+=' AND tc.id=?';args.append(channel_id)
-    if asset_id is not None:sql+=' AND a.id=?';args.append(asset_id)
-    sql+=' ORDER BY tr.captured_at DESC LIMIT ?';args.append(limit)
-    with db() as conn:return rows(conn.execute(sql,args))
+    with db() as conn:
+        return telemetry_reading_rows(conn,channel_id=channel_id,asset_id=asset_id,hours=hours,limit=limit)
 
 @app.get('/api/telemetry/batches')
 def telemetry_batches(limit:int=Query(100,ge=1,le=500),user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','executive'))):
