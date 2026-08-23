@@ -10,10 +10,15 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import sys
 import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.audit_verification import verify_audit_chain_report
 
 
 def main() -> int:
@@ -46,6 +51,25 @@ def main() -> int:
         conn = sqlite3.connect(restored)
         try:
             integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
+            tables = {
+                r[0]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if 'audit_logs' in tables:
+                # A restore replaces the live database wholesale; refusing a
+                # tampered snapshot here is the last line of defense before the
+                # corrupted evidence chain becomes production state.
+                conn.row_factory = sqlite3.Row
+                try:
+                    report = verify_audit_chain_report(conn)
+                finally:
+                    conn.row_factory = None
+                if not report['valid']:
+                    raise SystemExit(
+                        f'Restore refused: audit chain invalid at record '
+                        f"{report['first_invalid_id']} "
+                        '(the bundle may be tampered or corrupted)'
+                    )
         finally:
             conn.close()
         if integrity != 'ok':
