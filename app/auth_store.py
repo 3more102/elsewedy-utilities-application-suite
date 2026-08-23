@@ -154,23 +154,23 @@ def ensure_auth_schema(conn) -> dict:
 
 
 def initialize_auth_database(hash_password) -> dict:
-    """Initialize base schema v9, then advance to auth schema v10 safely.
+    """Compatibility wrapper for the shared schema migration runner.
 
-    The legacy initializer still owns the large base schema. Temporarily
-    pinning its marker to v9 prevents it from claiming v10 before the auth
-    migration has run. This helper is used by non-ASGI entrypoints.
+    ASGI startup historically imported this auth-specific helper. Keep that
+    stable entrypoint, but route it through ``app.migrations`` so application
+    startup, deployment readiness, workers and the migration CLI all use the
+    same registry, structural validation and database locking semantics.
+
+    The return shape remains compatible with callers that expect the historical
+    ``legacy_sessions_migrated`` counter.
     """
-    from . import database as database_module
+    from .migrations import initialize_database
 
-    previous_version = database_module.SCHEMA_VERSION
-    database_module.SCHEMA_VERSION = BASE_SCHEMA_VERSION
-    try:
-        database_module.init_db(hash_password)
-    finally:
-        database_module.SCHEMA_VERSION = previous_version
-
-    with database_module.db() as conn:
-        return ensure_auth_schema(conn)
+    result = initialize_database(hash_password)
+    details = result.get('details', {}).get(AUTH_SCHEMA_VERSION, {})
+    return {
+        'legacy_sessions_migrated': int(details.get('legacy_sessions_migrated', 0))
+    }
 
 
 def create_session(
