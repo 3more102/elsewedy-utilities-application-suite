@@ -37,6 +37,43 @@ def _as_int(env: Mapping[str, str], key: str, default: int) -> int:
         return default
 
 
+def _allowed_host_check(env: Mapping[str, str], *, strict_production: bool) -> Check:
+    raw = env.get('EUAS_ALLOWED_HOSTS', '').strip()
+    hosts = tuple(x.strip().lower() for x in raw.split(',') if x.strip())
+    if not hosts:
+        return Check(
+            'allowed_hosts',
+            'FAIL' if strict_production else 'WARN',
+            'EUAS_ALLOWED_HOSTS must explicitly list deployment hostnames in strict production.'
+            if strict_production
+            else 'No explicit allowed-host list configured; the production entrypoint will accept local smoke hosts only.',
+        )
+
+    invalid = []
+    for host in hosts:
+        wildcard_ok = host.startswith('*.') and host.count('*') == 1 and len(host) > 2
+        if host == '*' or ('*' in host and not wildcard_ok):
+            invalid.append(host)
+            continue
+        candidate = host[2:] if wildcard_ok else host
+        if (
+            not candidate
+            or '://' in host
+            or '/' in host
+            or ':' in host
+            or any(ch.isspace() for ch in host)
+        ):
+            invalid.append(host)
+
+    if invalid:
+        return Check(
+            'allowed_hosts',
+            'FAIL',
+            'Invalid or unrestricted EUAS_ALLOWED_HOSTS entries: ' + ', '.join(invalid) + '.',
+        )
+    return Check('allowed_hosts', 'PASS', f'{len(hosts)} trusted host pattern(s) configured.')
+
+
 def evaluate_configuration(
     env: Mapping[str, str], *, require_postgres: bool = False, strict_production: bool = False
 ) -> list[Check]:
@@ -59,6 +96,8 @@ def evaluate_configuration(
         checks.append(Check("database_backend", "PASS" if is_postgres else "FAIL", "PostgreSQL URL configured." if is_postgres else "EUAS_DATABASE_URL must be PostgreSQL."))
     else:
         checks.append(Check("database_backend", "PASS" if is_postgres else "WARN", "PostgreSQL configured." if is_postgres else "SQLite/reference mode configured."))
+
+    checks.append(_allowed_host_check(env, strict_production=strict_production))
 
     if webhook_url and not webhook_secret:
         checks.append(Check("webhook_signing", "FAIL", "Webhook URL is set but signing secret is empty."))

@@ -124,6 +124,7 @@ jobs:
     env:
       EUAS_ENV: production
       EUAS_DATABASE_URL: postgresql://euas:euas_ci_secret@127.0.0.1:5432/euas
+      EUAS_ALLOWED_HOSTS: "127.0.0.1,localhost"
       EUAS_BOOTSTRAP_ADMIN_PASSWORD: "CI-only-bootstrap-admin-2026!"
       EUAS_AUTOMATION_INTERVAL_MINUTES: "5"
       EUAS_SESSION_HOURS: "8"

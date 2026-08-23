@@ -17,6 +17,7 @@ def test_strict_production_rejects_reference_configuration():
     state = statuses(result)
     assert state['environment'] == 'FAIL'
     assert state['database_backend'] == 'FAIL'
+    assert state['allowed_hosts'] == 'FAIL'
     assert state['automation_scheduler'] == 'WARN'
 
 
@@ -24,6 +25,7 @@ def test_production_postgres_and_signed_webhook_are_ready():
     env = {
         'EUAS_ENV': 'production',
         'EUAS_DATABASE_URL': 'postgresql://euas:secret@db:5432/euas',
+        'EUAS_ALLOWED_HOSTS': 'euas.example.com,*.ops.example.com',
         'EUAS_EVENT_WEBHOOK_URL': 'https://example.invalid/euas/events',
         'EUAS_EVENT_WEBHOOK_SECRET': 'test-secret',
         'EUAS_AUTOMATION_INTERVAL_MINUTES': '5',
@@ -34,6 +36,7 @@ def test_production_postgres_and_signed_webhook_are_ready():
     state = statuses(result)
     assert state['environment'] == 'PASS'
     assert state['database_backend'] == 'PASS'
+    assert state['allowed_hosts'] == 'PASS'
     assert state['webhook_signing'] == 'PASS'
     assert state['automation_scheduler'] == 'PASS'
     assert not [c for c in result if c.status == 'FAIL']
@@ -45,6 +48,18 @@ def test_webhook_without_secret_is_a_hard_failure():
     )
     state = statuses(result)
     assert state['webhook_signing'] == 'FAIL'
+    assert state['allowed_hosts'] == 'WARN'
+
+    wildcard = evaluate_configuration(
+        {'EUAS_ALLOWED_HOSTS': '*'}, strict_production=True
+    )
+    assert statuses(wildcard)['allowed_hosts'] == 'FAIL'
+
+    malformed = evaluate_configuration(
+        {'EUAS_ALLOWED_HOSTS': 'https://euas.example.com,euas.example.com:443'},
+        strict_production=True,
+    )
+    assert statuses(malformed)['allowed_hosts'] == 'FAIL'
 
 
 def test_database_checks_validate_audit_chain():

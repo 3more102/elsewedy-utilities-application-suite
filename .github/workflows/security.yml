@@ -103,6 +103,15 @@ jobs:
           assert payload['database_backend'] == 'sqlite', payload
           print(json.dumps(payload, sort_keys=True))
           PY
+          rejected_status=$(curl --silent --output /tmp/euas-untrusted-host.txt --dump-header /tmp/euas-untrusted-host.headers --write-out '%{http_code}' --header 'Host: attacker.invalid' http://127.0.0.1:8879/api/health)
+          if [ "$rejected_status" != "400" ]; then
+            echo "Untrusted Host was not rejected: HTTP $rejected_status" >&2
+            cat /tmp/euas-untrusted-host.txt >&2 || true
+            exit 1
+          fi
+          grep -qi '^x-content-type-options: nosniff' /tmp/euas-untrusted-host.headers
+          grep -qi '^x-frame-options: DENY' /tmp/euas-untrusted-host.headers
+          grep -qi '^content-security-policy:' /tmp/euas-untrusted-host.headers
           python scripts/http_ui_smoke.py http://127.0.0.1:8879
 
       - name: Scan image for high and critical vulnerabilities
