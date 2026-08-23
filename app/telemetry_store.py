@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import math
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException
 
 from . import application as _application
 from .audit_store import append_audit
 from .auth import require_roles
+from .config import TELEMETRY_MAX_FUTURE_SKEW_SECONDS
 from .database import db, now
 
 
@@ -119,11 +121,35 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
         explicit_capture = reading.captured_at is not None
         captured = reading.captured_at or now()
         try:
-            _event_instant(captured)
+            event_instant = _event_instant(captured)
         except (TypeError, ValueError):
             raise HTTPException(
                 400,
                 f'Invalid captured_at for telemetry channel {channel_code}',
+            )
+
+        # Non-finite measurements cannot be ranked against thresholds and would
+        # poison channel state and active alarms (PostgreSQL ranks NaN above
+        # every finite value, SQLite rejects it as NULL), so reject them before
+        # any persistence happens.
+        if not math.isfinite(float(reading.value)):
+            raise HTTPException(
+                400,
+                f'Invalid non-finite measurement for telemetry channel {channel_code}',
+            )
+
+        # A future-dated capture beyond the configured skew would permanently
+        # freeze the channel: every genuine later reading would be classified
+        # as historical, so refuse to advance live state with it.
+        if (
+            explicit_capture
+            and event_instant
+            > datetime.now(timezone.utc).replace(tzinfo=None)
+            + timedelta(seconds=TELEMETRY_MAX_FUTURE_SKEW_SECONDS)
+        ):
+            raise HTTPException(
+                400,
+                f'captured_at for telemetry channel {channel_code} is too far in the future',
             )
 
         channel = _lock_and_load_channel(conn, channel_code)
