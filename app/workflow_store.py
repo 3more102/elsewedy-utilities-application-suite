@@ -285,6 +285,60 @@ def transition_dispatch_atomic(conn, dispatch_id: int, body, user: dict) -> dict
     return {'ok': True, 'status': target}
 
 
+def toggle_work_task_atomic(conn, wo_id: int, task_id: int, user: dict) -> dict:
+    """Flip one work-order task with a single audited state transition.
+
+    The toggle itself is the historical contract: every sequential call is a
+    real transition and keeps its audit record. Concurrency safety comes from
+    claiming the transition with an expected-status predicate, so simultaneous
+    identical toggles produce exactly one committed transition and one audit
+    instead of duplicated evidence from stale reads.
+    """
+    work = conn.execute(
+        'SELECT wo_no FROM work_orders WHERE id=?', (wo_id,)
+    ).fetchone()
+    if not work:
+        raise KeyError('Work order not found')
+    task = conn.execute(
+        'SELECT * FROM work_order_tasks WHERE id=? AND work_order_id=?',
+        (task_id, wo_id),
+    ).fetchone()
+    if not task:
+        raise KeyError('Task not found')
+
+    new_status = 'Pending' if task['status'] == 'Completed' else 'Completed'
+    changed = conn.execute(
+        '''UPDATE work_order_tasks
+           SET status=?,completed_at=?
+           WHERE id=? AND status=?''',
+        (
+            new_status,
+            _application.now() if new_status == 'Completed' else None,
+            task_id,
+            task['status'],
+        ),
+    )
+    if not _rowcount_one(changed):
+        current = conn.execute(
+            'SELECT status FROM work_order_tasks WHERE id=?', (task_id,)
+        ).fetchone()
+        status = current['status'] if current else 'missing'
+        raise WorkflowTransitionConflict(
+            f'Concurrent task transition won; current status is {status}'
+        )
+
+    append_audit(
+        conn,
+        user['id'],
+        'TASK ' + new_status.upper(),
+        'Work Management',
+        work['wo_no'],
+        task['status'],
+        new_status,
+    )
+    return {'ok': True, 'status': new_status}
+
+
 def install_workflow_transition_routes() -> None:
     app = _application.app
     marker = '_euas_workflow_transition_atomicity'
@@ -294,6 +348,7 @@ def install_workflow_transition_routes() -> None:
     replacements = {
         ('/api/work-orders/{wo_id}/transition', 'POST'),
         ('/api/dispatch/{dispatch_id}/transition', 'POST'),
+        ('/api/work-orders/{wo_id}/tasks/{task_id}/toggle', 'POST'),
     }
     app.router.routes[:] = [
         route
@@ -333,7 +388,22 @@ def install_workflow_transition_routes() -> None:
         except WorkflowTransitionConflict as exc:
             raise HTTPException(409, str(exc))
 
+    @app.post('/api/work-orders/{wo_id}/tasks/{task_id}/toggle')
+    def toggle_work_task_route(
+        wo_id: int,
+        task_id: int,
+        user=Depends(require_roles(*_application.WORK_ROLES)),
+    ):
+        try:
+            with db() as conn:
+                return toggle_work_task_atomic(conn, wo_id, task_id, user)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc).strip("'"))
+        except WorkflowTransitionConflict as exc:
+            raise HTTPException(409, str(exc))
+
     _application.transition_work = transition_work_route
     _application.transition_dispatch = transition_dispatch_route
+    _application.toggle_work_task = toggle_work_task_route
     app.openapi_schema = None
     setattr(app.state, marker, True)
