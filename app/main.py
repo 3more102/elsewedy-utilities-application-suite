@@ -31,7 +31,13 @@ from apps.notifications import notify, notify_once
 from apps.workforce import forecast_bucket_start as _forecast_bucket_start, parse_days_of_week as _parse_days_of_week, week_capacity as _workforce_week_capacity
 from apps.scheduling import maintenance_forecast as _maintenance_forecast
 from apps.preventive_maintenance import generate_due_work_orders as _generate_due_pm
-from apps.approvals import create_approval, resolve_approval
+from apps.approvals import (
+    DelegationError, active_delegation, append_evidence_event, create_approval, create_delegation,
+    decision_history as approval_decision_history, decision_snapshot as approval_decision_snapshot,
+    expected_intent as approval_expected_intent, record_signature as record_approval_signature,
+    revoke_delegation, verify_evidence_chain as verify_approval_evidence_chain,
+    verify_request_snapshot, verify_signature_chain as verify_approval_signature_chain, resolve_approval,
+)
 from apps.cbm import evaluate_rules as evaluate_cbm_rules
 from apps.reliability import asset_reliability_rows as _asset_reliability_rows, outage_overlap_hours as _outage_overlap_hours, site_reliability_rows as _site_reliability_rows
 from apps.fmea import FmeaError, calculate_risk as calculate_fmea_risk, get_record as get_fmea_record, would_create_failure_mode_cycle
@@ -39,7 +45,7 @@ from apps.rcm import RCM_CONSEQUENCES, RCM_STRATEGY_TYPES, RcmError, default_rev
 from api.middleware import security_headers
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
-from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
+from apps.authorization import require_roles, require_permission, effective_permissions, has_permission, user_has_permission
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -118,86 +124,10 @@ def _save_asset_health(conn, asset_id:int, actor_id:Optional[int]=None):
                  (asset_id,h['score'],h['risk_band'],json.dumps(h['factors'],sort_keys=True),now(),actor_id))
     return h
 
-def _delegation_active(conn, approval, user_id:int):
-    assigned=approval.get('assigned_user_id')
-    if not assigned:return False
-    stamp=now()
-    r=conn.execute("SELECT id FROM approval_delegations WHERE delegator_user_id=? AND delegate_user_id=? AND active=1 AND start_at<=? AND end_at>=? AND (module='*' OR module=?) ORDER BY id DESC LIMIT 1",
-                   (assigned,user_id,stamp,stamp,approval.get('module') or '')).fetchone()
-    return bool(r)
-
 def get_or_404(conn, sql, args, message='Record not found'):
     r=conn.execute(sql,args).fetchone()
     if not r: raise HTTPException(404,message)
     return dict(r)
-
-def _approval_expected_intent(decision:str, record_code:str) -> str:
-    action='approve' if decision.lower().strip()=='approve' else 'reject'
-    return f'I {action} {record_code}'
-
-def _approval_target_snapshot(conn, approval):
-    if approval['record_type']=='work_order':
-        return get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(approval['record_id'],),'Work order not found')
-    if approval['record_type']=='purchase_requisition':
-        return get_or_404(conn,'SELECT * FROM purchase_requisitions WHERE id=?',(approval['record_id'],),'Purchase requisition not found')
-    if approval['record_type']=='alarm_shelf':
-        return get_or_404(conn,'SELECT * FROM alarm_shelves WHERE id=?',(approval['record_id'],),'Alarm shelf request not found')
-    if approval['record_type']=='rcm_strategy':
-        return get_or_404(conn,'SELECT * FROM rcm_strategies WHERE id=?',(approval['record_id'],),'RCM strategy not found')
-    return {'record_type':approval['record_type'],'record_id':approval['record_id']}
-
-def _approval_signature_digest(prev_hash:str, payload_json:str) -> str:
-    return hashlib.sha256(f'{prev_hash or ""}|{payload_json}'.encode('utf-8')).hexdigest()
-
-def _record_approval_signature(conn, approval, target_status:str, user, intent_statement:str, comments:str, delegated:bool, record_snapshot:dict):
-    evidence_no=next_no(conn,'approval_signature_evidence','evidence_no','SIG-',9001)
-    signed_at=now()
-    payload={
-      'schema':1,'evidence_no':evidence_no,
-      'approval':{'id':approval['id'],'approval_no':approval['approval_no'],'module':approval['module'],'record_type':approval['record_type'],
-                  'record_id':approval['record_id'],'record_code':approval['record_code'],'title':approval['title'],
-                  'requested_by':approval['requested_by'],'requested_at':approval['requested_at']},
-      'decision':target_status,
-      'signer':{'user_id':user['id'],'username':user['username'],'full_name':user['full_name'],'role':user['role']},
-      'authority':{'delegated':bool(delegated)},'credential_verified':True,
-      'intent_statement':intent_statement,'comments':comments or '', 'signed_at':signed_at,
-      'record_snapshot':record_snapshot
-    }
-    payload_json=json.dumps(payload,sort_keys=True,separators=(',',':'),ensure_ascii=False,default=str)
-    prev=conn.execute('SELECT evidence_hash FROM approval_signature_evidence ORDER BY id DESC LIMIT 1').fetchone()
-    prev_hash=prev['evidence_hash'] if prev and prev['evidence_hash'] else ''
-    digest=_approval_signature_digest(prev_hash,payload_json)
-    cur=conn.execute('''INSERT INTO approval_signature_evidence(
-      evidence_no,approval_id,approval_no,module,record_type,record_id,record_code,decision,signer_user_id,signer_username,signer_name,signer_role,
-      delegated_authority,credential_verified,intent_statement,comments,signed_at,payload_json,prev_hash,evidence_hash
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
-      evidence_no,approval['id'],approval['approval_no'],approval['module'],approval['record_type'],approval['record_id'],approval['record_code'],target_status,
-      user['id'],user['username'],user['full_name'],user['role'],int(bool(delegated)),1,intent_statement,comments or '',signed_at,payload_json,prev_hash,digest))
-    return {'id':cur.lastrowid,'evidence_no':evidence_no,'signed_at':signed_at,'evidence_hash':digest,'prev_hash':prev_hash}
-
-def verify_approval_signature_chain(conn):
-    prev='';checked=0
-    for r in conn.execute('SELECT * FROM approval_signature_evidence ORDER BY id').fetchall():
-        checked+=1
-        payload_json=r['payload_json'] or ''
-        expected=_approval_signature_digest(prev,payload_json)
-        try:payload=json.loads(payload_json)
-        except Exception:
-            return {'valid':False,'checked':checked,'first_invalid_id':r['id'],'first_invalid_evidence_no':r['evidence_no'],'reason':'invalid_payload_json','head_hash':prev}
-        approval=payload.get('approval') or {}; signer=payload.get('signer') or {}; authority=payload.get('authority') or {}
-        columns_match=(
-          payload.get('evidence_no')==r['evidence_no'] and approval.get('approval_no')==r['approval_no'] and approval.get('module')==r['module'] and
-          approval.get('record_type')==r['record_type'] and int(approval.get('record_id',-1))==int(r['record_id']) and approval.get('record_code')==r['record_code'] and
-          payload.get('decision')==r['decision'] and int(signer.get('user_id',-1))==int(r['signer_user_id']) and signer.get('username')==r['signer_username'] and
-          signer.get('full_name')==r['signer_name'] and signer.get('role')==r['signer_role'] and int(bool(authority.get('delegated')))==int(r['delegated_authority']) and
-          bool(payload.get('credential_verified'))==bool(r['credential_verified']) and payload.get('intent_statement')==r['intent_statement'] and
-          (payload.get('comments') or '')==(r['comments'] or '') and payload.get('signed_at')==r['signed_at']
-        )
-        if (r['prev_hash'] or '')!=prev or (r['evidence_hash'] or '')!=expected or not columns_match:
-            reason='chain_link' if (r['prev_hash'] or '')!=prev else ('hash_mismatch' if (r['evidence_hash'] or '')!=expected else 'column_payload_mismatch')
-            return {'valid':False,'checked':checked,'first_invalid_id':r['id'],'first_invalid_evidence_no':r['evidence_no'],'reason':reason,'head_hash':prev}
-        prev=r['evidence_hash']
-    return {'valid':True,'checked':checked,'first_invalid_id':None,'first_invalid_evidence_no':None,'reason':'ok','head_hash':prev}
 
 def user_id_by_username(conn, username):
     r=conn.execute('SELECT id FROM users WHERE username=?',(username,)).fetchone(); return r['id'] if r else None
@@ -471,7 +401,7 @@ class UserRoleUpdateIn(BaseModel):
 class ApprovalDecisionIn(BaseModel):
     decision:str; comments:str=''; current_password:str=''; signer_intent:str=Field(default='',max_length=240)
 class ApprovalDelegationIn(BaseModel):
-    delegate_user_id:int; module:str='*'; start_at:str; end_at:str
+    delegate_user_id:int; module:str='*'; record_type:str='*'; resource_id:int=0; start_at:str; end_at:str; reason:str=Field(default='',max_length=500)
 class WorkRequirementIn(BaseModel):
     item_id:int; quantity:float=Field(gt=0); required_by:Optional[str]=None
 class CraftRequirementIn(BaseModel):
@@ -674,12 +604,14 @@ def list_approvals(status:str='Pending',module:str='',user=Depends(current_user)
     if user['role'] not in ('admin','maintenance_manager','executive'):
         sql+=""" AND (ap.assigned_user_id=? OR ap.assigned_role=? OR ap.requested_by=? OR EXISTS (
           SELECT 1 FROM approval_delegations d WHERE d.delegator_user_id=ap.assigned_user_id AND d.delegate_user_id=?
-          AND d.active=1 AND d.start_at<=? AND d.end_at>=? AND (d.module='*' OR d.module=ap.module)
+          AND d.active=1 AND d.revoked_at IS NULL AND d.start_at<=? AND d.end_at>=?
+          AND (d.module='*' OR d.module=ap.module) AND (d.record_type='*' OR d.record_type=ap.record_type)
+          AND (d.resource_id=0 OR d.resource_id=ap.record_id)
         ))""";stamp=now();args += [user['id'],user['role'],user['id'],user['id'],stamp,stamp]
     sql+=" ORDER BY CASE ap.status WHEN 'Pending' THEN 0 ELSE 1 END,ap.id DESC"
     with db() as conn:
         result=rows(conn.execute(sql,args))
-        for a in result:a['delegated_to_me']=bool(a['status']=='Pending' and _delegation_active(conn,a,user['id']))
+        for a in result:a['delegated_to_me']=bool(a['status']=='Pending' and active_delegation(conn,a,user['id']))
         return result
 
 @app.post('/api/approvals/{approval_id}/decision')
@@ -687,13 +619,21 @@ def decide_approval(approval_id:int,body:ApprovalDecisionIn,user=Depends(current
     decision=body.decision.lower().strip()
     if decision not in ('approve','reject'):raise HTTPException(400,'Decision must be approve or reject')
     with db() as conn:
-        if not has_permission(user,'approvals.decide'):
+        if not user_has_permission(conn,user['id'],'approvals.decide'):
             raise HTTPException(403,'Missing permission: approvals.decide')
         ap=get_or_404(conn,'SELECT * FROM approval_requests WHERE id=?',(approval_id,),'Approval request not found')
         if ap['status']!='Pending':raise HTTPException(409,'Approval request is already decided')
-        delegated=_delegation_active(conn,ap,user['id'])
+        delegation=active_delegation(conn,ap,user['id'],lock=True)
+        delegated=bool(delegation)
         allowed=user['role'] in ('admin','maintenance_manager') or ap['assigned_user_id']==user['id'] or (ap['assigned_role'] and ap['assigned_role']==user['role']) or delegated
         if not allowed:raise HTTPException(403,'This approval is not assigned to your role or user')
+
+        # A decision is bound to the exact target state captured when approval was requested.
+        snapshot_check=verify_request_snapshot(conn,ap)
+        ap=get_or_404(conn,'SELECT * FROM approval_requests WHERE id=?',(approval_id,),'Approval request not found')
+        if not snapshot_check['valid']:
+            raise HTTPException(409,'Approval target changed after the request; a new approval snapshot is required')
+
         target='Approved' if decision=='approve' else 'Rejected'
         if ap['record_type']=='work_order':
             rec=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(ap['record_id'],),'Work order not found')
@@ -709,11 +649,11 @@ def decide_approval(approval_id:int,body:ApprovalDecisionIn,user=Depends(current
             rec=_rcm_strategy_record(conn,ap['record_id'])
             if rec['status']!='Review':raise HTTPException(409,f"RCM strategy is {rec['status']}, not Review")
             if ap['requested_by']==user['id']:raise HTTPException(403,'RCM strategy approval requires a different authorized user')
-            if not has_permission(user,'reliability.rcm.approve'):raise HTTPException(403,'Missing permission: reliability.rcm.approve')
+            if not user_has_permission(conn,user['id'],'reliability.rcm.approve'):raise HTTPException(403,'Missing permission: reliability.rcm.approve')
         else:
             raise HTTPException(400,'Unsupported approval record type')
 
-        expected_intent=_approval_expected_intent(decision,ap['record_code'])
+        expected_intent=approval_expected_intent(decision,ap['record_code'])
         if body.signer_intent.strip()!=expected_intent:
             raise HTTPException(400,f'Electronic signature intent must exactly match: {expected_intent}')
         pwd=conn.execute('SELECT password_hash FROM users WHERE id=? AND active=1',(user['id'],)).fetchone()
@@ -733,44 +673,67 @@ def decide_approval(approval_id:int,body:ApprovalDecisionIn,user=Depends(current
             if target=='Approved':
                 end=(_dt(stamp)+timedelta(minutes=rec['duration_minutes'])).isoformat(timespec='seconds')
                 conn.execute("UPDATE alarm_shelves SET status='Approved',approved_by=?,approved_at=?,start_at=?,end_at=?,decision_comments=? WHERE id=?",(user['id'],stamp,stamp,end,body.comments,rec['id']))
-                emit_event(conn,'operations.alarm_shelf.approved','alarm_shelf',rec['shelf_no'],{'shelf_no':rec['shelf_no'],'alarm_no':rec['alarm_no'],'end_at':end})
+                emit_event(conn,'operations.alarm_shelf.approved','alarm_shelf',rec['shelf_no'],{'shelf_no':rec['shelf_no'],'alarm_no':rec['alarm_no'],'end_at':end},correlation_id=ap['correlation_id'])
             else:
                 conn.execute("UPDATE alarm_shelves SET status='Rejected',rejected_by=?,rejected_at=?,decision_comments=? WHERE id=?",(user['id'],stamp,body.comments,rec['id']))
-                emit_event(conn,'operations.alarm_shelf.rejected','alarm_shelf',rec['shelf_no'],{'shelf_no':rec['shelf_no'],'alarm_no':rec['alarm_no']})
+                emit_event(conn,'operations.alarm_shelf.rejected','alarm_shelf',rec['shelf_no'],{'shelf_no':rec['shelf_no'],'alarm_no':rec['alarm_no']},correlation_id=ap['correlation_id'])
             audit(conn,user['id'],decision.upper()+' ALARM SHELF','Utilities Operations',rec['shelf_no'],rec['status'],target)
         elif ap['record_type']=='rcm_strategy':
             stamp=now();strategy_status='Approved' if target=='Approved' else 'Draft'
             if target=='Approved':
                 conn.execute("UPDATE rcm_strategies SET status='Approved',approved_by=?,approved_at=?,last_decision_comments=?,updated_by=?,updated_at=? WHERE id=?",(user['id'],stamp,body.comments,user['id'],stamp,rec['id']))
-                emit_event(conn,'maintenance.reliability.rcm_approved','rcm_strategy',rec['strategy_no'],{'strategy_no':rec['strategy_no'],'fmea_no':rec['fmea_no'],'strategy_type':rec['strategy_type']})
+                emit_event(conn,'maintenance.reliability.rcm_approved','rcm_strategy',rec['strategy_no'],{'strategy_no':rec['strategy_no'],'fmea_no':rec['fmea_no'],'strategy_type':rec['strategy_type']},correlation_id=ap['correlation_id'])
             else:
                 conn.execute("UPDATE rcm_strategies SET status='Draft',approved_by=NULL,approved_at=NULL,last_decision_comments=?,updated_by=?,updated_at=? WHERE id=?",(body.comments,user['id'],stamp,rec['id']))
-                emit_event(conn,'maintenance.reliability.rcm_rejected','rcm_strategy',rec['strategy_no'],{'strategy_no':rec['strategy_no'],'fmea_no':rec['fmea_no']})
+                emit_event(conn,'maintenance.reliability.rcm_rejected','rcm_strategy',rec['strategy_no'],{'strategy_no':rec['strategy_no'],'fmea_no':rec['fmea_no']},correlation_id=ap['correlation_id'])
             workflow_event(conn,'Reliability','rcm_strategy',rec['id'],rec['strategy_no'],decision.upper(),rec['status'],strategy_status,user['id'],body.comments)
             audit(conn,user['id'],decision.upper()+' RCM','Reliability',rec['strategy_no'],rec['status'],strategy_status)
 
         resolve_approval(conn,ap['module'],ap['record_type'],ap['record_id'],decision,user['id'],body.comments)
-        snapshot=_approval_target_snapshot(conn,ap)
-        evidence=_record_approval_signature(conn,ap,target,user,body.signer_intent.strip(),body.comments,delegated,snapshot)
-        audit(conn,user['id'],'E-SIGN '+decision.upper(),'Approvals',ap['approval_no'],'',{'evidence_no':evidence['evidence_no'],'record_code':ap['record_code'],'evidence_hash':evidence['evidence_hash']})
+        snapshot=approval_decision_snapshot(conn,ap)
+        delegation_id=delegation['id'] if delegation else None
+        evidence=record_approval_signature(conn,ap,target,user,body.signer_intent.strip(),body.comments,delegated,snapshot,delegation_id)
+        lifecycle=append_evidence_event(
+            conn,'ApprovalGranted' if target=='Approved' else 'ApprovalRejected',user['id'],approval_id=ap['id'],delegation_id=delegation_id,
+            effective_actor_user_id=delegation['delegator_user_id'] if delegation else user['id'],decision=target,resource_type=ap['record_type'],
+            resource_id=ap['record_id'],resource_fingerprint=ap['request_snapshot_hash'],correlation_id=ap['correlation_id'],
+            details={'approval_no':ap['approval_no'],'record_code':ap['record_code'],'comments':body.comments or ''},
+        )
+        emit_event(conn,'approval.granted' if target=='Approved' else 'approval.rejected','approval',ap['approval_no'],{
+            'approval_no':ap['approval_no'],'record_type':ap['record_type'],'record_id':ap['record_id'],'record_code':ap['record_code'],
+            'decision':target,'delegated':delegated,'evidence_no':lifecycle['evidence_no']
+        },correlation_id=ap['correlation_id'])
+        audit(conn,user['id'],'E-SIGN '+decision.upper(),'Approvals',ap['approval_no'],'',{'evidence_no':evidence['evidence_no'],'record_code':ap['record_code'],'evidence_hash':evidence['evidence_hash'],'delegation_id':delegation_id})
         module_link='commandcenter' if ap['record_type']=='alarm_shelf' else ('work' if ap['record_type']=='work_order' else ('reliability' if ap['record_type']=='rcm_strategy' else 'procurement'))
         notify(conn,'Approval decision',f"{ap['record_code']} was {target.lower()} and electronically signed",'Info',ap['requested_by'],None,module_link,ap['record_code'])
-        return {'ok':True,'status':target,'record_code':ap['record_code'],'signature_evidence':evidence}
+        return {'ok':True,'status':target,'record_code':ap['record_code'],'signature_evidence':evidence,'decision_evidence':lifecycle}
 
 @app.get('/api/approvals/{approval_id}/signature-evidence')
 def approval_signature_evidence(approval_id:int,user=Depends(current_user)):
     with db() as conn:
         ap=get_or_404(conn,'SELECT * FROM approval_requests WHERE id=?',(approval_id,),'Approval request not found')
-        visible=user['role'] in ('admin','maintenance_manager','executive') or ap['requested_by']==user['id'] or ap['assigned_user_id']==user['id'] or (ap['assigned_role'] and ap['assigned_role']==user['role']) or ap.get('decided_by')==user['id'] or _delegation_active(conn,ap,user['id'])
+        visible=user['role'] in ('admin','maintenance_manager','executive') or ap['requested_by']==user['id'] or ap['assigned_user_id']==user['id'] or (ap['assigned_role'] and ap['assigned_role']==user['role']) or ap.get('decided_by')==user['id'] or bool(active_delegation(conn,ap,user['id']))
         if not visible:raise HTTPException(403,'Approval evidence is not visible to this user')
         evidence=get_or_404(conn,'SELECT * FROM approval_signature_evidence WHERE approval_id=?',(approval_id,),'Electronic signature evidence not found')
         evidence['payload']=json.loads(evidence['payload_json'])
         evidence.pop('payload_json',None)
         return evidence
 
+@app.get('/api/approvals/{approval_id}/decision-history')
+def approval_evidence_history(approval_id:int,user=Depends(current_user)):
+    with db() as conn:
+        ap=get_or_404(conn,'SELECT * FROM approval_requests WHERE id=?',(approval_id,),'Approval request not found')
+        visible=user['role'] in ('admin','maintenance_manager','executive') or ap['requested_by']==user['id'] or ap['assigned_user_id']==user['id'] or (ap['assigned_role'] and ap['assigned_role']==user['role']) or ap.get('decided_by')==user['id'] or bool(active_delegation(conn,ap,user['id']))
+        if not visible:raise HTTPException(403,'Approval history is not visible to this user')
+        return approval_decision_history(conn,approval_id)
+
 @app.get('/api/approval-signatures/verify')
 def approval_signature_integrity(user=Depends(require_roles('admin','maintenance_manager','executive'))):
     with db() as conn:return verify_approval_signature_chain(conn)
+
+@app.get('/api/approval-evidence/verify')
+def approval_evidence_integrity(user=Depends(require_roles('admin','maintenance_manager','executive'))):
+    with db() as conn:return verify_approval_evidence_chain(conn)
 
 @app.get('/api/approval-delegations')
 def list_approval_delegations(user=Depends(current_user)):
@@ -792,17 +755,35 @@ def create_approval_delegation(body:ApprovalDelegationIn,user=Depends(current_us
     with db() as conn:
         delegate=get_or_404(conn,'SELECT u.id,u.active,u.full_name FROM users u WHERE u.id=?',(body.delegate_user_id,),'Delegate user not found')
         if not delegate['active']:raise HTTPException(409,'Delegate user is inactive')
-        cur=conn.execute('INSERT INTO approval_delegations(delegator_user_id,delegate_user_id,module,start_at,end_at,active,created_by,created_at) VALUES(?,?,?,?,?,1,?,?)',(user['id'],body.delegate_user_id,body.module or '*',start.isoformat(timespec='seconds'),end.isoformat(timespec='seconds'),user['id'],now()))
-        audit(conn,user['id'],'DELEGATE','Approvals',str(cur.lastrowid),'',{'delegate':delegate['full_name'],'module':body.module or '*','start_at':body.start_at,'end_at':body.end_at})
-        notify(conn,'Approval delegation',f"{user['full_name']} delegated approvals to you through {end.date().isoformat()}",'Info',body.delegate_user_id,None,'approvals',str(cur.lastrowid))
-        return {'id':cur.lastrowid,'active':True}
+        try:
+            d=create_delegation(
+                conn,delegator_user_id=user['id'],delegate_user_id=body.delegate_user_id,module=body.module or '*',
+                record_type=body.record_type or '*',resource_id=body.resource_id or 0,start_at=start.isoformat(timespec='seconds'),
+                end_at=end.isoformat(timespec='seconds'),created_by=user['id'],reason=body.reason or '',
+            )
+        except DelegationError as exc:
+            raise HTTPException(409,str(exc))
+        lifecycle=append_evidence_event(
+            conn,'DelegationCreated',user['id'],delegation_id=d['id'],effective_actor_user_id=user['id'],
+            resource_type=body.record_type or '*',resource_id=(body.resource_id or None),
+            details={'delegate_user_id':body.delegate_user_id,'module':body.module or '*','reason':body.reason or '',
+                     'start_at':d['start_at'],'end_at':d['end_at']},
+        )
+        audit(conn,user['id'],'DELEGATE','Approvals',str(d['id']),'',{'delegate':delegate['full_name'],'module':body.module or '*','record_type':body.record_type or '*','resource_id':body.resource_id or 0,'start_at':body.start_at,'end_at':body.end_at,'reason':body.reason or ''})
+        emit_event(conn,'approval.delegation.created','approval_delegation',d['id'],{'delegation_id':d['id'],'module':body.module or '*','record_type':body.record_type or '*','resource_id':body.resource_id or 0},correlation_id=lifecycle['correlation_id'])
+        notify(conn,'Approval delegation',f"{user['full_name']} delegated approvals to you through {end.date().isoformat()}",'Info',body.delegate_user_id,None,'approvals',str(d['id']))
+        return {'id':d['id'],'active':True,'evidence_no':lifecycle['evidence_no']}
 
 @app.patch('/api/approval-delegations/{delegation_id}/deactivate')
 def deactivate_approval_delegation(delegation_id:int,user=Depends(current_user)):
     with db() as conn:
         d=get_or_404(conn,'SELECT * FROM approval_delegations WHERE id=?',(delegation_id,),'Delegation not found')
         if user['role']!='admin' and d['delegator_user_id']!=user['id']:raise HTTPException(403,'Only the delegator or administrator can deactivate this delegation')
-        conn.execute('UPDATE approval_delegations SET active=0 WHERE id=?',(delegation_id,));audit(conn,user['id'],'DEACTIVATE DELEGATION','Approvals',str(delegation_id),1,0);return {'ok':True}
+        d=revoke_delegation(conn,delegation_id,user['id'])
+        lifecycle=append_evidence_event(conn,'DelegationRevoked',user['id'],delegation_id=delegation_id,effective_actor_user_id=d['delegator_user_id'],resource_type=d.get('record_type') or '*',resource_id=(d.get('resource_id') or None),details={'module':d.get('module') or '*','reason':d.get('reason') or ''})
+        audit(conn,user['id'],'DEACTIVATE DELEGATION','Approvals',str(delegation_id),1,0)
+        emit_event(conn,'approval.delegation.revoked','approval_delegation',delegation_id,{'delegation_id':delegation_id},correlation_id=lifecycle['correlation_id'])
+        return {'ok':True,'evidence_no':lifecycle['evidence_no']}
 
 @app.get('/api/assets/health')
 def asset_health_portfolio(site_id:Optional[int]=None,user=Depends(current_user)):
@@ -2722,6 +2703,13 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
         field_sync_applied_24h=conn.execute("SELECT COUNT(*) FROM field_sync_operations WHERE status='Applied' AND applied_at>=?",((datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds'),)).fetchone()[0]
         signed_approvals=conn.execute('SELECT COUNT(*) FROM approval_signature_evidence').fetchone()[0]
         signature_integrity=verify_approval_signature_chain(conn)
+        approval_evidence_integrity=verify_approval_evidence_chain(conn)
+        approval_requested=conn.execute('SELECT COUNT(*) FROM approval_requests').fetchone()[0]
+        approval_granted=conn.execute("SELECT COUNT(*) FROM approval_requests WHERE status='Approved'").fetchone()[0]
+        approval_rejected=conn.execute("SELECT COUNT(*) FROM approval_requests WHERE status='Rejected'").fetchone()[0]
+        approval_expired=conn.execute("SELECT COUNT(*) FROM approval_requests WHERE status='Expired'").fetchone()[0]
+        approval_delegation_active=conn.execute("SELECT COUNT(*) FROM approval_delegations WHERE active=1 AND revoked_at IS NULL AND start_at<=? AND end_at>=?",(now(),now())).fetchone()[0]
+        approval_verification_failures=0 if signature_integrity['valid'] and approval_evidence_integrity['valid'] else 1
         retention_runs_total=conn.execute('SELECT COUNT(*) FROM retention_runs').fetchone()[0]
         retention_purged_total=conn.execute('SELECT COALESCE(SUM(purged_count),0) FROM retention_run_items').fetchone()[0] or 0
         active_retention_holds=conn.execute("SELECT COUNT(*) FROM retention_holds WHERE status='Active'").fetchone()[0]
@@ -2742,7 +2730,7 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
         critical_fmea_without_rcm=conn.execute("""SELECT COUNT(*) FROM asset_fmea f WHERE f.status<>'Retired' AND f.risk_band='Critical' AND NOT EXISTS(SELECT 1 FROM rcm_strategies r WHERE r.asset_fmea_id=f.id AND r.status IN ('Approved','Active'))""").fetchone()[0]
         rcm_coverage_pct=100*float(rcm_covered)/max(int(rcm_eligible),1)
         q24=_telemetry_quality_summary(conn,24,None);bad_quality_24h=q24['bad'];duplicates_24h=conn.execute("SELECT COALESCE(SUM(duplicate_count),0) FROM telemetry_ingest_batches WHERE started_at>=?",((datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds'),)).fetchone()[0] or 0
-    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {request_stats["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_outbox_dead_lettered {outbox_dead_lettered}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}',f'euas_open_alarm_incidents {open_incidents}',f'euas_active_alarm_suppressions {active_suppressions}',f'euas_active_alarm_shelves {active_shelves}',f'euas_active_topology_links {active_topology_links}',f'euas_topology_correlated_incidents {topology_incidents}',f'euas_field_sync_pending {field_sync_pending}',f'euas_field_sync_conflicts {field_sync_conflicts}',f'euas_field_sync_applied_24h {field_sync_applied_24h}',f'euas_signed_approvals_total {signed_approvals}',f'euas_approval_signature_chain_valid {1 if signature_integrity['valid'] else 0}',f'euas_retention_runs_total {retention_runs_total}',f'euas_retention_purged_records_total {retention_purged_total}',f'euas_active_retention_holds {active_retention_holds}',f'euas_retention_run_chain_valid {1 if retention_integrity['valid'] else 0}',f'euas_permission_role_grants {permission_role_grants}',f'euas_active_permission_overrides {active_permission_overrides}',f'euas_active_permission_denies {active_permission_denies}',f'euas_active_cbm_rules {active_cbm_rules}',f'euas_open_cbm_events {open_cbm_events}',f'euas_cbm_work_orders_total {cbm_work_orders}',f'euas_active_fmea_records {active_fmea_records}',f'euas_critical_fmea_records {critical_fmea_records}',f'euas_overdue_fmea_reviews {overdue_fmea_reviews}',f'euas_active_rcm_strategies {active_rcm_strategies}',f'euas_overdue_rcm_reviews {overdue_rcm_reviews}',f'euas_rcm_strategy_coverage_pct {rcm_coverage_pct:.2f}',f'euas_critical_fmea_without_rcm {critical_fmea_without_rcm}',f'euas_bad_quality_readings_24h {bad_quality_24h}',f'euas_duplicate_telemetry_readings_24h {duplicates_24h}']
+    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {request_stats["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_outbox_dead_lettered {outbox_dead_lettered}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}',f'euas_open_alarm_incidents {open_incidents}',f'euas_active_alarm_suppressions {active_suppressions}',f'euas_active_alarm_shelves {active_shelves}',f'euas_active_topology_links {active_topology_links}',f'euas_topology_correlated_incidents {topology_incidents}',f'euas_field_sync_pending {field_sync_pending}',f'euas_field_sync_conflicts {field_sync_conflicts}',f'euas_field_sync_applied_24h {field_sync_applied_24h}',f'euas_signed_approvals_total {signed_approvals}',f'euas_approval_signature_chain_valid {1 if signature_integrity['valid'] else 0}',f'euas_approval_evidence_chain_valid {1 if approval_evidence_integrity['valid'] else 0}',f'euas_approval_requested_total {approval_requested}',f'euas_approval_granted_total {approval_granted}',f'euas_approval_rejected_total {approval_rejected}',f'euas_approval_expired_total {approval_expired}',f'euas_approval_delegation_active {approval_delegation_active}',f'euas_approval_verification_failure_total {approval_verification_failures}',f'euas_retention_runs_total {retention_runs_total}',f'euas_retention_purged_records_total {retention_purged_total}',f'euas_active_retention_holds {active_retention_holds}',f'euas_retention_run_chain_valid {1 if retention_integrity['valid'] else 0}',f'euas_permission_role_grants {permission_role_grants}',f'euas_active_permission_overrides {active_permission_overrides}',f'euas_active_permission_denies {active_permission_denies}',f'euas_active_cbm_rules {active_cbm_rules}',f'euas_open_cbm_events {open_cbm_events}',f'euas_cbm_work_orders_total {cbm_work_orders}',f'euas_active_fmea_records {active_fmea_records}',f'euas_critical_fmea_records {critical_fmea_records}',f'euas_overdue_fmea_reviews {overdue_fmea_reviews}',f'euas_active_rcm_strategies {active_rcm_strategies}',f'euas_overdue_rcm_reviews {overdue_rcm_reviews}',f'euas_rcm_strategy_coverage_pct {rcm_coverage_pct:.2f}',f'euas_critical_fmea_without_rcm {critical_fmea_without_rcm}',f'euas_bad_quality_readings_24h {bad_quality_24h}',f'euas_duplicate_telemetry_readings_24h {duplicates_24h}']
     for code,count in sorted(request_stats['status'].items()):lines.append(f'euas_http_responses_total{{status="{code}"}} {count}')
     return '\n'.join(lines)+'\n'
 

@@ -38,13 +38,22 @@ def _permission_allowed(conn, user_id: int, role_code: str, permission_code: str
     return bool(granted), 'role_grant' if granted else 'not_granted'
 
 
+def permission_allowed(conn, user_id: int, role_code: str, permission_code: str) -> bool:
+    exists = conn.execute('SELECT 1 FROM permissions WHERE code=?', (permission_code,)).fetchone()
+    if not exists:
+        return False
+    allowed, _ = _permission_allowed(conn, int(user_id), role_code, permission_code)
+    return allowed
+
+
+def user_has_permission(conn, user_id: int, permission_code: str) -> bool:
+    row = conn.execute('''SELECT u.id,r.code role FROM users u JOIN roles r ON r.id=u.role_id WHERE u.id=? AND u.active=1''', (user_id,)).fetchone()
+    return bool(row) and permission_allowed(conn, int(user_id), row['role'], permission_code)
+
+
 def has_permission(user: dict, permission_code: str) -> bool:
     with db() as conn:
-        exists = conn.execute('SELECT 1 FROM permissions WHERE code=?', (permission_code,)).fetchone()
-        if not exists:
-            return False
-        allowed, _ = _permission_allowed(conn, int(user['id']), user['role'], permission_code)
-        return allowed
+        return permission_allowed(conn, int(user['id']), user['role'], permission_code)
 
 
 def effective_permissions(user: dict) -> list[dict]:

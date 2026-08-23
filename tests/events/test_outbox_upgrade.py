@@ -2,6 +2,7 @@ import sqlite3
 
 from apps.identity import hash_password
 from core.database import runtime as database_runtime
+from core.configuration import SCHEMA_VERSION
 
 
 def test_schema20_outbox_upgrades_in_place_with_dispatch_columns(monkeypatch, tmp_path):
@@ -38,6 +39,6 @@ def test_schema20_outbox_upgrades_in_place_with_dispatch_columns(monkeypatch, tm
         assert {'current_attempt_no', 'available_at', 'correlation_id', 'lease_owner', 'lease_expires_at', 'updated_at'} <= columns
         row = conn.execute("SELECT * FROM event_outbox WHERE event_no='EVT-UPGRADE'").fetchone()
         assert row['status'] == 'Pending' and row['available_at'] == row['created_at']
-        assert conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 21
+        assert conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == SCHEMA_VERSION
         assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='event_delivery_attempts'").fetchone()[0] == 1
         assert conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'

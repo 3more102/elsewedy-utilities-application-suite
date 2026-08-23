@@ -167,6 +167,19 @@ def _ensure_schema_columns(conn):
         if 'category' not in permission_cols: conn.execute("ALTER TABLE permissions ADD COLUMN category TEXT NOT NULL DEFAULT 'General'")
         if 'risk_level' not in permission_cols: conn.execute("ALTER TABLE permissions ADD COLUMN risk_level TEXT NOT NULL DEFAULT 'Standard'")
         if 'description' not in permission_cols: conn.execute("ALTER TABLE permissions ADD COLUMN description TEXT DEFAULT ''")
+    approval_cols=_table_columns(conn,'approval_requests')
+    if approval_cols:
+        if 'request_snapshot_json' not in approval_cols: conn.execute("ALTER TABLE approval_requests ADD COLUMN request_snapshot_json TEXT NOT NULL DEFAULT ''")
+        if 'request_snapshot_hash' not in approval_cols: conn.execute("ALTER TABLE approval_requests ADD COLUMN request_snapshot_hash TEXT NOT NULL DEFAULT ''")
+        if 'request_resource_version' not in approval_cols: conn.execute("ALTER TABLE approval_requests ADD COLUMN request_resource_version TEXT NOT NULL DEFAULT ''")
+        if 'correlation_id' not in approval_cols: conn.execute("ALTER TABLE approval_requests ADD COLUMN correlation_id TEXT NOT NULL DEFAULT ''")
+    delegation_cols=_table_columns(conn,'approval_delegations')
+    if delegation_cols:
+        if 'record_type' not in delegation_cols: conn.execute("ALTER TABLE approval_delegations ADD COLUMN record_type TEXT NOT NULL DEFAULT '*'")
+        if 'resource_id' not in delegation_cols: conn.execute('ALTER TABLE approval_delegations ADD COLUMN resource_id INTEGER NOT NULL DEFAULT 0')
+        if 'reason' not in delegation_cols: conn.execute("ALTER TABLE approval_delegations ADD COLUMN reason TEXT DEFAULT ''")
+        if 'revoked_at' not in delegation_cols: conn.execute('ALTER TABLE approval_delegations ADD COLUMN revoked_at TEXT')
+        if 'revoked_by' not in delegation_cols: conn.execute('ALTER TABLE approval_delegations ADD COLUMN revoked_by INTEGER REFERENCES users(id)')
     incident_cols=_table_columns(conn,'alarm_incidents')
     if incident_cols:
         if 'root_cause_asset_id' not in incident_cols: conn.execute('ALTER TABLE alarm_incidents ADD COLUMN root_cause_asset_id INTEGER REFERENCES assets(id)')
@@ -438,7 +451,9 @@ def init_db(hash_password):
           id INTEGER PRIMARY KEY AUTOINCREMENT, approval_no TEXT UNIQUE NOT NULL, module TEXT NOT NULL, record_type TEXT NOT NULL,
           record_id INTEGER NOT NULL, record_code TEXT NOT NULL, title TEXT NOT NULL, requested_by INTEGER NOT NULL REFERENCES users(id),
           assigned_role TEXT, assigned_user_id INTEGER REFERENCES users(id), status TEXT NOT NULL DEFAULT 'Pending', requested_at TEXT NOT NULL,
-          decided_at TEXT, decided_by INTEGER REFERENCES users(id), comments TEXT DEFAULT ''
+          decided_at TEXT, decided_by INTEGER REFERENCES users(id), comments TEXT DEFAULT '',
+          request_snapshot_json TEXT NOT NULL DEFAULT '', request_snapshot_hash TEXT NOT NULL DEFAULT '',
+          request_resource_version TEXT NOT NULL DEFAULT '', correlation_id TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_approvals_queue ON approval_requests(status,assigned_role,assigned_user_id,requested_at);
         CREATE TABLE IF NOT EXISTS approval_signature_evidence(
@@ -560,10 +575,22 @@ def init_db(hash_password):
         CREATE INDEX IF NOT EXISTS idx_retention_run_items_run ON retention_run_items(run_id,data_class);
         CREATE TABLE IF NOT EXISTS approval_delegations(
           id INTEGER PRIMARY KEY AUTOINCREMENT, delegator_user_id INTEGER NOT NULL REFERENCES users(id), delegate_user_id INTEGER NOT NULL REFERENCES users(id),
-          module TEXT NOT NULL DEFAULT '*', start_at TEXT NOT NULL, end_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
-          created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
+          module TEXT NOT NULL DEFAULT '*', record_type TEXT NOT NULL DEFAULT '*', resource_id INTEGER NOT NULL DEFAULT 0,
+          start_at TEXT NOT NULL, end_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+          created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, reason TEXT DEFAULT '',
+          revoked_at TEXT, revoked_by INTEGER REFERENCES users(id)
         );
         CREATE INDEX IF NOT EXISTS idx_approval_delegations_active ON approval_delegations(delegate_user_id,active,start_at,end_at);
+        CREATE TABLE IF NOT EXISTS approval_evidence_events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, evidence_no TEXT UNIQUE NOT NULL,
+          approval_id INTEGER REFERENCES approval_requests(id), delegation_id INTEGER REFERENCES approval_delegations(id),
+          event_type TEXT NOT NULL, actor_user_id INTEGER NOT NULL REFERENCES users(id), effective_actor_user_id INTEGER NOT NULL REFERENCES users(id),
+          decision TEXT DEFAULT '', resource_type TEXT DEFAULT '', resource_id INTEGER, resource_fingerprint TEXT DEFAULT '', correlation_id TEXT NOT NULL,
+          payload_json TEXT NOT NULL, prev_hash TEXT DEFAULT '', evidence_hash TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_evidence_approval ON approval_evidence_events(approval_id,created_at,id);
+        CREATE INDEX IF NOT EXISTS idx_approval_evidence_delegation ON approval_evidence_events(delegation_id,created_at,id);
+        CREATE INDEX IF NOT EXISTS idx_approval_evidence_hash ON approval_evidence_events(evidence_hash);
         CREATE TABLE IF NOT EXISTS asset_health_snapshots(
           id INTEGER PRIMARY KEY AUTOINCREMENT, asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE, score REAL NOT NULL,
           risk_band TEXT NOT NULL, factors_json TEXT NOT NULL, calculated_at TEXT NOT NULL, calculated_by INTEGER REFERENCES users(id)
@@ -757,6 +784,7 @@ def init_db(hash_password):
         ''')
         _ensure_schema_columns(conn)
         conn.execute('CREATE INDEX IF NOT EXISTS idx_outbox_dispatch ON event_outbox(status,available_at,id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_approval_delegations_scope ON approval_delegations(delegator_user_id,delegate_user_id,module,record_type,resource_id,active)')
         conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_readings_external ON telemetry_readings(channel_id,external_id) WHERE external_id IS NOT NULL')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_wo_fmea ON work_orders(asset_fmea_id,status)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_cbm_rules_fmea ON cbm_rules(asset_fmea_id,active)')
