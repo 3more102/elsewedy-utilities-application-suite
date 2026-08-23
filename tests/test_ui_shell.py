@@ -120,6 +120,9 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert ".required-field" in productivity_css
     assert ".field-invalid" in productivity_css
     assert ".toolbar" in productivity_css
+    assert ".module-finder" in productivity_css
+    assert ".nav-section-label" in productivity_css
+    assert ".module-filter-shortcut" in productivity_css
     assert "@media(max-width:820px)" in productivity_css
     assert "@media(prefers-reduced-motion:reduce)" in productivity_css
 
@@ -128,4 +131,9 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "aria-rowcount" in productivity_js
     assert "aria-required" in productivity_js
     assert "event.ctrlKey || event.metaKey" in productivity_js
+    assert "ensureModuleFinder" in productivity_js
+    assert "decorateNavigation" in productivity_js
+    assert "applyModuleFilter" in productivity_js
+    assert "event.altKey" in productivity_js
+    assert "Assets & Maintenance" in productivity_js
     assert "MutationObserver" in productivity_js

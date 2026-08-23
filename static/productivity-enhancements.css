@@ -1,4 +1,4 @@
-/* EUAS productivity layer — dense data surfaces, forms, and daily-use ergonomics. */
+/* EUAS productivity layer — dense data surfaces, forms, navigation, and daily-use ergonomics. */
 .table-wrap{position:relative;max-width:100%;overscroll-behavior-inline:contain}
 .table-wrap[tabindex="0"]:focus-visible{outline:3px solid rgba(182,36,42,.18);outline-offset:2px}
 .table-wrap.has-horizontal-overflow:after{content:"";position:sticky;float:right;right:0;bottom:0;width:30px;height:42px;margin-top:-42px;pointer-events:none;background:linear-gradient(90deg,transparent,rgba(15,23,34,.08));opacity:1;transition:opacity .16s ease}
@@ -17,15 +17,26 @@
 .field-invalid,.field-has-error input,.field-has-error select,.field-has-error textarea{border-color:#cf4249!important;box-shadow:0 0 0 3px rgba(182,36,42,.10)!important;background:#fffafa!important}
 .form-grid{align-items:start}.form-actions{position:sticky;bottom:-22px;z-index:3;margin:8px -22px -22px;padding:14px 22px;background:rgba(255,255,255,.95);backdrop-filter:blur(12px);border-top:1px solid #e7eaf0}
 
-/* Make global-search shortcut discoverable without altering the application contract. */
 .search-wrap:after{content:"Ctrl K";position:absolute;right:10px;top:50%;transform:translateY(-50%);padding:2px 6px;border:1px solid #dfe3e8;border-radius:6px;background:#fff;color:#98a2b3;font-size:9px;font-weight:800;pointer-events:none}
 .topbar input#global-search{padding-right:54px}
+
+/* Sidebar module discovery. */
+.module-finder{position:relative;padding:8px 2px 4px}
+.module-finder input{width:100%;height:36px;padding:0 52px 0 11px;border:1px solid rgba(255,255,255,.09);border-radius:9px;background:rgba(255,255,255,.055);color:#f7f9fb;font-size:11px;outline:none}
+.module-finder input::placeholder{color:#8390a0}.module-finder input:hover{border-color:rgba(255,255,255,.16);background:rgba(255,255,255,.075)}
+.module-finder input:focus{border-color:rgba(209,75,82,.7);box-shadow:0 0 0 3px rgba(182,36,42,.16);background:rgba(255,255,255,.08)}
+.module-filter-shortcut{position:absolute;right:9px;top:18px;padding:1px 5px;border:1px solid rgba(255,255,255,.10);border-radius:5px;color:#7f8a98;font-size:8px;font-weight:800;pointer-events:none}
+.module-filter-empty{padding:7px 8px 2px;color:#98a2b3;font-size:10px}.module-filter-empty.hidden{display:none}
+.nav-section-label{padding:13px 10px 5px;color:#6f7b8b;font-size:8px;font-weight:850;letter-spacing:.12em;text-transform:uppercase;user-select:none}
+.nav-section-label:first-child{padding-top:7px}.nav-btn[hidden],.nav-section-label[hidden]{display:none!important}
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
 
 @media(max-width:820px){
   .toolbar{top:72px;padding:9px}.toolbar-left{display:grid;grid-template-columns:1fr 1fr;width:100%}.toolbar input,.toolbar select{min-width:0;width:100%}
   .data-table{min-width:720px}.table-wrap{border:1px solid #e7eaf0;border-radius:14px}
   .form-actions{bottom:-16px;margin:8px -16px -16px;padding:12px 16px}
   .search-wrap:after{display:none}.topbar input#global-search{padding-right:10px}
+  .module-finder{padding-top:10px}
 }
 @media(max-width:560px){
   .toolbar{position:static}.toolbar-left{grid-template-columns:1fr}
