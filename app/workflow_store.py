@@ -339,6 +339,57 @@ def toggle_work_task_atomic(conn, wo_id: int, task_id: int, user: dict) -> dict:
     return {'ok': True, 'status': new_status}
 
 
+def append_work_note_atomic(conn, wo_id: int, body, user: dict) -> dict:
+    """Append one work-order note without losing concurrent notes.
+
+    The historical handler read the comments thread and wrote the concatenated
+    result back unconditionally, so two simultaneous notes could overwrite each
+    other. The append is now claimed against the observed ``updated_at`` stamp
+    (the established EUAS compare-and-set pattern): a loser re-reads current
+    state client-side and retries instead of silently dropping evidence.
+    """
+    work = conn.execute(
+        'SELECT * FROM work_orders WHERE id=?', (wo_id,)
+    ).fetchone()
+    if not work:
+        raise KeyError('Work order not found')
+    work = dict(work)
+
+    entry = f"[{_application.now()}] {user['full_name']}: {body.note}"
+    new_comments = ((work['comments'] or '') + '\n' + entry).strip()
+    # The claim includes the observed thread contents, not only updated_at:
+    # that stamp has second resolution, so two concurrent appends in the same
+    # second would otherwise both satisfy an updated_at-only predicate and the
+    # loser would silently erase the winner's note.
+    changed = conn.execute(
+        '''UPDATE work_orders
+           SET comments=?,updated_at=?
+           WHERE id=? AND updated_at=? AND comments=?''',
+        (
+            new_comments,
+            _application.now(),
+            wo_id,
+            work['updated_at'],
+            work['comments'] or '',
+        ),
+    )
+    if not _rowcount_one(changed):
+        raise WorkflowTransitionConflict(
+            'Work order changed concurrently; retry appending the note'
+        )
+
+    _application.audit(
+        conn,
+        user['id'],
+        'ADD NOTE',
+        'Work Management',
+        work['wo_no'],
+        work['comments'],
+        new_comments,
+    )
+    return {'ok': True}
+
+
 def install_workflow_transition_routes() -> None:
     app = _application.app
     marker = '_euas_workflow_transition_atomicity'
@@ -349,6 +400,7 @@ def install_workflow_transition_routes() -> None:
         ('/api/work-orders/{wo_id}/transition', 'POST'),
         ('/api/dispatch/{dispatch_id}/transition', 'POST'),
         ('/api/work-orders/{wo_id}/tasks/{task_id}/toggle', 'POST'),
+        ('/api/work-orders/{wo_id}/notes', 'POST'),
     }
     app.router.routes[:] = [
         route
@@ -402,8 +454,23 @@ def install_workflow_transition_routes() -> None:
         except WorkflowTransitionConflict as exc:
             raise HTTPException(409, str(exc))
 
+    @app.post('/api/work-orders/{wo_id}/notes')
+    def add_work_note_route(
+        wo_id: int,
+        body: _application.NoteIn,
+        user=Depends(require_roles(*_application.WORK_ROLES)),
+    ):
+        try:
+            with db() as conn:
+                return append_work_note_atomic(conn, wo_id, body, user)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc).strip("'"))
+        except WorkflowTransitionConflict as exc:
+            raise HTTPException(409, str(exc))
+
     _application.transition_work = transition_work_route
     _application.transition_dispatch = transition_dispatch_route
     _application.toggle_work_task = toggle_work_task_route
+    _application.add_work_note = add_work_note_route
     app.openapi_schema = None
     setattr(app.state, marker, True)

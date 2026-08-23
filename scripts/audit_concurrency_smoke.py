@@ -9,7 +9,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.audit_store import append_audit, ensure_audit_chain_lock
-from app.database import audit_digest, db
+from app.audit_verification import verify_audit_chain_report
+from app.database import db
 from app.main import verify_audit_chain
 
 
@@ -19,32 +20,14 @@ MODULE = 'AuditConcurrencyPostgreSQL'
 
 
 def assert_linear_chain(conn) -> int:
-    rows = conn.execute(
-        '''SELECT id,user_id,action,module,record_id,old_value,new_value,
-                  created_at,prev_hash,audit_hash
-           FROM audit_logs ORDER BY id'''
-    ).fetchall()
-    previous = ''
-    for row in rows:
-        if (row['prev_hash'] or '') != previous:
-            raise RuntimeError(
-                f"audit chain fork at id={row['id']}: "
-                f"expected prev={previous!r}, got {row['prev_hash']!r}"
-            )
-        expected = audit_digest(
-            previous,
-            row['user_id'],
-            row['action'],
-            row['module'],
-            row['record_id'],
-            row['old_value'],
-            row['new_value'],
-            row['created_at'],
+    """Validate the whole chain through the shared canonical validator."""
+    report = verify_audit_chain_report(conn)
+    if not report['valid']:
+        raise RuntimeError(
+            f"audit chain invalid at id={report['first_invalid_id']} "
+            f"(checked={report['checked']}, last_good_head={report['head_hash'] or '-'})"
         )
-        if row['audit_hash'] != expected:
-            raise RuntimeError(f"audit digest mismatch at id={row['id']}")
-        previous = row['audit_hash']
-    return len(rows)
+    return report['checked']
 
 
 def run_bootstrap_race() -> None:
