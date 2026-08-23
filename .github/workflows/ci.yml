@@ -27,6 +27,7 @@ jobs:
           node --check static/app.js
           node --check static/ux-enhancements.js
           node --check static/dashboard-enhancements.js
+          node --check static/productivity-enhancements.js
           node --check static/sw.js
 
       - name: Validate web manifest JSON
