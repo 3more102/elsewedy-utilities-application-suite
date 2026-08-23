@@ -171,13 +171,15 @@
     const modules = moduleItems();
     const actions = actionItems();
     const recents = recentItems(modules);
+    const recentViews = new Set(recents.map(item => item.view));
+    const nonRecentModules = modules.filter(item => !recentViews.has(item.view));
     const ranked = [...actions, ...modules]
       .map(item => ({item, score: score(item, query)}))
       .filter(entry => entry.score > 0)
       .sort((a, b) => b.score - a.score || a.item.label.localeCompare(b.item.label))
       .map(entry => entry.item);
 
-    currentItems = query ? ranked.slice(0, 18) : [...recents, ...actions, ...modules].slice(0, 18);
+    currentItems = query ? ranked.slice(0, 18) : [...recents, ...actions, ...nonRecentModules].slice(0, 18);
     activeIndex = Math.min(activeIndex, Math.max(0, currentItems.length - 1));
 
     if (!currentItems.length) {
