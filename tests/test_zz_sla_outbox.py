@@ -72,6 +72,9 @@ def test_sla_escalation_and_durable_outbox():
         related_events=[x for x in outbox if x['aggregate_id']==wo_no]
         assert related_events and any(x['event_type'].startswith('workflow.work_management') for x in related_events)
         assert any(x['event_type'].startswith('sla.') for x in related_events)
+        # Additive per-row delivery budget annotation for operator surfaces.
+        from app import application as _application
+        assert all(x['max_attempts']==_application.OUTBOX_MAX_ATTEMPTS for x in outbox)
         retry_target=related_events[0]
         retry=client.post(f"/api/events/outbox/{retry_target['id']}/retry",headers=admin)
         assert retry.status_code==200
