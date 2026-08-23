@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 from app.production import (
+    PRODUCTION_BROWSER_HEADERS,
     PRODUCTION_ISOLATION_HEADERS,
     ProductionSecurityHeaders,
     STRICT_CONTENT_SECURITY_POLICY,
@@ -92,8 +93,12 @@ def test_production_wrapper_emits_one_year_hsts_only_for_https_scope():
     assert 'preload' not in hsts_values[0]
 
 
-def test_production_wrapper_replaces_browser_isolation_headers():
+def test_production_wrapper_replaces_browser_and_isolation_headers():
     start = _run_wrapper([
+        (b'x-content-type-options', b'legacy'),
+        (b'x-frame-options', b'SAMEORIGIN'),
+        (b'referrer-policy', b'unsafe-url'),
+        (b'permissions-policy', b'camera=(*), geolocation=(*), microphone=(*)'),
         (b'cross-origin-opener-policy', b'unsafe-none'),
         (b'cross-origin-resource-policy', b'cross-origin'),
         (b'x-permitted-cross-domain-policies', b'all'),
@@ -102,8 +107,14 @@ def test_production_wrapper_replaces_browser_isolation_headers():
         name.lower(): value
         for name, value in start['headers']
     }
+    for name, expected in PRODUCTION_BROWSER_HEADERS.items():
+        assert headers[name] == expected
     for name, expected in PRODUCTION_ISOLATION_HEADERS.items():
         assert headers[name] == expected
+    assert headers[b'x-content-type-options'] == b'nosniff'
+    assert headers[b'x-frame-options'] == b'DENY'
+    assert headers[b'referrer-policy'] == b'strict-origin-when-cross-origin'
+    assert headers[b'permissions-policy'] == b'camera=(self), geolocation=(self), microphone=()'
     assert headers[b'cross-origin-opener-policy'] == b'same-origin'
     assert headers[b'cross-origin-resource-policy'] == b'same-origin'
     assert headers[b'x-permitted-cross-domain-policies'] == b'none'
