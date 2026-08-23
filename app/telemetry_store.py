@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException
 
@@ -50,7 +50,7 @@ def _event_instant(value: str | datetime) -> datetime:
 
 
 def _is_temporally_current(captured_at: str, last_reading_at: str | None) -> bool:
-    """Only a strictly newer event-time reading may advance live state."""
+    """Only a strictly newer explicit event-time reading may advance live state."""
     if not last_reading_at:
         return True
     try:
@@ -61,31 +61,16 @@ def _is_temporally_current(captured_at: str, last_reading_at: str | None) -> boo
 
 
 def _implicit_capture_after(last_reading_at: str | None) -> str:
-    """Return a server-local microsecond marker strictly after current live state.
+    """Return the historical server-arrival marker for untimestamped telemetry.
 
-    Untimestamped telemetry historically followed arrival order. Generate its
-    event time only after the channel lock is held so concurrent legacy callers
-    are serialized by the database rather than by request-start timing. If the
-    host clock is equal to or behind the stored marker, synthesize the next
-    microsecond while retaining EUAS' historical naive-local storage format.
+    Untimestamped callers historically use ``now()`` and may therefore share a
+    second-resolution timestamp. Canonical channel locking serializes those live
+    generations, so equal implicit timestamps remain safe and preserve the
+    established storage/API contract. Strict event-time ordering applies only to
+    explicit device/client timestamps.
     """
-    candidate = datetime.now().isoformat(timespec='microseconds')
-    if not last_reading_at:
-        return candidate
-    try:
-        if _event_instant(candidate) > _event_instant(last_reading_at):
-            return candidate
-        target_utc = (
-            _event_instant(last_reading_at).replace(tzinfo=timezone.utc)
-            + timedelta(microseconds=1)
-        )
-        return (
-            target_utc.astimezone()
-            .replace(tzinfo=None)
-            .isoformat(timespec='microseconds')
-        )
-    except (TypeError, ValueError):
-        return candidate
+    del last_reading_at
+    return now()
 
 
 def _resolve_and_lock_channels(conn, channel_codes: list[str]) -> dict[str, int]:
