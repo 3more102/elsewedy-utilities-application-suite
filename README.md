@@ -15,10 +15,10 @@ EUAS is an original **suite of integrated enterprise applications** for asset ma
 The latest **verified `main` checkpoint** is:
 
 ```text
-main: 61e30e9c9d0f80c6476945a8df479dcbebbe329f
+main: 709f3b2d2a6f17ce1d3487fc9c3931874f0c2e7c
 ```
 
-That commit is the GitHub-verified merge of PR #36, **Make integration outbox delivery concurrency-safe**.
+That commit is the GitHub-verified head of main after PR #38, **Honor telemetry channel code normalization**, and includes the audit-chain verification/replay validator work.
 
 The production-hardening program completed through that checkpoint includes:
 
@@ -42,10 +42,10 @@ The production-hardening program completed through that checkpoint includes:
 The current development branch is:
 
 ```text
-dev/reorder-generation-atomicity
+oxalpha/euas-development
 ```
 
-It contains **unmerged work** to make automatic low-stock replenishment generation concurrency-safe across simultaneous automation runs. It is intentionally **not described as complete or production-verified until its exact branch head passes the full CI/security matrix and is merged**.
+It continues the production-hardening mega-wave from the verified main checkpoint (see [docs/EUAS_HARDENING_MEGA_WAVE_STATUS.md](docs/EUAS_HARDENING_MEGA_WAVE_STATUS.md)). It is intentionally **not described as complete or production-verified until its exact branch head passes the full CI/security matrix and is merged**.
 
 ---
 
