@@ -11,8 +11,8 @@ def test_protected_report_blob_layer_is_strict_loaded_and_precached():
     renderer = (ROOT / 'app' / 'report_html.py').read_text(encoding='utf-8')
 
     assert '/static/report-security.js' in html
-    assert html.index('/static/app.js') < html.index('/static/report-security.js')
-    assert html.index('/static/report-security.js') < html.index('/static/csp-action-bridge.js')
+    assert html.index('/static/app.js') < html.index('/static/csp-action-bridge.js')
+    assert html.index('/static/csp-action-bridge.js') < html.index('/static/report-security.js')
     assert "'/static/report-security.js'" in service_worker
 
     assert "contentType!=='text/html'" in report_security
