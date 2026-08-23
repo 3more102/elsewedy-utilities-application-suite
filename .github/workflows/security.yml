@@ -73,6 +73,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Validate hardened Compose profiles
+        shell: bash
+        env:
+          EUAS_POSTGRES_PASSWORD: compose-ci-postgres-secret
+          EUAS_BOOTSTRAP_ADMIN_PASSWORD: "Compose-ci-bootstrap-admin-2026!"
+          EUAS_ALLOWED_HOSTS: "localhost,127.0.0.1"
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yml config >/tmp/euas-compose-sqlite.yml
+          docker compose -f docker-compose.postgres.yml config >/tmp/euas-compose-postgres.yml
+          python - <<'PY'
+          from pathlib import Path
+          for path in ('docker-compose.yml', 'docker-compose.postgres.yml'):
+              text = Path(path).read_text(encoding='utf-8')
+              service = text.split('\n  euas:\n', 1)[1]
+              assert '    cap_drop:\n      - ALL\n' in service, path
+              assert '    security_opt:\n      - no-new-privileges:true\n' in service, path
+          print('PASS hardened EUAS Compose runtime contract')
+          PY
+
       - name: Build EUAS image
         run: docker build --pull --tag euas-security:${{ github.sha }} .
 
@@ -80,9 +100,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --detach --name euas-security-smoke --publish 8879:8000 euas-security:${{ github.sha }}
+          docker run --detach --name euas-security-smoke --cap-drop ALL --security-opt no-new-privileges:true --publish 8879:8000 euas-security:${{ github.sha }}
           cleanup() { docker logs euas-security-smoke || true; docker rm --force euas-security-smoke >/dev/null 2>&1 || true; }
           trap cleanup EXIT
+          docker inspect euas-security-smoke --format '{{json .HostConfig.CapDrop}}' | grep -q '"ALL"'
+          docker inspect euas-security-smoke --format '{{json .HostConfig.SecurityOpt}}' | grep -q 'no-new-privileges:true'
           healthy=0
           for attempt in $(seq 1 30); do
             if curl --fail --silent --show-error http://127.0.0.1:8879/api/health >/tmp/euas-health.json; then
