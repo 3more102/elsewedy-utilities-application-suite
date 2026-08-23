@@ -16,7 +16,7 @@ from apps.audit import audit, verify_audit_chain
 from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
 from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record
 from apps.maintenance import ACTION_ROLES, TRANSITIONS, DispatchError, InvalidWorkTransition, MaintenanceCommandError, WorkTransitionForbidden, backfill_work_order_slas as _backfill_work_order_slas, create_dispatch as create_dispatch_record, create_work_order as create_work_order_record, ensure_work_sla as _ensure_work_sla, mark_sla_resolution as _mark_sla_resolution, mark_sla_response as _mark_sla_response, transition_dispatch as transition_dispatch_record, transition_target, transition_work_order as transition_work_order_record, update_work_order as update_work_order_record, validate_transition_actor
-from apps.procurement import InvalidProcurementTransition, purchase_order_receive_target, requisition_target
+from apps.procurement import ProcurementCommandError, approve_requisition as approve_requisition_record, create_purchase_order as create_purchase_order_record, create_requisition as create_requisition_record, receive_purchase_order as receive_purchase_order_record, submit_requisition as submit_requisition_record
 from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction, reconcile_reserved_stock as _reconcile_reserved_stock, reservation_rows as _reservation_rows, sync_reserved_stock as _sync_reserved_stock, work_order_parts_readiness as _work_order_parts_readiness
 from apps.inspections import corrective_required, inspection_result
 from apps.hse import is_high_risk, risk_score, validate_hse_status
@@ -2079,27 +2079,19 @@ def procurement(user=Depends(current_user)):
 @app.post('/api/procurement/requisitions')
 def create_pr(body:PRIn,user=Depends(require_permission('procurement.write','admin','storekeeper','maintenance_manager','procurement','planner'))):
     with db() as conn:
-        no=next_no(conn,'purchase_requisitions','pr_no','PR-',8001);total=sum(float(x.get('quantity',0))*float(x.get('estimated_unit_cost',0)) for x in body.items);cur=conn.execute('INSERT INTO purchase_requisitions(pr_no,title,requester_id,site_id,work_order_id,project_id,status,justification,total_estimate,created_at) VALUES(?,?,?,?,?,?,\'Draft\',?,?,?)',(no,body.title,user['id'],body.site_id,body.work_order_id,body.project_id,body.justification,total,now()))
-        for x in body.items:conn.execute('INSERT INTO purchase_requisition_items(pr_id,inventory_item_id,description,quantity,estimated_unit_cost) VALUES(?,?,?,?,?)',(cur.lastrowid,x.get('inventory_item_id'),x.get('description','Item'),x.get('quantity',1),x.get('estimated_unit_cost',0)))
-        audit(conn,user['id'],'CREATE','Procurement',no,'',body.model_dump());return {'id':cur.lastrowid,'pr_no':no}
+        try:return create_requisition_record(conn,body.model_dump(),user['id'])
+        except ProcurementCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 @app.post('/api/procurement/requisitions/{pr_id}/submit')
 def submit_pr(pr_id:int,user=Depends(require_permission('procurement.write','admin','storekeeper','maintenance_manager','procurement','planner'))):
     with db() as conn:
-        pr=get_or_404(conn,'SELECT * FROM purchase_requisitions WHERE id=?',(pr_id,),'PR not found')
-        try:target=requisition_target(pr['status'],'submit')
-        except InvalidProcurementTransition:raise HTTPException(409,'Only Draft or Rejected requisitions can be submitted')
-        conn.execute("UPDATE purchase_requisitions SET status=? WHERE id=?",(target,pr_id))
-        create_approval(conn,'Procurement','purchase_requisition',pr_id,pr['pr_no'],f"Approve {pr['pr_no']} — {pr['title']}",user['id'],assigned_role='procurement')
-        workflow_event(conn,'Procurement','purchase_requisition',pr_id,pr['pr_no'],'SUBMIT',pr['status'],target,user['id'])
-        audit(conn,user['id'],'SUBMIT','Procurement',pr['pr_no'],pr['status'],target);return {'ok':True,'status':target}
+        try:return submit_requisition_record(conn,pr_id,user['id'])
+        except ProcurementCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 
 @app.post('/api/procurement/requisitions/{pr_id}/approve')
 def approve_pr(pr_id:int,user=Depends(require_permission('procurement.write',*PROC_ROLES))):
     with db() as conn:
-        pr=get_or_404(conn,'SELECT * FROM purchase_requisitions WHERE id=?',(pr_id,),'PR not found')
-        try:target=requisition_target(pr['status'],'approve')
-        except InvalidProcurementTransition:raise HTTPException(409,'Purchase requisition must be Submitted before approval')
-        conn.execute("UPDATE purchase_requisitions SET status=?,approved_at=? WHERE id=?",(target,now(),pr_id));resolve_approval(conn,'Procurement','purchase_requisition',pr_id,'approve',user['id']);workflow_event(conn,'Procurement','purchase_requisition',pr_id,pr['pr_no'],'APPROVE',pr['status'],target,user['id']);audit(conn,user['id'],'APPROVE','Procurement',pr['pr_no'],pr['status'],target);return {'ok':True}
+        try:return approve_requisition_record(conn,pr_id,user['id'])
+        except ProcurementCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 @app.post('/api/procurement/quotations')
 def create_quote(body:QuoteIn,user=Depends(require_permission('procurement.write',*PROC_ROLES))):
     with db() as conn:
@@ -2108,25 +2100,13 @@ def create_quote(body:QuoteIn,user=Depends(require_permission('procurement.write
 @app.post('/api/procurement/purchase-orders')
 def create_po(body:POIn,user=Depends(require_permission('procurement.write',*PROC_ROLES))):
     with db() as conn:
-        pr=get_or_404(conn,'SELECT * FROM purchase_requisitions WHERE id=?',(body.pr_id,),'PR not found')
-        try:ordered_status=requisition_target(pr['status'],'order')
-        except InvalidProcurementTransition:raise HTTPException(409,'Purchase requisition must be approved first')
-        no=next_no(conn,'purchase_orders','po_no','PO-',9001);cur=conn.execute('INSERT INTO purchase_orders(po_no,pr_id,vendor_id,status,order_date,expected_delivery,total_cost,work_order_id,project_id) VALUES(?,?,?,?,?,?,?,?,?)',(no,body.pr_id,body.vendor_id,ordered_status,date.today().isoformat(),body.expected_delivery,pr['total_estimate'],pr['work_order_id'],pr['project_id']));conn.execute("UPDATE purchase_requisitions SET status=? WHERE id=?",(ordered_status,body.pr_id));items=rows(conn.execute('SELECT * FROM purchase_requisition_items WHERE pr_id=?',(body.pr_id,)))
-        for x in items:conn.execute('INSERT INTO purchase_order_items(po_id,inventory_item_id,description,quantity,unit_cost) VALUES(?,?,?,?,?)',(cur.lastrowid,x['inventory_item_id'],x['description'],x['quantity'],x['estimated_unit_cost']))
-        audit(conn,user['id'],'CREATE PO','Procurement',no,'',{'pr':pr['pr_no']});return {'id':cur.lastrowid,'po_no':no}
+        try:return create_purchase_order_record(conn,body.model_dump(),user['id'])
+        except ProcurementCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 @app.post('/api/procurement/purchase-orders/{po_id}/receive')
 def receive_po(po_id:int,user=Depends(require_permission('procurement.write','admin','procurement','storekeeper'))):
     with db() as conn:
-        po=get_or_404(conn,'SELECT * FROM purchase_orders WHERE id=?',(po_id,),'PO not found')
-        try:received_status=purchase_order_receive_target(po['status'])
-        except InvalidProcurementTransition as exc:raise HTTPException(409,str(exc))
-        items=rows(conn.execute('SELECT * FROM purchase_order_items WHERE po_id=?',(po_id,)))
-        for x in items:
-            if x['inventory_item_id']:
-                item=conn.execute('SELECT * FROM inventory_items WHERE id=?',(x['inventory_item_id'],)).fetchone();conn.execute('UPDATE inventory_items SET current_stock=current_stock+? WHERE id=?',(x['quantity'],x['inventory_item_id']));conn.execute('INSERT INTO inventory_transactions(item_id,tx_type,quantity,from_warehouse_id,reference,user_id,created_at) VALUES(?,?,?,?,?,?,?)',(x['inventory_item_id'],'RECEIPT',x['quantity'],item['warehouse_id'],po['po_no'],user['id'],now()))
-        conn.execute("UPDATE purchase_orders SET status=?,actual_receipt=? WHERE id=?",(received_status,date.today().isoformat(),po_id));
-        if po['pr_id']:conn.execute("UPDATE purchase_requisitions SET status=? WHERE id=?",(received_status,po['pr_id']))
-        audit(conn,user['id'],'RECEIVE','Procurement',po['po_no'],po['status'],received_status);return {'ok':True}
+        try:return receive_purchase_order_record(conn,po_id,user['id'])
+        except ProcurementCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 
 # ---------- outages / operational availability ----------
 @app.get('/api/outages')

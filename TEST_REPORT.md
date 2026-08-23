@@ -7,7 +7,7 @@
 
 | Verification | Result |
 |---|---|
-| Integrated pytest regression suite | **PASS — 91 source definitions / 93 collected tests** |
+| Integrated pytest regression suite | **PASS — 93 source definitions / 95 collected tests** |
 | Fresh Uvicorn HTTP smoke | **PASS — version 4.9.0 / RCM read surface** |
 | Fresh SQLite initialization | **PASS — schema 22, 89 tables, 88 indexes, integrity ok** |
 | v4.8.0 → v4.9.0 SQLite schema upgrade | **PASS — 18 → 19** |
