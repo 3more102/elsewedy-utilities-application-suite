@@ -7,9 +7,9 @@
   "api_routes_under_api": 243,
   "relational_tables": 89,
   "explicit_indexes": 89,
-  "automated_tests": 107,
+  "automated_tests": 109,
   "verification": {
-    "pytest": "PASS — 107 source test definitions / 109 collected tests",
+    "pytest": "PASS — 109 source test definitions / 111 collected tests",
     "fresh_uvicorn_http_smoke": "PASS — version=4.9.0 with RCM read surface",
     "fresh_sqlite_schema": "PASS — schema 23, 89 tables, 89 indexes, integrity ok",
     "python_compile": "PASS",

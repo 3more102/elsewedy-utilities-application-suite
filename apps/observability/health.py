@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from core.configuration import APP_NAME, APP_VERSION, AUTOMATION_INTERVAL_MINUTES, DB_BACKEND, SCHEMA_VERSION
 from core.database import db
+from .jobs import job_metrics_snapshot
 
 
 def health_snapshot() -> dict:
@@ -27,9 +28,10 @@ def readiness_snapshot() -> dict:
             'users': conn.execute('SELECT COUNT(*) FROM users').fetchone()[0],
             'assets': conn.execute('SELECT COUNT(*) FROM assets').fetchone()[0],
         }
+        jobs = job_metrics_snapshot(conn)
     return {
         'status': 'ready',
         'database_backend': DB_BACKEND,
         'schema_version': SCHEMA_VERSION,
-        'checks': counts,
+        'checks': {**counts, 'jobs': jobs},
     }
