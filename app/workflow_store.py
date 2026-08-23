@@ -18,6 +18,46 @@ def _rowcount_one(cursor) -> bool:
     return int(cursor.rowcount or 0) == 1
 
 
+DISPATCH_WORK_STATES = {
+    'accept': ('Assigned', 'In Progress'),
+    'enroute': ('Assigned', 'In Progress'),
+    'arrive': ('Assigned', 'In Progress'),
+    # Field completion may legitimately trail direct work completion/closure;
+    # allow it to settle the dispatch record without reopening the work order.
+    'complete': ('In Progress', 'Completed', 'Closed'),
+}
+
+
+def _guard_dispatch_work_state(conn, dispatch: dict, action: str) -> None:
+    """Lock and validate the linked work state for one dispatch transition.
+
+    The dispatch row is claimed before this helper runs. The no-op guarded work
+    update therefore preserves the established dispatch -> work lock order while
+    making the linked work state part of the same transaction. If another route
+    completed/closed the work first, this transition rolls back its dispatch
+    claim instead of advancing stale field-service state.
+    """
+    allowed = DISPATCH_WORK_STATES.get(action)
+    if not allowed:
+        return
+    placeholders = ','.join('?' for _ in allowed)
+    changed = conn.execute(
+        f'''UPDATE work_orders SET status=status
+            WHERE id=? AND status IN ({placeholders})''',
+        (dispatch['work_order_id'], *allowed),
+    )
+    if _rowcount_one(changed):
+        return
+    current = conn.execute(
+        'SELECT status FROM work_orders WHERE id=?',
+        (dispatch['work_order_id'],),
+    ).fetchone()
+    status = current['status'] if current else 'missing'
+    raise WorkflowTransitionConflict(
+        f'Dispatch action {action} is not valid while work order is {status}'
+    )
+
+
 def transition_work_atomic(conn, wo_id: int, body, user: dict) -> dict:
     work = conn.execute('SELECT * FROM work_orders WHERE id=?', (wo_id,)).fetchone()
     if not work:
@@ -206,6 +246,10 @@ def transition_dispatch_atomic(conn, dispatch_id: int, body, user: dict) -> dict
         raise WorkflowTransitionConflict(
             f'Concurrent dispatch transition won; current status is {status}'
         )
+
+    # Make linked work state part of the same transactional claim. The helper
+    # locks work after dispatch, matching the established cross-entity lock order.
+    _guard_dispatch_work_state(conn, dispatch, action)
 
     if action == 'arrive':
         work_changed = conn.execute(
