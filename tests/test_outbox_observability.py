@@ -18,6 +18,22 @@ def _bearer(token: str) -> dict[str, str]:
     return {'Authorization': f'Bearer {token}'}
 
 
+def _metric_value(text: str, name: str) -> float:
+    prefix = name + ' '
+    matches = [line for line in text.splitlines() if line.startswith(prefix)]
+    assert len(matches) == 1, (name, matches)
+    return float(matches[0].split(' ', 1)[1])
+
+
+def _admin_token(client: TestClient) -> str:
+    login = client.post(
+        '/api/auth/login',
+        json={'username': 'omar', 'password': 'EUAS@2026'},
+    )
+    assert login.status_code == 200, login.text
+    return login.json()['token']
+
+
 def _seed(
     conn,
     suffix: str,
@@ -95,13 +111,7 @@ def test_operational_snapshot_classifies_backlog_without_payloads():
 
 def test_outbox_status_endpoint_is_available_to_admin_and_payload_free():
     with TestClient(app) as client:
-        login = client.post(
-            '/api/auth/login',
-            json={'username': 'omar', 'password': 'EUAS@2026'},
-        )
-        assert login.status_code == 200, login.text
-        token = login.json()['token']
-
+        token = _admin_token(client)
         response = client.get('/api/events/outbox/status', headers=_bearer(token))
         assert response.status_code == 200, response.text
         body = response.json()
@@ -160,3 +170,47 @@ def test_outbox_status_preserves_operator_role_ceiling():
             headers=_bearer(login.json()['token']),
         )
         assert response.status_code == 403
+
+
+def test_metrics_exposes_snapshot_consistent_outbox_lease_gauges():
+    with TestClient(app) as client:
+        token = _admin_token(client)
+        with db() as conn:
+            snapshot = outbox_operational_snapshot(conn)
+
+        response = client.get('/api/metrics', headers=_bearer(token))
+        assert response.status_code == 200, response.text
+        text = response.text
+        queue = snapshot['queue']
+        assert _metric_value(text, 'euas_outbox_retryable') == queue['retryable']
+        assert _metric_value(text, 'euas_outbox_queued') == queue['queued']
+        assert _metric_value(text, 'euas_outbox_failed_retryable') == queue['failed_retryable']
+        assert _metric_value(text, 'euas_outbox_active_leases') == queue['active_leases']
+        assert _metric_value(text, 'euas_outbox_stale_leases') == queue['stale_leases']
+        assert _metric_value(text, 'euas_outbox_unresolved') == queue['unresolved']
+        expected_age = float(snapshot['oldest_retryable_age_seconds'] or 0)
+        observed_age = _metric_value(text, 'euas_outbox_oldest_retryable_age_seconds')
+        assert observed_age >= expected_age
+        assert observed_age - expected_age <= 5
+
+
+def test_metrics_preserves_existing_outbox_gauges_without_duplicates():
+    with TestClient(app) as client:
+        token = _admin_token(client)
+        response = client.get('/api/metrics', headers=_bearer(token))
+        assert response.status_code == 200, response.text
+        text = response.text
+
+        # Existing gauges remain present while each new gauge is emitted once.
+        assert len([x for x in text.splitlines() if x.startswith('euas_outbox_pending ')]) == 1
+        assert len([x for x in text.splitlines() if x.startswith('euas_outbox_attempt_exhausted ')]) == 1
+        for name in (
+            'euas_outbox_retryable',
+            'euas_outbox_queued',
+            'euas_outbox_failed_retryable',
+            'euas_outbox_active_leases',
+            'euas_outbox_stale_leases',
+            'euas_outbox_unresolved',
+            'euas_outbox_oldest_retryable_age_seconds',
+        ):
+            _metric_value(text, name)

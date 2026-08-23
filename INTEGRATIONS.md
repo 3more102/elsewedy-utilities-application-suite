@@ -77,6 +77,20 @@ Receivers should compare signatures in constant time and reject replayed event I
 
 The status endpoint is read-only and is limited to the existing observability operator ceiling (`admin`, `maintenance_manager`, `executive`) plus the database-backed `observability.metrics.read` capability.
 
+## Outbox metrics
+
+`GET /api/metrics` preserves the existing `euas_outbox_pending` and `euas_outbox_attempt_exhausted` gauges and adds the same lease/backlog model used by the status endpoint:
+
+- `euas_outbox_retryable`
+- `euas_outbox_queued`
+- `euas_outbox_failed_retryable`
+- `euas_outbox_active_leases`
+- `euas_outbox_stale_leases`
+- `euas_outbox_unresolved`
+- `euas_outbox_oldest_retryable_age_seconds`
+
+These gauges contain counts and age only; event payloads and delivery error text are not exported.
+
 ## Current event families
 
 - `workflow.work_management.*`

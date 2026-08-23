@@ -13,6 +13,16 @@ from .outbox_store import _lease_cutoff
 
 OUTBOX_STATUS_ROLES = ('admin', 'maintenance_manager', 'executive')
 OUTBOX_STATUS_PERMISSION = 'observability.metrics.read'
+_legacy_metrics = _application.metrics
+_OUTBOX_METRIC_PREFIXES = (
+    'euas_outbox_retryable ',
+    'euas_outbox_queued ',
+    'euas_outbox_failed_retryable ',
+    'euas_outbox_active_leases ',
+    'euas_outbox_stale_leases ',
+    'euas_outbox_unresolved ',
+    'euas_outbox_oldest_retryable_age_seconds ',
+)
 
 
 def _age_seconds(created_at: str | None, as_of: str) -> int | None:
@@ -113,12 +123,45 @@ def outbox_operational_snapshot(conn) -> dict:
     }
 
 
+def metrics_with_outbox_observability(user) -> str:
+    """Append lease/backlog gauges to the established Prometheus text surface."""
+    base = str(_legacy_metrics(user))
+    with db() as conn:
+        snapshot = outbox_operational_snapshot(conn)
+
+    lines = [
+        line
+        for line in base.splitlines()
+        if not line.startswith(_OUTBOX_METRIC_PREFIXES)
+    ]
+    queue = snapshot['queue']
+    oldest_age = int(snapshot['oldest_retryable_age_seconds'] or 0)
+    lines.extend(
+        [
+            f"euas_outbox_retryable {queue['retryable']}",
+            f"euas_outbox_queued {queue['queued']}",
+            f"euas_outbox_failed_retryable {queue['failed_retryable']}",
+            f"euas_outbox_active_leases {queue['active_leases']}",
+            f"euas_outbox_stale_leases {queue['stale_leases']}",
+            f"euas_outbox_unresolved {queue['unresolved']}",
+            f'euas_outbox_oldest_retryable_age_seconds {oldest_age}',
+        ]
+    )
+    return '\n'.join(lines) + '\n'
+
+
 def install_outbox_observability() -> None:
-    """Install a payload-free, capability-narrowed operator status endpoint."""
+    """Install payload-free operator status and metrics augmentation."""
     app = _application.app
     marker = '_euas_outbox_observability'
     if getattr(app.state, marker, False):
         return
+
+    # app.main imports the production extension composition before capturing its
+    # legacy metrics callable. Replacing this application global here makes the
+    # hardened /api/metrics route wrap this augmentation without duplicating or
+    # rewriting the security/session hardening in app.main.
+    _application.metrics = metrics_with_outbox_observability
 
     path = '/api/events/outbox/status'
     app.router.routes[:] = [
