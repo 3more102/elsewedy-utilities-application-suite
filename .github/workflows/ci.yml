@@ -113,6 +113,9 @@ jobs:
       - name: Run PostgreSQL workflow concurrency smoke
         run: python scripts/workflow_concurrency_smoke.py
 
+      - name: Run PostgreSQL dispatch/work-state concurrency smoke
+        run: python scripts/dispatch_work_state_concurrency_smoke.py
+
       - name: Run PostgreSQL dispatch assignment concurrency smoke
         run: python scripts/dispatch_assignment_concurrency_smoke.py
 
