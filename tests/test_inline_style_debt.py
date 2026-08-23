@@ -8,7 +8,7 @@ APP_JS = STATIC / 'app.js'
 INDEX = STATIC / 'index.html'
 STYLES_CSS = STATIC / 'styles.css'
 
-STYLE_ATTRIBUTE = re.compile(r'\bstyle\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
+STYLE_ATTRIBUTE = re.compile(r'(?<![\w.-])style\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
 DIRECT_STYLE_API = re.compile(
     r'(?:'
     r'(?:\.\s*style\b|\[\s*["\']style["\']\s*\])\s*(?:=|\.|\[)'
@@ -38,6 +38,12 @@ def _allowed_app_style(value: str) -> bool:
 
 
 def test_inline_style_debt_is_confined_to_known_app_renderer_patterns():
+    # Pin detector semantics: match genuine inline style attributes while not
+    # confusing the stylesheet-backed data-csp-style migration hooks for debt.
+    assert STYLE_ATTRIBUTE.findall('<div style="margin-top:14px">') == ['margin-top:14px']
+    assert not STYLE_ATTRIBUTE.findall('<div data-csp-style="mt14">')
+    assert not STYLE_ATTRIBUTE.findall('<div data-style="mt14">')
+
     assert not STYLE_ATTRIBUTE.findall(INDEX.read_text(encoding='utf-8'))
 
     app_source = APP_JS.read_text(encoding='utf-8')
