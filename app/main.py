@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from .config import APP_NAME, APP_VERSION, STATIC_DIR, UPLOAD_DIR, SESSION_HOURS, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, ALLOWED_DOC_SUFFIXES, DB_BACKEND, DB_PATH, SCHEMA_VERSION, AUTOMATION_INTERVAL_MINUTES, EVENT_WEBHOOK_URL, EVENT_WEBHOOK_SECRET, OUTBOX_MAX_ATTEMPTS
 from .database import db, init_db, now
 from apps.audit import audit, verify_audit_chain
+from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
 from .auth import hash_password, verify_password, current_user, require_roles, require_permission, effective_permissions, has_permission
 
 @asynccontextmanager
@@ -355,11 +356,6 @@ def _site_reliability_rows(conn, period_days:int=365):
 def notify(conn,title,message,severity='Info',user_id=None,role_code=None,module='',record_id=''):
     conn.execute('INSERT INTO notifications(user_id,role_code,title,message,severity,link_module,link_id,created_at) VALUES(?,?,?,?,?,?,?,?)',(user_id,role_code,title,message,severity,module,record_id,now()))
 
-def workflow_event(conn,module,record_type,record_id,record_code,event,from_status,to_status,actor_id,notes=''):
-    conn.execute('INSERT INTO workflow_events(module,record_type,record_id,record_code,event,from_status,to_status,actor_id,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(module,record_type,record_id,record_code,event,from_status or '',to_status or '',actor_id,notes or '',now()))
-    event_name='workflow.'+module.lower().replace(' ','_')+'.'+event.lower().replace(' ','_')
-    emit_event(conn,event_name,record_type,record_code,{'record_id':record_id,'record_code':record_code,'from_status':from_status or '', 'to_status':to_status or '', 'actor_id':actor_id,'notes':notes or ''})
-
 def create_approval(conn,module,record_type,record_id,record_code,title,requested_by,assigned_role=None,assigned_user_id=None):
     existing=conn.execute("SELECT * FROM approval_requests WHERE module=? AND record_type=? AND record_id=? AND status='Pending'",(module,record_type,record_id)).fetchone()
     if existing:return dict(existing)
@@ -463,11 +459,6 @@ def user_id_by_username(conn, username):
 def _dt(value):
     if isinstance(value,datetime): return value
     return datetime.fromisoformat(str(value))
-
-def emit_event(conn,event_type:str,aggregate_type:str,aggregate_id,payload:dict):
-    event_no='EVT-'+uuid.uuid4().hex[:16].upper()
-    cur=conn.execute("INSERT INTO event_outbox(event_no,event_type,aggregate_type,aggregate_id,payload_json,status,created_at) VALUES(?,?,?,?,?,'Pending',?)",(event_no,event_type,aggregate_type,str(aggregate_id),json.dumps(payload,ensure_ascii=False,default=str),now()))
-    return {'id':cur.lastrowid,'event_no':event_no}
 
 def _channel_site(conn, asset_id:int):
     r=conn.execute('SELECT s.id site_id,s.site_code,s.name site_name FROM assets a LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE a.id=?',(asset_id,)).fetchone()
@@ -967,35 +958,15 @@ def _run_sla_scan(conn,actor_id:int,target:date):
     return {'response_breaches':response_breaches,'resolution_breaches':resolution_breaches}
 
 def _process_outbox(conn):
-    # Normalize legacy exhausted rows first. Earlier builds left them permanently
-    # in Failed because the retry query excludes attempts >= max attempts.
-    terminal_at=now()
-    dead_lettered=conn.execute(
-        "UPDATE event_outbox SET status='DeadLetter',processed_at=COALESCE(processed_at,?) "
-        "WHERE status='Failed' AND attempts>=?",
-        (terminal_at,OUTBOX_MAX_ATTEMPTS),
-    ).rowcount
-    items=rows(conn.execute("SELECT * FROM event_outbox WHERE status IN ('Pending','Failed') AND attempts<? ORDER BY id LIMIT 100",(OUTBOX_MAX_ATTEMPTS,)))
-    delivered=failed=skipped=0
-    for item in items:
-        attempts=item['attempts']+1
-        if not EVENT_WEBHOOK_URL:
-            conn.execute("UPDATE event_outbox SET status='Skipped',attempts=?,processed_at=?,last_error='Webhook not configured' WHERE id=?",(attempts,now(),item['id']));skipped+=1;continue
-        body=json.dumps({'event_no':item['event_no'],'event_type':item['event_type'],'aggregate_type':item['aggregate_type'],'aggregate_id':item['aggregate_id'],'payload':json.loads(item['payload_json']),'created_at':item['created_at']},ensure_ascii=False).encode()
-        headers={'Content-Type':'application/json','User-Agent':'EUAS/'+APP_VERSION,'X-EUAS-Event':item['event_type'],'X-EUAS-Event-ID':item['event_no']}
-        if EVENT_WEBHOOK_SECRET: headers['X-EUAS-Signature']='sha256='+hmac.new(EVENT_WEBHOOK_SECRET.encode(),body,hashlib.sha256).hexdigest()
-        try:
-            req=urllib_request.Request(EVENT_WEBHOOK_URL,data=body,headers=headers,method='POST')
-            with urllib_request.urlopen(req,timeout=5) as resp:
-                if not 200<=resp.status<300: raise RuntimeError(f'Webhook HTTP {resp.status}')
-            conn.execute("UPDATE event_outbox SET status='Delivered',attempts=?,processed_at=?,last_error='' WHERE id=?",(attempts,now(),item['id']));delivered+=1
-        except Exception as exc:
-            error=str(exc)[:500]
-            if attempts>=OUTBOX_MAX_ATTEMPTS:
-                conn.execute("UPDATE event_outbox SET status='DeadLetter',attempts=?,processed_at=?,last_error=? WHERE id=?",(attempts,now(),error,item['id']));dead_lettered+=1
-            else:
-                conn.execute("UPDATE event_outbox SET status='Failed',attempts=?,processed_at=NULL,last_error=? WHERE id=?",(attempts,error,item['id']));failed+=1
-    return {'delivered':delivered,'failed':failed,'dead_lettered':dead_lettered,'skipped':skipped,'processed':delivered+failed+dead_lettered+skipped}
+    return process_outbox(
+        conn,
+        webhook_url=EVENT_WEBHOOK_URL,
+        webhook_secret=EVENT_WEBHOOK_SECRET,
+        max_attempts=OUTBOX_MAX_ATTEMPTS,
+        app_version=APP_VERSION,
+        urlopen=urllib_request.urlopen,
+        request_factory=urllib_request.Request,
+    )
 
 def notify_once(conn,title,message,severity='Info',user_id=None,role_code=None,module='',record_id=''):
     existing=conn.execute('''SELECT id FROM notifications WHERE title=? AND link_module=? AND link_id=? AND is_read=0
@@ -3441,8 +3412,8 @@ def outbox_list(status:str='',limit:int=Query(100,ge=1,le=500),user=Depends(requ
 @app.post('/api/events/outbox/{event_id}/retry')
 def retry_outbox_event(event_id:int,user=Depends(require_permission('automation.run','admin','maintenance_manager'))):
     with db() as conn:
-        event=get_or_404(conn,'SELECT * FROM event_outbox WHERE id=?',(event_id,),'Outbox event not found')
-        conn.execute("UPDATE event_outbox SET status='Pending',attempts=0,processed_at=NULL,last_error='' WHERE id=?",(event_id,))
+        event=rearm_outbox_event(conn,event_id)
+        if not event:raise HTTPException(404,'Outbox event not found')
         audit(conn,user['id'],'RETRY','Integration Events',event['event_no'],event['status'],'Pending')
         return {'ok':True,'event_no':event['event_no']}
 
