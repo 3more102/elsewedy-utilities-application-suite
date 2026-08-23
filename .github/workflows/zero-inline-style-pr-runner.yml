@@ -1,0 +1,50 @@
+name: Run zero-inline-style refactor
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    if: github.head_ref == 'oxalpha/euas-zero-inline-style-csp'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: oxalpha/euas-zero-inline-style-csp
+          fetch-depth: 0
+
+      - name: Extract staged refactor
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/zero-inline-style-refactor.yml').read_text(encoding='utf-8')
+          marker = "          python - <<'PY'\n"
+          start = source.index(marker) + len(marker)
+          end = source.index("\n          PY", start)
+          block = source[start:end]
+          lines = [line[10:] if line.startswith('          ') else line for line in block.splitlines()]
+          Path('/tmp/euas_zero_inline_refactor.py').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PY
+          python /tmp/euas_zero_inline_refactor.py
+          node --check static/app.js
+          python -m compileall -q app scripts tests
+          pytest -q tests/test_inline_style_debt.py tests/test_production_csp.py
+
+      - name: Commit transformed implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/application.py app/production.py scripts/http_ui_smoke.py static/app.js static/styles.css static/report.css tests/test_inline_style_debt.py tests/test_production_csp.py
+          git diff --cached --quiet && { echo 'zero-inline-style transformation produced no changes' >&2; exit 1; }
+          git commit -m 'feat(csp): eliminate production inline styles'
+          git push origin HEAD:oxalpha/euas-zero-inline-style-csp
