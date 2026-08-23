@@ -10,6 +10,7 @@ const ASSETS=[
   '/static/command-palette.css',
   '/static/shortcut-center.css',
   '/static/app.js',
+  '/static/report-security.js',
   '/static/csp-action-bridge.js',
   '/static/ux-enhancements.js',
   '/static/dashboard-enhancements.js',
