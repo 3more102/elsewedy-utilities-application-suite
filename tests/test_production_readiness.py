@@ -53,6 +53,7 @@ def test_database_checks_validate_audit_chain():
     assert state['critical_tables'] == 'PASS'
     assert state['seed_integrity'] == 'PASS'
     assert state['schema_migrations'] == 'PASS'
+    assert state['default_credentials'] in {'PASS', 'WARN'}
     assert state['audit_chain_integrity'] == 'PASS'
 
 
@@ -63,6 +64,7 @@ def test_tampered_audit_chain_fails_deployment_preflight():
     # Ensure schema/lock bootstrap has run even when this module executes alone.
     first = statuses(run_database_checks())
     assert first['schema_migrations'] == 'PASS'
+    assert first['default_credentials'] in {'PASS', 'WARN'}
     assert first['audit_chain_integrity'] == 'PASS'
     with db() as conn:
         ensure_audit_chain_lock(conn)
