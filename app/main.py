@@ -15,7 +15,7 @@ from .database import db, init_db, now
 from apps.audit import audit, verify_audit_chain
 from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
-from .auth import require_roles, require_permission, effective_permissions, has_permission
+from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
