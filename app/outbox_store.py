@@ -4,12 +4,14 @@ import hashlib
 import hmac
 import json
 import sys
+from datetime import datetime, timedelta
 
 from fastapi import Depends, HTTPException
 
 from . import application as _application
 from .audit_store import append_audit
 from .auth import require_roles
+from .config import OUTBOX_LEASE_SECONDS
 from .database import db, now
 
 
@@ -21,27 +23,85 @@ def _rowcount_one(cursor) -> bool:
     return int(cursor.rowcount or 0) == 1
 
 
-def _claim_delivery(conn, snapshot: dict) -> dict | None:
-    """Claim one exact outbox generation before any external side effect.
-
-    The selected status+attempt pair is part of the claim. A concurrent worker
-    that selected the same stale row blocks on PostgreSQL and then fails the
-    predicate after the first worker commits, including when that first attempt
-    failed and advanced the attempt generation.
-    """
-    claimed = conn.execute(
-        '''UPDATE event_outbox
-           SET attempts=attempts+1
-           WHERE id=? AND status=? AND attempts=? AND attempts<?''',
-        (
-            snapshot['id'],
-            snapshot['status'],
-            snapshot['attempts'],
-            _application.OUTBOX_MAX_ATTEMPTS,
-        ),
+def _lease_cutoff() -> str:
+    return (datetime.now() - timedelta(seconds=OUTBOX_LEASE_SECONDS)).isoformat(
+        timespec='seconds'
     )
+
+
+def _lease_is_active(row: dict) -> bool:
+    stamp = row.get('processed_at')
+    return bool(stamp and str(stamp) > _lease_cutoff())
+
+
+def _claim_delivery(conn, snapshot: dict) -> dict | None:
+    """Durably lease one exact outbox generation before outbound I/O.
+
+    ``attempts`` is the generation fence and ``processed_at`` is the lease token
+    while a Pending event is in flight. The claim is committed before the
+    network call so no database row lock is held across webhook latency.
+
+    A stale lease may be reclaimed after ``OUTBOX_LEASE_SECONDS``. Reclaiming
+    increments the generation; any older sender can still have produced the
+    external side effect (at-least-once delivery), but its final database write
+    is fenced out by the generation+lease predicate. Receivers continue to use
+    the stable X-EUAS-Event-ID for deduplication.
+    """
+    status = str(snapshot.get('status') or '')
+    if status not in ('Pending', 'Failed'):
+        return None
+
+    previous_lease = snapshot.get('processed_at')
+    if status == 'Pending' and previous_lease and _lease_is_active(snapshot):
+        return None
+
+    claim_stamp = now()
+    if status == 'Pending' and previous_lease is None:
+        claimed = conn.execute(
+            '''UPDATE event_outbox
+               SET attempts=attempts+1,processed_at=?,last_error=''
+               WHERE id=? AND status='Pending' AND attempts=?
+                 AND processed_at IS NULL AND attempts<?''',
+            (
+                claim_stamp,
+                snapshot['id'],
+                snapshot['attempts'],
+                _application.OUTBOX_MAX_ATTEMPTS,
+            ),
+        )
+    elif status == 'Pending':
+        claimed = conn.execute(
+            '''UPDATE event_outbox
+               SET attempts=attempts+1,processed_at=?,last_error=''
+               WHERE id=? AND status='Pending' AND attempts=?
+                 AND processed_at=? AND attempts<?''',
+            (
+                claim_stamp,
+                snapshot['id'],
+                snapshot['attempts'],
+                previous_lease,
+                _application.OUTBOX_MAX_ATTEMPTS,
+            ),
+        )
+    else:
+        claimed = conn.execute(
+            '''UPDATE event_outbox
+               SET status='Pending',attempts=attempts+1,processed_at=?,last_error=''
+               WHERE id=? AND status='Failed' AND attempts=? AND attempts<?''',
+            (
+                claim_stamp,
+                snapshot['id'],
+                snapshot['attempts'],
+                _application.OUTBOX_MAX_ATTEMPTS,
+            ),
+        )
+
     if not _rowcount_one(claimed):
         return None
+
+    # Persist the lease before any external side effect. This is the key
+    # difference from the old row-lock-across-network implementation.
+    conn.commit()
     row = conn.execute(
         'SELECT * FROM event_outbox WHERE id=?',
         (snapshot['id'],),
@@ -49,24 +109,60 @@ def _claim_delivery(conn, snapshot: dict) -> dict | None:
     return dict(row) if row else None
 
 
+def _finalize_claim(
+    conn,
+    item: dict,
+    *,
+    status: str,
+    processed_at: str | None,
+    last_error: str,
+) -> bool:
+    """Finalize only the exact generation+lease owned by this sender."""
+    changed = conn.execute(
+        '''UPDATE event_outbox
+           SET status=?,processed_at=?,last_error=?
+           WHERE id=? AND status='Pending' AND attempts=? AND processed_at=?''',
+        (
+            status,
+            processed_at,
+            last_error,
+            item['id'],
+            item['attempts'],
+            item['processed_at'],
+        ),
+    )
+    if not _rowcount_one(changed):
+        conn.rollback()
+        return False
+    conn.commit()
+    return True
+
+
 def process_outbox_atomic(conn) -> dict:
-    """Deliver eligible committed outbox events with one sender per generation.
+    """Deliver eligible committed outbox events with durable leased claims.
 
     Callers must enter this after the business transaction that created events
     has committed. The automation wrapper below enforces that boundary.
 
-    Concurrent duplicate sends are prevented, but crash semantics remain
-    intentionally at-least-once: if the process dies after the remote endpoint
-    accepts the POST but before delivery status commits, the stable
-    X-EUAS-Event-ID is the receiver-side deduplication key.
+    Claims are committed before network I/O, so workers do not hold database
+    locks for the webhook duration. Crash semantics remain intentionally
+    at-least-once: after a stale lease is reclaimed, the stable X-EUAS-Event-ID
+    remains the receiver-side deduplication key.
     """
+    cutoff = _lease_cutoff()
     items = [
         dict(row)
         for row in conn.execute(
             '''SELECT * FROM event_outbox
-               WHERE status IN ('Pending','Failed') AND attempts<?
+               WHERE attempts<? AND (
+                 status='Failed'
+                 OR (
+                   status='Pending'
+                   AND (processed_at IS NULL OR processed_at<=?)
+                 )
+               )
                ORDER BY id LIMIT 100''',
-            (_application.OUTBOX_MAX_ATTEMPTS,),
+            (_application.OUTBOX_MAX_ATTEMPTS, cutoff),
         ).fetchall()
     ]
     delivered = failed = skipped = 0
@@ -76,15 +172,15 @@ def process_outbox_atomic(conn) -> dict:
         if item is None:
             continue
 
-        attempts = int(item['attempts'])
         if not _application.EVENT_WEBHOOK_URL:
-            conn.execute(
-                '''UPDATE event_outbox
-                   SET status='Skipped',processed_at=?,last_error='Webhook not configured'
-                   WHERE id=? AND attempts=?''',
-                (now(), item['id'], attempts),
-            )
-            skipped += 1
+            if _finalize_claim(
+                conn,
+                item,
+                status='Skipped',
+                processed_at=now(),
+                last_error='Webhook not configured',
+            ):
+                skipped += 1
             continue
 
         try:
@@ -121,21 +217,23 @@ def process_outbox_atomic(conn) -> dict:
             with _application.urllib_request.urlopen(request, timeout=5) as response:
                 if not 200 <= response.status < 300:
                     raise RuntimeError(f'Webhook HTTP {response.status}')
-            conn.execute(
-                '''UPDATE event_outbox
-                   SET status='Delivered',processed_at=?,last_error=''
-                   WHERE id=? AND attempts=?''',
-                (now(), item['id'], attempts),
-            )
-            delivered += 1
+            if _finalize_claim(
+                conn,
+                item,
+                status='Delivered',
+                processed_at=now(),
+                last_error='',
+            ):
+                delivered += 1
         except Exception as exc:
-            conn.execute(
-                '''UPDATE event_outbox
-                   SET status='Failed',processed_at=NULL,last_error=?
-                   WHERE id=? AND attempts=?''',
-                (str(exc)[:500], item['id'], attempts),
-            )
-            failed += 1
+            if _finalize_claim(
+                conn,
+                item,
+                status='Failed',
+                processed_at=None,
+                last_error=str(exc)[:500],
+            ):
+                failed += 1
 
     return {'delivered': delivered, 'failed': failed, 'skipped': skipped}
 
@@ -187,23 +285,21 @@ def execute_automation_postcommit(
             '',
             outbox,
         )
-        # Persist delivery attempts/status independently from the already
-        # committed business payload. The enclosing db() context may commit
-        # again; that is harmless for both adapters.
         conn.commit()
         result = dict(result)
         result['summary'] = summary
     except Exception:
         # A processor/database failure must never retroactively mark committed
-        # business automation as failed. Roll back only the post-commit delivery
-        # transaction; eligible events remain queued for a later attempt.
+        # business automation as failed. Roll back only post-commit metadata;
+        # durable outbox claims/finalizations already committed by the processor
+        # remain correct and stale claims can be reclaimed by their lease.
         conn.rollback()
         _application.logger.exception('EUAS post-commit outbox delivery failed')
     return result
 
 
 def retry_outbox_event_atomic(conn, event_id: int, user: dict) -> dict:
-    """Requeue one stable event generation without racing an in-flight sender."""
+    """Requeue one stable event generation without racing an active lease."""
     initial_row = conn.execute(
         'SELECT * FROM event_outbox WHERE id=?',
         (event_id,),
@@ -212,9 +308,8 @@ def retry_outbox_event_atomic(conn, event_id: int, user: dict) -> dict:
         raise KeyError('Outbox event not found')
     initial = dict(initial_row)
 
-    # Obtain the same row lock used by delivery mutation. If a sender is already
-    # in flight this waits for it; afterwards generation comparison below makes
-    # the stale retry a no-op instead of re-queuing a just-delivered event.
+    # Serialize competing operator retries and any claim that is still in its
+    # short database mutation phase. Network I/O holds no row lock.
     locked = conn.execute(
         'UPDATE event_outbox SET status=status WHERE id=?',
         (event_id,),
@@ -232,33 +327,48 @@ def retry_outbox_event_atomic(conn, event_id: int, user: dict) -> dict:
     generation_changed = (
         fresh['status'] != initial['status']
         or int(fresh['attempts']) != int(initial['attempts'])
+        or (fresh.get('processed_at') or '') != (initial.get('processed_at') or '')
     )
-    # Pending retries are already idempotent. Delivered is also terminal for this
-    # retry surface: returning the established success response without mutating
-    # it prevents an operator retry from creating a second external side effect.
-    if generation_changed or fresh['status'] in ('Pending', 'Delivered'):
+    if generation_changed or fresh['status'] == 'Delivered':
         return {'ok': True, 'event_no': fresh['event_no']}
 
-    # An explicit operator retry of an attempt-exhausted event resets the
-    # delivery budget. Without this the requeued event would sit Pending
-    # forever: the processor claim requires attempts<max, so the previous
-    # behavior reported ok=True while delivery could never happen again.
-    # Automated runs never reset attempts, so the automated failure ceiling
-    # still bounds unattended retry loops.
     exhausted = int(fresh['attempts']) >= int(_application.OUTBOX_MAX_ATTEMPTS)
+
+    # Pending+processed_at is an in-flight durable lease. Active leases are
+    # idempotent on the retry surface; a stale lease may be explicitly broken by
+    # an operator. Ordinary unleased Pending rows are already queued and remain
+    # idempotent unless their attempt budget is exhausted.
+    if fresh['status'] == 'Pending':
+        if _lease_is_active(fresh):
+            return {'ok': True, 'event_no': fresh['event_no']}
+        if not fresh.get('processed_at') and not exhausted:
+            return {'ok': True, 'event_no': fresh['event_no']}
+
     if exhausted:
         changed = conn.execute(
             '''UPDATE event_outbox
                SET status='Pending',attempts=0,processed_at=NULL,last_error=''
-               WHERE id=? AND status=? AND attempts=?''',
-            (event_id, fresh['status'], fresh['attempts']),
+               WHERE id=? AND status=? AND attempts=?
+                 AND COALESCE(processed_at,'')=COALESCE(?,'')''',
+            (
+                event_id,
+                fresh['status'],
+                fresh['attempts'],
+                fresh.get('processed_at'),
+            ),
         )
     else:
         changed = conn.execute(
             '''UPDATE event_outbox
                SET status='Pending',processed_at=NULL,last_error=''
-               WHERE id=? AND status=? AND attempts=?''',
-            (event_id, fresh['status'], fresh['attempts']),
+               WHERE id=? AND status=? AND attempts=?
+                 AND COALESCE(processed_at,'')=COALESCE(?,'')''',
+            (
+                event_id,
+                fresh['status'],
+                fresh['attempts'],
+                fresh.get('processed_at'),
+            ),
         )
     if not _rowcount_one(changed):
         return {'ok': True, 'event_no': fresh['event_no']}
@@ -318,5 +428,3 @@ def install_outbox_atomicity() -> None:
             raise HTTPException(404, str(exc).strip("'"))
 
     _application.retry_outbox_event = retry_outbox_event_route
-    app.openapi_schema = None
-    setattr(app.state, marker, True)
