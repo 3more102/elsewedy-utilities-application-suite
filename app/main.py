@@ -11,7 +11,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import APP_NAME, APP_VERSION, STATIC_DIR, UPLOAD_DIR, SESSION_HOURS, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, ALLOWED_DOC_SUFFIXES, DB_BACKEND, DB_PATH, SCHEMA_VERSION, AUTOMATION_INTERVAL_MINUTES, EVENT_WEBHOOK_URL, EVENT_WEBHOOK_SECRET, OUTBOX_MAX_ATTEMPTS
-from .database import db, init_db, now, audit_digest
+from .database import db, init_db, now
+from apps.audit import audit, verify_audit_chain
 from .auth import hash_password, verify_password, current_user, require_roles, require_permission, effective_permissions, has_permission
 
 @asynccontextmanager
@@ -108,27 +109,6 @@ def telemetry_ingest_principal(authorization:Optional[str]=Header(default=None),
 def rows(cur): return [dict(r) for r in cur.fetchall()]
 def one(cur):
     r=cur.fetchone(); return dict(r) if r else None
-
-def audit(conn, user_id:int, action:str, module:str, record_id:str, old='', new=''):
-    if not isinstance(old,str): old=json.dumps(old,ensure_ascii=False,default=str,sort_keys=True)
-    if not isinstance(new,str): new=json.dumps(new,ensure_ascii=False,default=str,sort_keys=True)
-    created=now()
-    prev=conn.execute("SELECT audit_hash FROM audit_logs ORDER BY id DESC LIMIT 1").fetchone()
-    prev_hash=(prev['audit_hash'] if prev and prev['audit_hash'] else '')
-    digest=audit_digest(prev_hash,user_id,action,module,record_id,old,new,created)
-    conn.execute('INSERT INTO audit_logs(user_id,action,module,record_id,old_value,new_value,created_at,prev_hash,audit_hash) VALUES(?,?,?,?,?,?,?,?,?)',(user_id,action,module,record_id,old,new,created,prev_hash,digest))
-    return digest
-
-def verify_audit_chain(conn):
-    prev=''
-    checked=0
-    for r in conn.execute('SELECT id,user_id,action,module,record_id,old_value,new_value,created_at,prev_hash,audit_hash FROM audit_logs ORDER BY id').fetchall():
-        checked+=1
-        expected=audit_digest(prev,r['user_id'],r['action'],r['module'],r['record_id'],r['old_value'],r['new_value'],r['created_at'])
-        if (r['prev_hash'] or '')!=prev or (r['audit_hash'] or '')!=expected:
-            return {'valid':False,'checked':checked,'first_invalid_id':r['id'],'head_hash':prev}
-        prev=r['audit_hash']
-    return {'valid':True,'checked':checked,'first_invalid_id':None,'head_hash':prev}
 
 def post_cost(conn, work_order, cost_type, amount, quantity, reference, user_id):
     if amount<=0:return None
