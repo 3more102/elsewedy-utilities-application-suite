@@ -58,6 +58,9 @@ def _assert_security_headers(headers: dict[str, str]) -> None:
     assert headers.get('x-content-type-options', '').casefold() == 'nosniff', headers
     assert headers.get('x-frame-options', '').casefold() == 'deny', headers
     assert headers.get('referrer-policy', '').casefold() == 'strict-origin-when-cross-origin', headers
+    assert headers.get('cross-origin-opener-policy', '').casefold() == 'same-origin', headers
+    assert headers.get('cross-origin-resource-policy', '').casefold() == 'same-origin', headers
+    assert headers.get('x-permitted-cross-domain-policies', '').casefold() == 'none', headers
     csp = headers.get('content-security-policy', '')
     assert "default-src 'self'" in csp, csp
     assert "style-src 'self' 'unsafe-inline'" in csp, csp
