@@ -22,11 +22,12 @@ EUAS includes security controls appropriate for a runnable reference deployment.
 - Foreign-key enforcement and transactional rollback for database writes.
 - Audit records for authentication and important business changes; passwords and raw bearer tokens are not included in those events.
 - Security response headers: request ID, `nosniff`, frame denial, referrer policy, permissions policy and Content Security Policy.
+- The production entrypoint enforces self-only scripts, blocks inline script attributes, constrains form submissions to self, and emits one-year HSTS only for requests that reach the ASGI application as HTTPS.
 - API responses default to `Cache-Control: no-store`.
 - GitHub CodeQL scans Python with the `security-extended` query suite on pushes, pull requests and a weekly schedule.
 - `pip-audit` checks the resolved Python dependency environment for known vulnerability advisories.
 - Trivy scans the built EUAS container image and fails on fixable high/critical OS or library vulnerabilities.
-- The production container is smoke-tested through `/api/health` before vulnerability scanning.
+- The production container is smoke-tested through `/api/health` and the live browser/static shell before vulnerability scanning.
 - Dependabot monitors Python packages, GitHub Actions and the pinned Docker base image for version updates.
 
 ## Password-hash migration contract
@@ -71,7 +72,7 @@ For very large multi-region deployments, a purpose-built shared rate-limit servi
 
 The current API authenticates with an `Authorization: Bearer` header. It does not place the authentication bearer in a browser cookie. Traditional cookie-CSRF tokens are therefore not part of the current authentication design. If EUAS later introduces cookie-based authentication, the cookie and state-changing request model must be reviewed together for `HttpOnly`, `Secure`, `SameSite`, expiry/domain/path policy and CSRF protection before that mode is enabled.
 
-Production traffic must still be protected with TLS so bearer credentials cannot be observed in transit.
+Production traffic must be protected with TLS so bearer credentials cannot be observed in transit. `app.production` emits `Strict-Transport-Security: max-age=31536000` only when the ASGI request scheme is `https`; it deliberately does not opt into `includeSubDomains` or preload because those are domain-wide deployment decisions. When TLS terminates at a reverse proxy, configure Uvicorn's trusted forwarded-proxy addresses so the proxy's HTTPS scheme is propagated safely to the application. Do not use a wildcard trusted-proxy configuration on an internet-facing process unless the surrounding network boundary guarantees that clients cannot inject forwarded headers. HTTP-to-HTTPS redirection remains the ingress/reverse-proxy responsibility.
 
 ## Continuous security validation
 
@@ -79,7 +80,7 @@ The dedicated `EUAS Security` workflow contains three independent controls:
 
 - **CodeQL / Python** performs static security analysis and publishes supported findings to GitHub code scanning.
 - **Python dependency audit** installs the application dependency set and runs `pip-audit`; known vulnerable resolved dependencies fail the job.
-- **Container build, smoke and image scan** builds the hardened production Dockerfile, boots the non-root image, verifies the health endpoint, and runs Trivy against OS and library packages; fixable high/critical findings fail the job.
+- **Container build, smoke and image scan** builds the hardened production Dockerfile, boots the non-root image, verifies the health endpoint and browser/static shell including the production CSP contract, and runs Trivy against OS and library packages; fixable high/critical findings fail the job.
 
 The Trivy GitHub Action is pinned to a full release commit SHA rather than a movable tag. The workflow runs for `main`, pull requests targeting `main`, manual dispatches, and on a weekly schedule. Dependabot separately proposes updates for pip dependencies, GitHub Actions and the Docker base image.
 
@@ -89,7 +90,7 @@ The PostgreSQL integration smoke exercises the live authentication path and vali
 
 ## Production hardening checklist
 
-1. Terminate TLS using an approved ingress/reverse proxy and redirect all HTTP to HTTPS.
+1. Terminate TLS using an approved ingress/reverse proxy, redirect all HTTP to HTTPS, and configure trusted forwarded-proxy addresses so EUAS sees the correct HTTPS scheme.
 2. Replace demo accounts/passwords before exposing the service to any network.
 3. Integrate corporate SSO (OIDC/SAML/Entra ID or equivalent) and MFA.
 4. Move persistence to PostgreSQL HA and managed/object attachment storage.
@@ -99,7 +100,7 @@ The PostgreSQL integration smoke exercises the live authentication path and vali
 8. Restrict database/storage network access to application identities only.
 9. Forward audit logs, request IDs, metrics and authentication events to centralized SIEM/observability platforms.
 10. Add deployment-target DAST and periodic penetration testing alongside the existing CodeQL, dependency and container-image scans before internet-facing deployment.
-11. Review CSP and remove `unsafe-inline` by migrating the remaining generated inline event handlers to delegated listeners before strict CSP enforcement.
+11. Migrate the remaining generated inline style attributes before removing `style-src 'unsafe-inline'`; production script execution is already self-only and inline script attributes are blocked.
 12. Maintain tested backup, restore, retention and disaster-recovery RPO/RTO policies.
 
 ## Demo credentials
