@@ -89,7 +89,7 @@ from .reorder_store import install_reorder_generation_atomicity
 from .reservation_authorization import install_reservation_authorization_contract
 from .reservation_store import install_reservation_routes
 from .scheduler_store import install_distributed_scheduler_singleton
-from .telemetry_store import install_telemetry_temporal_ordering
+from .telemetry_store import install_telemetry_temporal_integrity
 from .transfer_startup import install_inventory_transfer_startup
 from .work_order_number_startup import install_work_order_number_startup
 from .workflow_authorization import install_workflow_authorization_contract
@@ -107,7 +107,7 @@ install_pm_generation_startup()
 install_outbox_atomicity()
 install_distributed_scheduler_singleton()
 install_reorder_generation_atomicity()
-install_telemetry_temporal_ordering()
+install_telemetry_temporal_integrity()
 install_procurement_routes()
 install_atomic_approval_route()
 install_reservation_routes()
