@@ -3,32 +3,36 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
+STATIC_ROOT = ROOT / "static"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
-INDEX = ROOT / "static" / "index.html"
-BASE_CSS = ROOT / "static" / "styles.css"
-REFRESH_CSS = ROOT / "static" / "ui-refresh.css"
-UX_CSS = ROOT / "static" / "ux-enhancements.css"
-UX_JS = ROOT / "static" / "ux-enhancements.js"
-DASHBOARD_JS = ROOT / "static" / "dashboard-enhancements.js"
-PRODUCTIVITY_CSS = ROOT / "static" / "productivity-enhancements.css"
-PRODUCTIVITY_JS = ROOT / "static" / "productivity-enhancements.js"
-OPERATIONAL_CSS = ROOT / "static" / "operational-enhancements.css"
-OPERATIONAL_JS = ROOT / "static" / "operational-enhancements.js"
-WORKSPACE_CSS = ROOT / "static" / "workspace-preferences.css"
-WORKSPACE_JS = ROOT / "static" / "workspace-preferences.js"
-COMMAND_CSS = ROOT / "static" / "command-palette.css"
-COMMAND_JS = ROOT / "static" / "command-palette.js"
-SHORTCUT_CSS = ROOT / "static" / "shortcut-center.css"
-SHORTCUT_JS = ROOT / "static" / "shortcut-center.js"
-SERVICE_WORKER = ROOT / "static" / "sw.js"
+INDEX = STATIC_ROOT / "index.html"
+APP_JS = STATIC_ROOT / "app.js"
+BASE_CSS = STATIC_ROOT / "styles.css"
+REFRESH_CSS = STATIC_ROOT / "ui-refresh.css"
+UX_CSS = STATIC_ROOT / "ux-enhancements.css"
+UX_JS = STATIC_ROOT / "ux-enhancements.js"
+DASHBOARD_JS = STATIC_ROOT / "dashboard-enhancements.js"
+PRODUCTIVITY_CSS = STATIC_ROOT / "productivity-enhancements.css"
+PRODUCTIVITY_JS = STATIC_ROOT / "productivity-enhancements.js"
+OPERATIONAL_CSS = STATIC_ROOT / "operational-enhancements.css"
+OPERATIONAL_JS = STATIC_ROOT / "operational-enhancements.js"
+WORKSPACE_CSS = STATIC_ROOT / "workspace-preferences.css"
+WORKSPACE_JS = STATIC_ROOT / "workspace-preferences.js"
+COMMAND_CSS = STATIC_ROOT / "command-palette.css"
+COMMAND_JS = STATIC_ROOT / "command-palette.js"
+SHORTCUT_CSS = STATIC_ROOT / "shortcut-center.css"
+SHORTCUT_JS = STATIC_ROOT / "shortcut-center.js"
+SERVICE_WORKER = STATIC_ROOT / "sw.js"
 
 
 def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     html = INDEX.read_text(encoding="utf-8")
+    app_js = APP_JS.read_text(encoding="utf-8")
     service_worker = SERVICE_WORKER.read_text(encoding="utf-8")
     ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 
     assert CI_WORKFLOW.exists()
+    assert APP_JS.exists()
     assert BASE_CSS.exists()
     assert REFRESH_CSS.exists()
     assert UX_CSS.exists()
@@ -75,7 +79,35 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert "No static JavaScript assets found" in ci_workflow
     assert "node --check static/app.js" not in ci_workflow
     assert "node --check static/shortcut-center.js" not in ci_workflow
-    assert "Reject packaged credentials in login shell" in ci_workflow
+    assert "Reject packaged credentials in frontend assets" in ci_workflow
+    assert "grep -RInE" in ci_workflow
+    assert "--include='*.html'" in ci_workflow
+    assert "--include='*.js'" in ci_workflow
+    assert "--include='*.css'" in ci_workflow
+    assert "--include='*.webmanifest'" in ci_workflow
+    assert "Packaged demo credentials must not be shipped in frontend assets" in ci_workflow
+    assert "Reject packaged credentials in login shell" not in ci_workflow
+
+    packaged_tokens = (
+        "EUAS@2026",
+        "Planner@2026",
+        "Supervisor@2026",
+        "Tech@2026",
+        "Store@2026",
+        "Proc@2026",
+        "HSE@2026",
+        "Viewer@2026",
+    )
+    text_suffixes = {".html", ".js", ".css", ".webmanifest"}
+    for path in sorted(STATIC_ROOT.rglob("*")):
+        if not path.is_file() or path.suffix not in text_suffixes:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for token in packaged_tokens:
+            assert token not in text, f"{token} is packaged in {path.relative_to(ROOT)}"
+    assert 'value="omar"' not in html
+    assert "appropriately provisioned account for technician workflows" in app_js
+    assert "appropriately provisioned technician account" in app_js
 
     required_ids = {
         "login",
