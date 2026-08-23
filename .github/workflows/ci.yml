@@ -59,6 +59,14 @@ jobs:
       - name: Compile backend
         run: python -m compileall -q app scripts
 
+      - name: Validate SQLite migration operations
+        env:
+          EUAS_DB_PATH: /tmp/euas_migration_ci.db
+          EUAS_VERSION: 3.9.0
+        run: |
+          python scripts/migrate.py upgrade
+          python scripts/migrate.py check
+
       - name: Verify deterministic engineering evidence
         run: python scripts/engineering_evidence.py --check ENGINEERING_EVIDENCE.json
 
@@ -119,6 +127,9 @@ jobs:
 
       - name: Run strict production readiness gate
         run: python scripts/production_readiness.py --strict-production --require-postgres --check-db
+
+      - name: Verify PostgreSQL migration contract
+        run: python scripts/migrate.py check
 
       - name: Run PostgreSQL inventory concurrency smoke
         run: python scripts/inventory_concurrency_smoke.py
