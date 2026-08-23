@@ -46,6 +46,7 @@ from .auth_store import (
     revoke_session,
     throttle_status,
 )
+from .client_identity import resolve_client_host
 from .config import SESSION_HOURS
 from .database import db
 from .inventory_store import (
@@ -130,7 +131,7 @@ app.openapi_schema = None
 
 
 def _client_host(request: Request) -> str:
-    return request.client.host if request.client else 'unknown'
+    return resolve_client_host(request)
 
 
 @app.post('/api/auth/login')
