@@ -3,8 +3,8 @@
   "api_routes": 150,
   "application_version": "3.9.0",
   "database_backend": "sqlite",
-  "explicit_indexes": 38,
-  "relational_tables": 61,
+  "explicit_indexes": 41,
+  "relational_tables": 63,
   "schema_version": 10,
-  "source_test_definitions": 190
+  "source_test_definitions": 193
 }
