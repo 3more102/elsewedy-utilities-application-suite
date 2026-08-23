@@ -68,9 +68,23 @@ def test_production_wrapper_replaces_legacy_inline_script_policy():
     csp = csp_values[0]
     assert "script-src 'self'" in csp
     assert "script-src 'self' 'unsafe-inline'" not in csp
+    assert "script-src-elem 'self'" in csp
     assert "script-src-attr 'none'" in csp
-    assert "form-action 'self'" in csp
     assert "style-src 'self' 'unsafe-inline'" in csp
+    assert "style-src-elem 'self'" in csp
+    assert "style-src-elem 'self' 'unsafe-inline'" not in csp
+    assert "style-src-attr 'unsafe-inline'" in csp
+    assert "font-src 'self'" in csp
+    assert "media-src 'self'" in csp
+    assert "worker-src 'self'" in csp
+    assert "manifest-src 'self'" in csp
+    assert "connect-src 'self'" in csp
+    assert "frame-src 'none'" in csp
+    assert "object-src 'none'" in csp
+    assert "base-uri 'self'" in csp
+    assert "form-action 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert '*' not in csp
 
 
 def test_production_wrapper_emits_one_year_hsts_only_for_https_scope():
