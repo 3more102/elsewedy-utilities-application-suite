@@ -178,6 +178,8 @@ def _ensure_schema_columns(conn):
     if work_cols and 'asset_fmea_id' not in work_cols: conn.execute('ALTER TABLE work_orders ADD COLUMN asset_fmea_id INTEGER REFERENCES asset_fmea(id) ON DELETE SET NULL')
     cbm_rule_cols=_table_columns(conn,'cbm_rules')
     if cbm_rule_cols and 'asset_fmea_id' not in cbm_rule_cols: conn.execute('ALTER TABLE cbm_rules ADD COLUMN asset_fmea_id INTEGER REFERENCES asset_fmea(id) ON DELETE SET NULL')
+    job_cols=_table_columns(conn,'jobs')
+    if job_cols and 'current_attempt_no' not in job_cols: conn.execute('ALTER TABLE jobs ADD COLUMN current_attempt_no INTEGER NOT NULL DEFAULT 0')
     cbm_event_cols=_table_columns(conn,'cbm_events')
     if cbm_event_cols and 'asset_fmea_id' not in cbm_event_cols: conn.execute('ALTER TABLE cbm_events ADD COLUMN asset_fmea_id INTEGER REFERENCES asset_fmea(id) ON DELETE SET NULL')
 
@@ -445,6 +447,33 @@ def init_db(hash_password):
           actor_id INTEGER REFERENCES users(id), as_of TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, summary_json TEXT DEFAULT '', error_message TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_job_runs_status ON job_runs(status,started_at);
+        CREATE TABLE IF NOT EXISTS workers(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, worker_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'Active', registered_at TEXT NOT NULL, last_heartbeat_at TEXT NOT NULL, metadata_json TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_workers_heartbeat ON workers(status,last_heartbeat_at);
+        CREATE TABLE IF NOT EXISTS jobs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT UNIQUE NOT NULL, job_type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'Pending', priority INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, available_at TEXT NOT NULL,
+          lease_owner TEXT REFERENCES workers(worker_id), lease_expires_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, current_attempt_no INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL DEFAULT 5, last_error TEXT DEFAULT '', correlation_id TEXT NOT NULL, deduplication_key TEXT UNIQUE,
+          started_at TEXT, finished_at TEXT, cancelled_at TEXT, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status,available_at,priority,id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_lease_expiry ON jobs(status,lease_expires_at);
+        CREATE INDEX IF NOT EXISTS idx_jobs_type_status ON jobs(job_type,status,created_at);
+        CREATE TABLE IF NOT EXISTS job_attempts(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          attempt_no INTEGER NOT NULL, worker_id TEXT NOT NULL REFERENCES workers(worker_id), status TEXT NOT NULL,
+          started_at TEXT NOT NULL, finished_at TEXT, error_message TEXT DEFAULT '', UNIQUE(job_id,attempt_no)
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_attempts_job ON job_attempts(job_id,attempt_no);
+        CREATE TABLE IF NOT EXISTS job_leases(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          worker_id TEXT NOT NULL REFERENCES workers(worker_id), leased_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+          released_at TEXT, release_reason TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_leases_active ON job_leases(job_id,released_at,expires_at);
         CREATE TABLE IF NOT EXISTS sla_policies(
           id INTEGER PRIMARY KEY AUTOINCREMENT, policy_code TEXT UNIQUE NOT NULL, priority TEXT UNIQUE NOT NULL,
           response_minutes INTEGER NOT NULL, resolution_minutes INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL

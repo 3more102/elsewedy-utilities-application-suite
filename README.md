@@ -8,9 +8,9 @@
 <p align="center">
   <a href="https://github.com/3more102/elsewedy-utilities-application-suite/actions/workflows/ci.yml"><img alt="EUAS CI" src="https://github.com/3more102/elsewedy-utilities-application-suite/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Version" src="https://img.shields.io/badge/version-4.9.0-0A6EBD">
-  <img alt="Schema" src="https://img.shields.io/badge/schema-v19-334155">
+  <img alt="Schema" src="https://img.shields.io/badge/schema-v20-334155">
   <img alt="API Endpoints" src="https://img.shields.io/badge/API_endpoints-242-2563EB">
-  <img alt="Tests" src="https://img.shields.io/badge/regression_tests-59-16A34A">
+  <img alt="Tests" src="https://img.shields.io/badge/regression_tests-65-16A34A">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB">
 </p>
 
