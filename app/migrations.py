@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -8,6 +11,19 @@ from .database import now
 
 BASELINE_VERSION = 9
 POSTGRES_MIGRATION_LOCK_KEY = 0x455541530010
+MIN_PRODUCTION_BOOTSTRAP_PASSWORD = 16
+DEMO_DEFAULT_CREDENTIALS = {
+    'omar': 'EUAS@2026',
+    'seif': 'EUAS@2026',
+    'planner': 'Planner@2026',
+    'supervisor': 'Supervisor@2026',
+    'tech1': 'Tech@2026',
+    'tech2': 'Tech2@2026',
+    'store': 'Store@2026',
+    'proc': 'Proc@2026',
+    'hse': 'HSE@2026',
+    'exec': 'Viewer@2026',
+}
 
 
 class MigrationError(RuntimeError):
@@ -60,9 +76,6 @@ def _auth_v10_valid(conn, backend: str) -> bool:
 
 
 def registered_migrations() -> tuple[Migration, ...]:
-    # Import lazily so legacy startup code can import this module without an
-    # auth_store import cycle. Existing v10 DDL remains the authoritative body
-    # of that migration while the registry owns ordering and validation.
     from . import auth_store
 
     return (
@@ -98,8 +111,6 @@ def _acquire_migration_lock(conn, backend: str) -> None:
         try:
             conn.execute('BEGIN IMMEDIATE')
         except Exception as exc:
-            # A caller may already have opened the transaction. In that case the
-            # enclosing transaction remains the serialization boundary.
             if 'within a transaction' not in str(exc).lower():
                 raise
         return
@@ -164,14 +175,6 @@ def run_pending_migrations(
     backend: str,
     target_version: int = SCHEMA_VERSION,
 ) -> dict:
-    """Apply registered migrations under one database transaction and lock.
-
-    PostgreSQL uses a transaction-scoped advisory lock. SQLite upgrades take an
-    immediate write transaction before the migration ledger is inspected. A
-    persisted migration marker is not trusted blindly: each registered version
-    validates its structural contract, and explicitly repairable migrations can
-    heal historical pre-claimed markers before deployment continues.
-    """
     _acquire_migration_lock(conn, backend)
     before = migration_status(conn, backend=backend, target_version=target_version)
 
@@ -217,9 +220,6 @@ def run_pending_migrations(
             )
         details[migration.version] = dict(result)
 
-        # Legacy migration bodies may still write their own marker. During this
-        # transition the runner adopts that marker instead of duplicating it;
-        # future migrations should leave ledger ownership entirely to this runner.
         persisted = set(_applied_versions(conn))
         if already_recorded:
             repaired_now.append(migration.version)
@@ -245,25 +245,160 @@ def run_pending_migrations(
     }
 
 
+def _production_environment() -> bool:
+    return os.getenv('EUAS_ENV', 'development').strip().lower() == 'production'
+
+
+def _bootstrap_secret(required: bool) -> str:
+    secret = os.getenv('EUAS_BOOTSTRAP_ADMIN_PASSWORD', '').strip()
+    if not required and not secret:
+        return ''
+    if len(secret) < MIN_PRODUCTION_BOOTSTRAP_PASSWORD:
+        raise MigrationError(
+            'production bootstrap requires EUAS_BOOTSTRAP_ADMIN_PASSWORD '
+            f'with at least {MIN_PRODUCTION_BOOTSTRAP_PASSWORD} characters'
+        )
+    if secret in set(DEMO_DEFAULT_CREDENTIALS.values()):
+        raise MigrationError('production bootstrap password must not reuse a packaged demo password')
+    return secret
+
+
+def _database_has_users(database_module) -> bool:
+    try:
+        with database_module.db() as conn:
+            return bool(int(conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]))
+    except Exception:
+        return False
+
+
+def _derived_seed_password(secret: str, discriminator: str) -> str:
+    return hmac.new(
+        secret.encode('utf-8'),
+        f'euas-production-seed:{discriminator}'.encode('utf-8'),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _secure_seed_hasher(hash_password, secret: str):
+    defaults = set(DEMO_DEFAULT_CREDENTIALS.values())
+
+    def secure_hash(password: str) -> str:
+        if password in defaults:
+            password = _derived_seed_password(secret, password)
+        return hash_password(password)
+
+    return secure_hash
+
+
+def find_insecure_demo_users(conn, verify_password) -> list[str]:
+    insecure: list[str] = []
+    for username, packaged_password in DEMO_DEFAULT_CREDENTIALS.items():
+        row = conn.execute(
+            'SELECT password_hash,active FROM users WHERE username=?', (username,)
+        ).fetchone()
+        if row and int(row['active'] or 0) and verify_password(packaged_password, row['password_hash']):
+            insecure.append(username)
+    return insecure
+
+
+def _rotate_insecure_demo_credentials(conn, hash_password, verify_password, secret: str) -> list[str]:
+    rotated: list[str] = []
+    stamp = now()
+    for username, packaged_password in DEMO_DEFAULT_CREDENTIALS.items():
+        row = conn.execute(
+            'SELECT id,password_hash,active FROM users WHERE username=?', (username,)
+        ).fetchone()
+        if not row or not int(row['active'] or 0):
+            continue
+        if not verify_password(packaged_password, row['password_hash']):
+            continue
+        replacement = secret if username == 'omar' else _derived_seed_password(
+            secret, f'{username}:{packaged_password}'
+        )
+        conn.execute(
+            'UPDATE users SET password_hash=? WHERE id=?',
+            (hash_password(replacement), int(row['id'])),
+        )
+        try:
+            conn.execute(
+                'UPDATE auth_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL',
+                (stamp, int(row['id'])),
+            )
+        except Exception:
+            pass
+        conn.execute('DELETE FROM sessions WHERE user_id=?', (int(row['id']),))
+        rotated.append(username)
+    return rotated
+
+
 def initialize_database(hash_password) -> dict:
     """Bootstrap the historical v9 base, then migrate to the app contract.
 
-    This is the controlled replacement for callers that previously invoked
-    ``database.init_db`` directly. The base initializer is intentionally pinned
-    to v9 so it can never pre-claim a later migration marker.
+    Production bootstraps never commit the packaged demo passwords. A fresh
+    production database requires ``EUAS_BOOTSTRAP_ADMIN_PASSWORD``; all packaged
+    seed passwords are replaced before the base seed transaction commits, then
+    the ``omar`` administrator is assigned the operator-provided secret. Existing
+    production databases are scanned for packaged demo credentials and those
+    credentials are rotated (with sessions revoked) when the secret is supplied.
     """
     from . import database as database_module
+
+    production = _production_environment()
+    had_users = _database_has_users(database_module) if production else False
+    secret = _bootstrap_secret(required=production and not had_users) if production else ''
+    bootstrap_hasher = _secure_seed_hasher(hash_password, secret) if production and secret else hash_password
 
     target_version = int(database_module.SCHEMA_VERSION)
     database_module.SCHEMA_VERSION = BASELINE_VERSION
     try:
-        database_module.init_db(hash_password)
+        database_module.init_db(bootstrap_hasher)
     finally:
         database_module.SCHEMA_VERSION = target_version
 
     with database_module.db() as conn:
-        return run_pending_migrations(
+        result = run_pending_migrations(
             conn,
             backend=database_module.DB_BACKEND,
             target_version=target_version,
         )
+
+        credential_hardening = {
+            'production': production,
+            'fresh_admin_initialized': False,
+            'rotated_users': [],
+        }
+        if production:
+            from .auth import verify_password
+
+            insecure = find_insecure_demo_users(conn, verify_password)
+            if insecure and not secret:
+                raise MigrationError(
+                    'packaged demo credentials remain active for: '
+                    + ','.join(insecure)
+                    + '; set EUAS_BOOTSTRAP_ADMIN_PASSWORD to rotate them before startup'
+                )
+            if insecure:
+                credential_hardening['rotated_users'] = _rotate_insecure_demo_credentials(
+                    conn, hash_password, verify_password, secret
+                )
+            if not had_users:
+                admin = conn.execute(
+                    "SELECT id FROM users WHERE username='omar' AND active=1"
+                ).fetchone()
+                if not admin:
+                    raise MigrationError('production bootstrap administrator was not created')
+                conn.execute(
+                    'UPDATE users SET password_hash=? WHERE id=?',
+                    (hash_password(secret), int(admin['id'])),
+                )
+                credential_hardening['fresh_admin_initialized'] = True
+
+            remaining = find_insecure_demo_users(conn, verify_password)
+            if remaining:
+                raise MigrationError(
+                    'packaged demo credentials remain active after hardening: '
+                    + ','.join(remaining)
+                )
+
+        result['credential_hardening'] = credential_hardening
+        return result
