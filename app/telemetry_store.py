@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -366,6 +367,14 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
     normalized: list[tuple[object, str, str | None]] = []
     for reading in body.readings:
         code = reading.channel_code.strip().upper()
+        if not math.isfinite(float(reading.value)):
+            # NaN compares false against every threshold, so a single garbage
+            # sample would silently CLEAR an active alarm; +/-inf would open
+            # alarms with unusable trigger values. Reject before any write.
+            raise HTTPException(
+                400,
+                f'Non-finite value for telemetry channel {code}',
+            )
         explicit_capture = reading.captured_at
         if explicit_capture is not None:
             try:
