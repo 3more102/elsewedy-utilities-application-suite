@@ -205,6 +205,71 @@ def _retry_is_idempotent() -> None:
         raise RuntimeError(f'expected one retry audit, got {audits}')
 
 
+def _retry_exhausted_resets_budget_once() -> None:
+    _quiesce_existing()
+    user = _admin()
+    max_attempts = int(_application.OUTBOX_MAX_ATTEMPTS)
+    event_id, event_no = _seed_event(status='Failed', attempts=max_attempts)
+
+    def retry(_index):
+        with db() as conn:
+            return retry_outbox_event_atomic(conn, event_id, user)
+
+    results = _parallel(WORKERS, retry)
+    if any(result != {'ok': True, 'event_no': event_no} for result in results):
+        raise RuntimeError(f'exhausted retry response changed: {results!r}')
+    with db() as conn:
+        event = conn.execute(
+            'SELECT status,attempts FROM event_outbox WHERE id=?',
+            (event_id,),
+        ).fetchone()
+        audits = int(
+            conn.execute(
+                """SELECT COUNT(*) FROM audit_logs
+                   WHERE module='Integration Events' AND action='RETRY'
+                     AND record_id=?""",
+                (event_no,),
+            ).fetchone()[0]
+        )
+    if event['status'] != 'Pending' or int(event['attempts']) != 0:
+        raise RuntimeError(f'exhausted retry state invalid: {dict(event)!r}')
+    if audits != 1:
+        raise RuntimeError(f'expected one exhausted-retry audit, got {audits}')
+
+    # The reset budget must make the event deliverable exactly once.
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def fake_urlopen(request, timeout=5):
+        nonlocal calls
+        if _event_header(request) == event_no:
+            with calls_lock:
+                calls += 1
+        return _Response()
+
+    original_url = _application.EVENT_WEBHOOK_URL
+    original_open = _application.urllib_request.urlopen
+    _application.EVENT_WEBHOOK_URL = 'https://example.invalid/euas'
+    _application.urllib_request.urlopen = fake_urlopen
+    try:
+        def process(_index):
+            with db() as conn:
+                return process_outbox_atomic(conn)
+
+        _parallel(WORKERS, process)
+    finally:
+        _application.EVENT_WEBHOOK_URL = original_url
+        _application.urllib_request.urlopen = original_open
+
+    with db() as conn:
+        event = conn.execute(
+            'SELECT status,attempts FROM event_outbox WHERE id=?',
+            (event_id,),
+        ).fetchone()
+    if calls != 1 or event['status'] != 'Delivered' or int(event['attempts']) != 1:
+        raise RuntimeError(f'reset-budget delivery invalid: sends={calls} state={dict(event)!r}')
+
+
 def _postcommit_boundary() -> None:
     _quiesce_existing()
     user = _admin()
@@ -286,10 +351,11 @@ def main() -> None:
     _claim_generation_once()
     _one_external_send()
     _retry_is_idempotent()
+    _retry_exhausted_resets_budget_once()
     _postcommit_boundary()
     print(
         'outbox delivery concurrency smoke: PASS '
-        'generation_claim=1 send=1 retry_audit=1 postcommit=visible workers=12'
+        'generation_claim=1 send=1 retry_audit=1 exhausted_retry_reset=1 postcommit=visible workers=12'
     )
 
 

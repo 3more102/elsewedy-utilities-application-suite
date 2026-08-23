@@ -236,12 +236,27 @@ def retry_outbox_event_atomic(conn, event_id: int, user: dict) -> dict:
     if generation_changed or fresh['status'] == 'Pending':
         return {'ok': True, 'event_no': fresh['event_no']}
 
-    changed = conn.execute(
-        '''UPDATE event_outbox
-           SET status='Pending',processed_at=NULL,last_error=''
-           WHERE id=? AND status=? AND attempts=?''',
-        (event_id, fresh['status'], fresh['attempts']),
-    )
+    # An explicit operator retry of an attempt-exhausted event resets the
+    # delivery budget. Without this the requeued event would sit Pending
+    # forever: the processor claim requires attempts<max, so the previous
+    # behavior reported ok=True while delivery could never happen again.
+    # Automated runs never reset attempts, so the automated failure ceiling
+    # still bounds unattended retry loops.
+    exhausted = int(fresh['attempts']) >= int(_application.OUTBOX_MAX_ATTEMPTS)
+    if exhausted:
+        changed = conn.execute(
+            '''UPDATE event_outbox
+               SET status='Pending',attempts=0,processed_at=NULL,last_error=''
+               WHERE id=? AND status=? AND attempts=?''',
+            (event_id, fresh['status'], fresh['attempts']),
+        )
+    else:
+        changed = conn.execute(
+            '''UPDATE event_outbox
+               SET status='Pending',processed_at=NULL,last_error=''
+               WHERE id=? AND status=? AND attempts=?''',
+            (event_id, fresh['status'], fresh['attempts']),
+        )
     if not _rowcount_one(changed):
         return {'ok': True, 'event_no': fresh['event_no']}
 
