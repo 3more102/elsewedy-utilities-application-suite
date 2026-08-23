@@ -1,135 +1,125 @@
 # EUAS Database Architecture
 
-EUAS v3.9.0 supports two runtime database modes behind the same application service boundary.
+EUAS v3.9.0 supports SQLite reference mode and PostgreSQL production mode behind the same application service boundary.
 
-## 1. SQLite reference mode
+## Runtime database modes
 
-This is the default zero-configuration mode used for local demos, QA and presentations.
+### SQLite reference mode
 
 ```text
 EUAS_DB_PATH=./euas.db
 ```
 
-Characteristics:
+SQLite is the default zero-configuration mode for local development, demos and QA. EUAS enables foreign keys and WAL mode and uses the same application schema contract exercised by CI.
 
-- relational schema with foreign keys
-- WAL mode
-- explicit indexes
-- automatic schema creation and demo seeding
-- no external database server required
-
-## 2. PostgreSQL mode
-
-Set:
+### PostgreSQL mode
 
 ```text
 EUAS_DATABASE_URL=postgresql://euas:<password>@<host>:5432/euas
 ```
 
-When a PostgreSQL URL is present, EUAS selects the PostgreSQL adapter instead of SQLite. The adapter provides parameter translation, PostgreSQL DDL conversion, transaction handling and generated-ID retrieval while keeping the application APIs unchanged.
+When a PostgreSQL URL is configured, EUAS uses the PostgreSQL adapter for qmark bind translation, DDL compatibility, transactional behavior and generated-ID handling. PostgreSQL mode requires `psycopg` from `requirements.txt`.
 
-Install the project requirements in the target environment. PostgreSQL mode requires `psycopg`.
-
-### Docker Compose
+Local container deployment:
 
 ```bash
 docker compose -f docker-compose.postgres.yml up --build
 ```
 
-Set a non-default password before production use:
-
-```bash
-export EUAS_POSTGRES_PASSWORD='replace-with-a-secret'
-```
-
-### Connectivity preflight
+Connectivity preflight:
 
 ```bash
 EUAS_DATABASE_URL=postgresql://... python scripts/postgres_preflight.py
 ```
 
-## Schema versioning
+## Schema contract and migration ledger
 
-EUAS records applied schema versions in:
+The application schema contract is currently **version 10**. Applied versions are recorded in:
 
 ```text
 schema_migrations
 ```
 
-Current schema version: **2**.
+The historical bootstrap owns the large additive base schema through version 9. Schema changes after that baseline are executed through the migration registry in `app/migrations.py`.
 
-The startup initializer is idempotent for the reference application: it creates missing tables/indexes and records the current schema version. For a large production rollout, replace startup DDL with a dedicated migration tool and controlled deployment pipeline.
+The migration runner:
 
-## Important validation note
+- pins legacy bootstrap to schema v9 so bootstrap cannot pre-claim a later version;
+- orders registered migrations by version;
+- validates the structural contract for a recorded migration instead of trusting the ledger marker alone;
+- can repair the historical v10 pre-claim case when the marker exists but the hardened auth tables are missing;
+- refuses databases carrying schema versions newer than the running application;
+- refuses gaps for which no migration is registered;
+- serializes PostgreSQL migration execution with a transaction-scoped advisory lock;
+- takes an immediate SQLite write transaction before migration inspection/execution.
 
-SQLite initialization and the full EUAS regression suite are executed in the supplied build environment. The PostgreSQL adapter SQL translation contract is unit-tested. A live PostgreSQL server is not available in the current build sandbox, and the sandbox has no internet access to install the missing PostgreSQL driver, so a live PostgreSQL integration test is **not claimed** in this release.
+### Migration operations
 
-The target deployment should run:
+Inspect the configured database without modifying it:
 
-1. `python scripts/postgres_preflight.py`
-2. application startup against an empty PostgreSQL database
-3. `python scripts/smoke_test.py` adapted to that environment or equivalent CI API smoke
-4. backup/restore validation before go-live
+```bash
+python scripts/migrate.py status
+```
 
-## Production recommendations
+Bootstrap the v9 base when necessary and advance through registered migrations:
 
-- managed PostgreSQL or HA cluster
-- encrypted connections and secret manager
-- automated backup / point-in-time recovery
-- migration approval in CI/CD
-- connection pooling
-- database monitoring and slow-query analysis
-- least-privilege application role
-- separate reporting/read replicas where needed
+```bash
+python scripts/migrate.py upgrade
+```
 
+Fail unless the configured database exactly satisfies the current migration contract:
 
-## v3.3 operations ledger
+```bash
+python scripts/migrate.py check
+```
 
-`job_runs` records every EUAS automation execution with run number, trigger source, actor, business date, status, timestamps, JSON result summary and error text. Schema version 3 creates this ledger and its status/start-time index.
+All commands support machine-readable output:
 
+```bash
+python scripts/migrate.py check --json
+```
 
-## Schema v4 additions
+`production_readiness.py --check-db` uses the same controlled bootstrap/migration path and treats migration-contract failure as a deployment failure. The external automation worker also migrates before executing scheduled work.
 
-Schema version 4 adds four operational-control tables:
+## Schema v10 authentication hardening
 
-- `sla_policies` — priority-to-response/resolution policy master.
-- `work_order_sla` — one SLA clock/result row per work order.
-- `sla_events` — unique breach/escalation history.
-- `event_outbox` — durable integration events and delivery attempts.
+Schema v10 adds the hardened authentication persistence layer:
 
-The release continues to initialize schema additively with `CREATE TABLE/INDEX IF NOT EXISTS` and records the active release schema in `schema_migrations`.
+- `auth_sessions` — digest-only bearer-session storage with revocation, expiry and client metadata;
+- `auth_login_throttle` — persistent login throttling state;
+- indexes for active-session lookup, token-digest lookup and throttle maintenance.
 
+The legacy `sessions` table remains as a rolling-upgrade compatibility landing zone. Historical raw tokens found there are converted to one-way SHA-256 digests and removed transactionally during the v10 migration.
 
-## Schema v5 governance tables
+## Earlier schema milestones
 
-Schema version **5** adds:
+- **v3:** `job_runs` automation execution ledger.
+- **v4:** SLA policy/results/events and durable `event_outbox`.
+- **v5:** maintenance cost ledger, report snapshots, backup records, retention policies and tamper-evident audit-chain fields.
+- **v6:** approval delegations and asset-health snapshots.
+- **v7:** crafts, technician profiles, shifts, absences and normalized work-order resource requirements.
+- **v8/v9:** inventory reservations, dispatch assignments, asset outages and subsequent production-hardening additions incorporated into the v9 baseline.
+- **v10:** hardened session storage and persistent authentication throttling.
 
-- `maintenance_cost_ledger` — posted maintenance labor/material/historical cost events linked to work orders and assets.
-- `report_snapshots` — point-in-time serialized reports with SHA-256 content hashes.
-- `backup_records` — evidence of application-generated SQLite backup packages and checksums.
-- `retention_policies` — configurable retention intent and non-destructive eligibility calculations.
-- `audit_logs.prev_hash` / `audit_logs.audit_hash` — linked tamper-evident audit-chain fields.
+## CI and production validation
 
-The v3.9.0 schema contains **61 relational tables** and **38 explicit indexes**. Fresh installs create schema v9 directly. The reference initialization also adds the two audit-chain columns to an existing audit table when absent and backfills blank legacy hashes in sequence. Production PostgreSQL upgrades should still be managed through an approved migration framework rather than relying on application startup as the long-term migration strategy.
+GitHub Actions validates both supported database modes. The mandatory pipeline includes:
 
+- SQLite regression on Python 3.11 and 3.12;
+- deterministic engineering-evidence drift detection;
+- migration `upgrade` + `check` validation on an isolated SQLite database;
+- PostgreSQL 16 connectivity and strict production-readiness checks;
+- PostgreSQL migration-contract validation;
+- PostgreSQL concurrency smokes across inventory, audit, procurement, reservations, workflow, dispatch, transfers, preventive maintenance, alarms, inspections, business numbers, reorder generation, outbox delivery, scheduler singleton behavior and telemetry ordering/integrity;
+- live PostgreSQL HTTP smoke testing.
 
-## Schema v6 planning tables
+Before production deployment, run at minimum:
 
-- `approval_delegations` — temporary user-to-user approval authority with module/effective-date scope.
-- `asset_health_snapshots` — persisted point-in-time health score, band and factor breakdown for each asset.
+```bash
+python scripts/postgres_preflight.py
+python scripts/migrate.py upgrade
+python scripts/migrate.py check
+python scripts/production_readiness.py --strict-production --require-postgres --check-db
+```
 
-The live asset-health endpoint recalculates from current transactional state; snapshots are persisted on explicit recalculation and automation runs.
-
-
-## Schema v7 — workforce and planning readiness
-
-Schema v7 adds `crafts`, `technician_profiles`, `shift_templates`, `technician_shift_assignments`, `technician_absences`, `work_order_requirements` and `work_order_craft_requirements`. These records keep resource availability and planned material/craft demand normalized instead of embedding schedules or spare lists in free-text work-order fields.
-
-
-## v3.8 execution tables
-
-- `inventory_reservations` — work-order-specific material reservation, issued quantity and release state.
-- `dispatch_assignments` — technician dispatch lifecycle, ETA and field arrival timestamps.
-- `asset_outages` — explicit asset downtime/outage evidence linked to assets, sites and optionally work orders.
-
-Indexes support active reservation lookup by work/item, dispatch lookup by technician/work, and outage analysis by asset/site and timestamp. Reserved stock is protected from generic issue/transfer transactions so allocated work cannot be silently starved by unrelated stock movements.
+Production deployments should additionally use encrypted connections, managed secrets, automated backup/PITR, database monitoring, least-privilege roles and an approved migration/deployment change process.
