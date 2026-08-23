@@ -158,3 +158,57 @@ def test_restore_removes_stale_wal_sidecars(tmp_path: Path):
     finally:
         conn.close()
     assert rows == [("alpha",), ("beta",)]
+
+
+def _make_postgres_backup(tmp_path: Path) -> Path:
+    backup = tmp_path / "pg-backup"
+    backup.mkdir()
+    artifact = backup / "database.pgdump"
+    artifact.write_bytes(b"PGDMP-fake")
+    manifest = {
+        "format_version": 1,
+        "created_at": "2026-08-24T00:00:00+00:00",
+        "application": "EUAS",
+        "app_version": "3.9.0",
+        "schema_version": 10,
+        "database_backend": "postgresql",
+        "artifacts": [
+            {
+                "path": "database.pgdump",
+                "bytes": artifact.stat().st_size,
+                "sha256": __import__("hashlib").sha256(artifact.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    (backup / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return backup
+
+
+def test_postgres_restore_requires_force_before_touching_target(
+    tmp_path: Path, monkeypatch
+):
+    import scripts.disaster_recovery as dr
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(dr, "_require_executable", lambda name: f"/fake/{name}")
+
+    def fake_run(command, **kwargs):
+        calls.append(tuple(command))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(dr.subprocess, "run", fake_run)
+    backup = _make_postgres_backup(tmp_path)
+
+    with pytest.raises(RuntimeError, match=r"use --force"):
+        dr.restore_backup(
+            backup, target_database_url="postgresql://euas:secret@db-host/euas"
+        )
+
+    # The refusal must happen before pg_restore is ever invoked.
+    result = dr.restore_backup(
+        backup, target_database_url="postgresql://euas:secret@db-host/euas", force=True
+    )
+    assert result["restored"] is True
+    assert any("--clean" in str(args) for args in calls)

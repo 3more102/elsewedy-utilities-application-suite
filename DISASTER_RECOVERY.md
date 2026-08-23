@@ -104,7 +104,7 @@ python scripts/disaster_recovery.py restore backups/euas-backup-YYYYMMDDTHHMMSSZ
   --force
 ```
 
-The restore uses `--clean --if-exists --no-owner`. Run it only against the intended recovery database.
+The restore uses `--clean --if-exists --no-owner`, which drops and recreates every object in the target database; `--force` is therefore required, matching the SQLite restore gate. Run it only against the intended recovery database.
 
 ## Restore uploads
 

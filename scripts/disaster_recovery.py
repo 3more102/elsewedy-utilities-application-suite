@@ -271,6 +271,13 @@ def restore_backup(
     else:
         if not target_database_url.startswith(("postgresql://", "postgres://")):
             raise ValueError("--target-database-url is required for PostgreSQL restore")
+        # pg_restore --clean drops and recreates every object in the target
+        # database, so a mistyped URL silently destroys a live deployment.
+        # Require the same explicit --force gate as the SQLite path.
+        if not force:
+            raise RuntimeError(
+                "PostgreSQL restore replaces existing objects (--clean); use --force"
+            )
         pg_restore = _require_executable("pg_restore")
         subprocess.run(
             [
