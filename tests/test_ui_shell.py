@@ -19,6 +19,7 @@ COMMAND_CSS = ROOT / "static" / "command-palette.css"
 COMMAND_JS = ROOT / "static" / "command-palette.js"
 SHORTCUT_CSS = ROOT / "static" / "shortcut-center.css"
 SHORTCUT_JS = ROOT / "static" / "shortcut-center.js"
+HELP_SECURITY_JS = ROOT / "static" / "help-security.js"
 SERVICE_WORKER = ROOT / "static" / "sw.js"
 
 
@@ -41,6 +42,7 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert COMMAND_JS.exists()
     assert SHORTCUT_CSS.exists()
     assert SHORTCUT_JS.exists()
+    assert HELP_SECURITY_JS.exists()
     assert SERVICE_WORKER.exists()
     assert 'href="/static/styles.css"' in html
     assert 'href="/static/ui-refresh.css"' in html
@@ -59,6 +61,7 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert 'src="/static/command-palette.js"' in html
     assert 'src="/static/navigation-history.js"' in html
     assert 'src="/static/shortcut-center.js"' in html
+    assert 'src="/static/help-security.js"' in html
 
     html_assets = set(re.findall(r'(?:href|src)="(/static/[^"]+)"', html))
     assert html_assets
@@ -108,6 +111,19 @@ def test_ui_shell_has_accessibility_landmarks():
     assert 'aria-modal="true"' in html
     assert 'role="status" aria-live="polite"' in html
     assert 'role="alert" aria-live="polite"' in html
+
+
+def test_help_security_override_is_last_and_credential_free():
+    html = INDEX.read_text(encoding="utf-8")
+    help_js = HELP_SECURITY_JS.read_text(encoding="utf-8")
+    scripts = re.findall(r'<script src="([^"]+)"', html)
+
+    assert scripts[-1] == '/static/help-security.js'
+    assert scripts.index('/static/help-security.js') > scripts.index('/static/app.js')
+    assert "helpButton.onclick=openCredentialSafeHelp" in help_js
+    assert "Credentials are managed by your administrator" in help_js
+    assert "EUAS@2026" not in help_js
+    assert "Tech@2026" not in help_js
 
 
 def test_ui_refresh_includes_responsive_and_motion_safety_rules():
@@ -246,12 +262,13 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "aria-describedby" in shortcut_js
     assert "Browser Back / Forward" in shortcut_js
 
-    assert "euas-shell-v3.9.0-ui11" in service_worker
+    assert "euas-shell-v3.9.0-ui12" in service_worker
     assert "'/static/command-palette.css'" in service_worker
     assert "'/static/command-palette.js'" in service_worker
     assert "'/static/shortcut-center.css'" in service_worker
     assert "'/static/shortcut-center.js'" in service_worker
     assert "'/static/navigation-history.js'" in service_worker
+    assert "'/static/help-security.js'" in service_worker
     assert "'/static/workspace-preferences.css'" in service_worker
     assert "'/static/operational-enhancements.js'" in service_worker
     assert "url.origin===self.location.origin" in service_worker
