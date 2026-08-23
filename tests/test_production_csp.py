@@ -283,6 +283,8 @@ def test_production_wrapper_replaces_browser_and_isolation_headers():
 def test_production_entrypoint_matches_external_script_shell_contract():
     dockerfile = (ROOT / 'Dockerfile').read_text(encoding='utf-8')
     html = (ROOT / 'static' / 'index.html').read_text(encoding='utf-8')
+    app_js = (ROOT / 'static' / 'app.js').read_text(encoding='utf-8')
+    action_bridge = (ROOT / 'static' / 'csp-action-bridge.js').read_text(encoding='utf-8')
     postgres_smoke = (ROOT / 'scripts' / 'postgres_smoke_test.py').read_text(encoding='utf-8')
     production_source = (ROOT / 'app' / 'production.py').read_text(encoding='utf-8')
 
@@ -302,6 +304,30 @@ def test_production_entrypoint_matches_external_script_shell_contract():
     assert script_tags
     assert all(re.search(r'\bsrc="/static/[^"]+"', tag, flags=re.I) for tag in script_tags)
     assert not re.search(r'\son[a-z]+\s*=', html, flags=re.I)
+    assert '<script src="/static/app.js"></script><script src="/static/csp-action-bridge.js"></script>' in html
+
+    handlers = re.findall(r'onclick="([A-Za-z_$][\w$]*)\(([^\"]*)\)"', app_js)
+    assert handlers, 'legacy generated actions unexpectedly disappeared; remove the bridge instead of leaving dead compatibility code'
+    bridge_signatures = dict(re.findall(r"^\s{4}([A-Za-z_$][\w$]*):'(n|nn|s|ns)',?$", action_bridge, flags=re.M))
+    assert bridge_signatures
+    assert {name for name, _ in handlers} <= bridge_signatures.keys()
+    for name, arguments in handlers:
+        parts = [part.strip() for part in arguments.split(',', 1)]
+        if len(parts) == 1:
+            source_signature = 'n' if parts[0].startswith('${') else 's'
+        else:
+            source_signature = 'nn' if parts[1].startswith('${') else 'ns'
+        assert bridge_signatures[name] == source_signature, (name, arguments, bridge_signatures[name], source_signature)
+
+    assert "removeAttribute('onclick')" in action_bridge
+    assert "attributeFilter:['onclick']" in action_bridge
+    assert "new MutationObserver" in action_bridge
+    assert "closest?.('[data-euas-action]')" in action_bridge
+    assert 'globalThis[name]' in action_bridge
+    assert 'JSON.parse(decodeURIComponent(' in action_bridge
+    assert 'eval(' not in action_bridge
+    assert 'new Function' not in action_bridge
+
     application_source = (ROOT / 'app' / 'application.py').read_text(encoding='utf-8')
     report_renderer_source = (ROOT / 'app' / 'report_html.py').read_text(encoding='utf-8')
     report_css = (ROOT / 'static' / 'report.css').read_text(encoding='utf-8')
