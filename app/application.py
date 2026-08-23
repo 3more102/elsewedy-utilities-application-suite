@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 from urllib import request as urllib_request, error as urllib_error
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -742,7 +742,15 @@ def health():
 def health_ready():
     with db() as conn:
         counts={'users':conn.execute('SELECT COUNT(*) FROM users').fetchone()[0],'assets':conn.execute('SELECT COUNT(*) FROM assets').fetchone()[0]}
-    return {'status':'ready','database_backend':DB_BACKEND,'schema_version':SCHEMA_VERSION,'checks':counts}
+        applied=conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]
+    applied_version=0 if applied is None else int(applied)
+    payload={'status':'ready' if applied_version>=SCHEMA_VERSION else 'degraded','database_backend':DB_BACKEND,'schema_version':SCHEMA_VERSION,'applied_schema_version':applied_version,'checks':counts}
+    if payload['status']!='ready':
+        # Readiness must fail closed when database migrations lag the deployed
+        # application; reporting the constant as applied would mask a broken
+        # deployment behind a healthy-looking 200.
+        return JSONResponse(status_code=503,content=payload)
+    return payload
 
 # ---------- auth ----------
 @app.post('/api/auth/login')
