@@ -1,5 +1,29 @@
 # EUAS Operations Guide
 
+## Production credential bootstrap
+
+EUAS reference/demo mode retains packaged sample users so local demonstrations remain deterministic. Production mode does not permit those packaged passwords to remain active.
+
+For a fresh production database, configure both database and initial administrator secrets before startup. `EUAS_BOOTSTRAP_ADMIN_PASSWORD` must contain at least 16 characters and must not equal any packaged demo password.
+
+```bash
+export EUAS_POSTGRES_PASSWORD='replace-with-managed-database-secret'
+export EUAS_BOOTSTRAP_ADMIN_PASSWORD='replace-with-managed-admin-secret'
+docker compose -f docker-compose.postgres.yml up --build
+```
+
+On first production bootstrap, `omar` remains the initial administrator principal but receives the operator-supplied bootstrap password. Other seeded principals receive non-public derived passwords so the connected reference dataset can retain its foreign-key relationships without leaving known credentials active. Reset or provision those accounts through the normal administration/identity process before operational use.
+
+For an existing production database, startup scans active packaged demo principals. If one still matches its published demo password, startup refuses to proceed unless `EUAS_BOOTSTRAP_ADMIN_PASSWORD` is supplied; when supplied, those known credentials are rotated and their active/legacy sessions are revoked. Once no packaged password remains, an existing production database can restart without retaining the bootstrap secret in its environment.
+
+Deployment preflight exposes this as the `default_credentials` check:
+
+```bash
+python scripts/production_readiness.py --strict-production --require-postgres --check-db
+```
+
+`default_credentials` is a hard failure in production and only a warning in reference/demo mode.
+
 ## Automation engine
 
 EUAS v3.9.0 includes an auditable automation engine for recurring operational controls. Each run is recorded in `job_runs` with a unique run number, trigger source, actor, business date, completion status and JSON summary.
