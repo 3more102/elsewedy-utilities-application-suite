@@ -60,6 +60,11 @@ def _assert_security_headers(headers: dict[str, str]) -> None:
     assert headers.get('referrer-policy', '').casefold() == 'strict-origin-when-cross-origin', headers
     csp = headers.get('content-security-policy', '')
     assert "default-src 'self'" in csp, csp
+    assert "style-src 'self' 'unsafe-inline'" in csp, csp
+    assert "script-src 'self'" in csp, csp
+    assert "script-src 'self' 'unsafe-inline'" not in csp, csp
+    assert "script-src-attr 'none'" in csp, csp
+    assert "form-action 'self'" in csp, csp
     assert "frame-ancestors 'none'" in csp, csp
 
 
