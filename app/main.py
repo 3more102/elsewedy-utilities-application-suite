@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, csv, hashlib, hmac, io, json, logging, secrets, shutil, sqlite3, time, uuid, zipfile
+import asyncio, csv, hashlib, hmac, io, json, logging, secrets, shutil, sqlite3, zipfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -21,8 +21,9 @@ from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, 
 from apps.inspections import corrective_required, inspection_result
 from apps.hse import is_high_risk, risk_score, validate_hse_status
 from apps.projects import InvalidProjectTask, normalize_task_changes, recalculate_project_progress
-from apps.observability import record_request, request_metrics_snapshot
+from apps.observability import health_snapshot, readiness_snapshot, request_metrics_snapshot
 from apps.integrations import IntegrationKeyNotFound, create_integration_api_key as create_integration_key_record, list_integration_api_keys, revoke_integration_api_key as revoke_integration_key_record, telemetry_ingest_principal
+from api.middleware import security_headers
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
 from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
@@ -52,21 +53,7 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url='/api/docs', redoc_u
 # Production deployments should place EUAS behind a reverse proxy/WAF as well.
 logger = logging.getLogger('euas')
 
-@app.middleware('http')
-async def security_headers(request: Request, call_next):
-    request_id = request.headers.get('x-request-id') or uuid.uuid4().hex
-    started = time.perf_counter()
-    response = await call_next(request)
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    record_request(response.status_code, elapsed_ms)
-    response.headers['X-Request-ID'] = request_id
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Permissions-Policy'] = 'camera=(self), geolocation=(self), microphone=()'
-    response.headers['Cache-Control'] = 'no-store' if request.url.path.startswith('/api/') else response.headers.get('Cache-Control','no-cache')
-    response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
-    return response
+app.middleware('http')(security_headers)
 
 WRITE_ROLES = ('admin','asset_manager','maintenance_manager','planner','supervisor')
 WORK_ROLES = ('admin','maintenance_manager','planner','supervisor','technician')
@@ -1207,17 +1194,11 @@ class FieldSyncResolveIn(BaseModel):
 
 @app.get('/api/health')
 def health():
-    with db() as conn:
-        conn.execute('SELECT 1').fetchone()
-        r=conn.execute('SELECT MAX(version) FROM schema_migrations').fetchone();schema=r[0] if r and r[0] is not None else 0
-        last=conn.execute('SELECT run_no,status,finished_at FROM job_runs ORDER BY id DESC LIMIT 1').fetchone()
-    return {'status':'ok','application':APP_NAME,'version':APP_VERSION,'database_backend':DB_BACKEND,'schema_version':schema,'automation_interval_minutes':AUTOMATION_INTERVAL_MINUTES,'last_automation_run':dict(last) if last else None}
+    return health_snapshot()
 
 @app.get('/api/health/ready')
 def health_ready():
-    with db() as conn:
-        counts={'users':conn.execute('SELECT COUNT(*) FROM users').fetchone()[0],'assets':conn.execute('SELECT COUNT(*) FROM assets').fetchone()[0]}
-    return {'status':'ready','database_backend':DB_BACKEND,'schema_version':SCHEMA_VERSION,'checks':counts}
+    return readiness_snapshot()
 
 # ---------- auth ----------
 @app.post('/api/auth/login')
