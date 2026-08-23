@@ -238,6 +238,71 @@ def test_failed_event_retry_is_idempotent_and_audited_once():
         assert audits == 1
 
 
+def test_exhausted_event_retry_resets_budget_and_delivers(monkeypatch):
+    with TestClient(app):
+        suffix = uuid.uuid4().hex[:10]
+        with db() as conn:
+            user = _admin(conn)
+            event_id, event_no = _seed_event(
+                conn, suffix, status='Failed', attempts=_application.OUTBOX_MAX_ATTEMPTS
+            )
+
+        # An attempt-exhausted event is invisible to the automated processor.
+        monkeypatch.setattr(_application, 'EVENT_WEBHOOK_URL', '')
+        with db() as conn:
+            process_outbox_atomic(conn)
+        with db() as conn:
+            untouched = conn.execute(
+                'SELECT status,attempts FROM event_outbox WHERE id=?', (event_id,)
+            ).fetchone()
+        assert untouched['status'] == 'Failed'
+        assert int(untouched['attempts']) == _application.OUTBOX_MAX_ATTEMPTS
+
+        with db() as conn:
+            result = retry_outbox_event_atomic(conn, event_id, user)
+        assert result == {'ok': True, 'event_no': event_no}
+
+        with db() as conn:
+            event = conn.execute(
+                'SELECT status,attempts,processed_at,last_error FROM event_outbox WHERE id=?',
+                (event_id,),
+            ).fetchone()
+            audits = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM audit_logs
+                       WHERE module='Integration Events' AND action='RETRY'
+                         AND record_id=?""",
+                    (event_no,),
+                ).fetchone()[0]
+            )
+        assert event['status'] == 'Pending'
+        assert int(event['attempts']) == 0
+        assert event['processed_at'] is None
+        assert audits == 1
+
+        # The fresh budget makes the event eligible again and it delivers once.
+        calls: list[str | None] = []
+
+        def fake_urlopen(request, timeout=5):
+            calls.append(_event_header(request))
+            return _Response()
+
+        monkeypatch.setattr(_application, 'EVENT_WEBHOOK_URL', 'https://example.invalid/euas')
+        monkeypatch.setattr(_application.urllib_request, 'urlopen', fake_urlopen)
+        with db() as conn:
+            processed = process_outbox_atomic(conn)
+        assert processed['delivered'] >= 1
+        assert calls.count(event_no) == 1
+
+        with db() as conn:
+            event = conn.execute(
+                'SELECT status,attempts FROM event_outbox WHERE id=?',
+                (event_id,),
+            ).fetchone()
+        assert event['status'] == 'Delivered'
+        assert int(event['attempts']) == 1
+
+
 def test_automation_dispatches_event_only_after_business_commit(monkeypatch):
     with TestClient(app):
         suffix = uuid.uuid4().hex[:10]
