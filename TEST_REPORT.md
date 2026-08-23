@@ -1,15 +1,15 @@
 # EUAS v4.9.0 — QA / Verification Report
 
 **Release:** 4.9.0  
-**Schema:** 20
+**Schema:** 21
 
 ## Release gates
 
 | Verification | Result |
 |---|---|
-| Integrated pytest regression suite | **PASS — 65 tests** |
+| Integrated pytest regression suite | **PASS — 69 source definitions / 71 collected tests** |
 | Fresh Uvicorn HTTP smoke | **PASS — version 4.9.0 / RCM read surface** |
-| Fresh SQLite initialization | **PASS — schema 20, 87 tables, 82 indexes, integrity ok** |
+| Fresh SQLite initialization | **PASS — schema 21, 88 tables, 84 indexes, integrity ok** |
 | v4.8.0 → v4.9.0 SQLite schema upgrade | **PASS — 18 → 19** |
 | Python compile | **PASS** |
 | Frontend JavaScript syntax | **PASS** |

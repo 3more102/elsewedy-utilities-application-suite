@@ -180,6 +180,20 @@ def _ensure_schema_columns(conn):
     if cbm_rule_cols and 'asset_fmea_id' not in cbm_rule_cols: conn.execute('ALTER TABLE cbm_rules ADD COLUMN asset_fmea_id INTEGER REFERENCES asset_fmea(id) ON DELETE SET NULL')
     job_cols=_table_columns(conn,'jobs')
     if job_cols and 'current_attempt_no' not in job_cols: conn.execute('ALTER TABLE jobs ADD COLUMN current_attempt_no INTEGER NOT NULL DEFAULT 0')
+    outbox_cols=_table_columns(conn,'event_outbox')
+    if outbox_cols:
+        if 'current_attempt_no' not in outbox_cols: conn.execute('ALTER TABLE event_outbox ADD COLUMN current_attempt_no INTEGER NOT NULL DEFAULT 0')
+        if 'available_at' not in outbox_cols: conn.execute("ALTER TABLE event_outbox ADD COLUMN available_at TEXT NOT NULL DEFAULT ''")
+        if 'correlation_id' not in outbox_cols: conn.execute("ALTER TABLE event_outbox ADD COLUMN correlation_id TEXT NOT NULL DEFAULT ''")
+        if 'lease_owner' not in outbox_cols: conn.execute('ALTER TABLE event_outbox ADD COLUMN lease_owner TEXT')
+        if 'lease_expires_at' not in outbox_cols: conn.execute('ALTER TABLE event_outbox ADD COLUMN lease_expires_at TEXT')
+        if 'updated_at' not in outbox_cols: conn.execute("ALTER TABLE event_outbox ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE event_outbox SET available_at=created_at WHERE available_at='' OR available_at IS NULL")
+        conn.execute("UPDATE event_outbox SET updated_at=created_at WHERE updated_at='' OR updated_at IS NULL")
+        conn.execute('UPDATE event_outbox SET current_attempt_no=attempts WHERE current_attempt_no<attempts')
+        attempt_tables=_table_columns(conn,'event_delivery_attempts')
+        if attempt_tables:
+            conn.execute('''UPDATE event_outbox SET current_attempt_no=COALESCE((SELECT MAX(a.attempt_no) FROM event_delivery_attempts a WHERE a.event_id=event_outbox.id),current_attempt_no) WHERE EXISTS (SELECT 1 FROM event_delivery_attempts a WHERE a.event_id=event_outbox.id)''')
     cbm_event_cols=_table_columns(conn,'cbm_events')
     if cbm_event_cols and 'asset_fmea_id' not in cbm_event_cols: conn.execute('ALTER TABLE cbm_events ADD COLUMN asset_fmea_id INTEGER REFERENCES asset_fmea(id) ON DELETE SET NULL')
 
@@ -493,9 +507,17 @@ def init_db(hash_password):
         CREATE INDEX IF NOT EXISTS idx_sla_events_work ON sla_events(work_order_id,created_at);
         CREATE TABLE IF NOT EXISTS event_outbox(
           id INTEGER PRIMARY KEY AUTOINCREMENT, event_no TEXT UNIQUE NOT NULL, event_type TEXT NOT NULL, aggregate_type TEXT NOT NULL, aggregate_id TEXT NOT NULL,
-          payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Pending', attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, processed_at TEXT, last_error TEXT DEFAULT ''
+          payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Pending', attempts INTEGER NOT NULL DEFAULT 0, current_attempt_no INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+          available_at TEXT NOT NULL DEFAULT '', processed_at TEXT, last_error TEXT DEFAULT '', correlation_id TEXT NOT NULL DEFAULT '',
+          lease_owner TEXT, lease_expires_at TEXT, updated_at TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_outbox_status ON event_outbox(status,created_at);
+        CREATE TABLE IF NOT EXISTS event_delivery_attempts(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL REFERENCES event_outbox(id) ON DELETE CASCADE,
+          attempt_no INTEGER NOT NULL, worker_id TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL,
+          finished_at TEXT, error_message TEXT DEFAULT '', UNIQUE(event_id,attempt_no)
+        );
+        CREATE INDEX IF NOT EXISTS idx_event_delivery_attempts ON event_delivery_attempts(event_id,attempt_no);
         CREATE TABLE IF NOT EXISTS maintenance_cost_ledger(
           id INTEGER PRIMARY KEY AUTOINCREMENT, entry_no TEXT UNIQUE NOT NULL, work_order_id INTEGER REFERENCES work_orders(id),
           asset_id INTEGER REFERENCES assets(id), cost_type TEXT NOT NULL, amount REAL NOT NULL, quantity REAL NOT NULL DEFAULT 1,
@@ -734,6 +756,7 @@ def init_db(hash_password):
         CREATE INDEX IF NOT EXISTS idx_audit_chain ON audit_logs(id,audit_hash);
         ''')
         _ensure_schema_columns(conn)
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_outbox_dispatch ON event_outbox(status,available_at,id)')
         conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_readings_external ON telemetry_readings(channel_id,external_id) WHERE external_id IS NOT NULL')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_wo_fmea ON work_orders(asset_fmea_id,status)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_cbm_rules_fmea ON cbm_rules(asset_fmea_id,active)')

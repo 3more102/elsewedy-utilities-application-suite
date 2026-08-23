@@ -16,10 +16,30 @@ def event_conn():
              payload_json TEXT NOT NULL,
              status TEXT NOT NULL DEFAULT 'Pending',
              attempts INTEGER NOT NULL DEFAULT 0,
+             current_attempt_no INTEGER NOT NULL DEFAULT 0,
              created_at TEXT NOT NULL,
+             available_at TEXT NOT NULL DEFAULT '',
              processed_at TEXT,
-             last_error TEXT DEFAULT ''
+             last_error TEXT DEFAULT '',
+             correlation_id TEXT NOT NULL DEFAULT '',
+             lease_owner TEXT,
+             lease_expires_at TEXT,
+             updated_at TEXT NOT NULL DEFAULT ''
            )'''
+    )
+    conn.execute(
+        '''CREATE TABLE event_delivery_attempts(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             event_id INTEGER NOT NULL REFERENCES event_outbox(id) ON DELETE CASCADE,
+             attempt_no INTEGER NOT NULL,
+             worker_id TEXT NOT NULL,
+             status TEXT NOT NULL,
+             started_at TEXT NOT NULL,
+             finished_at TEXT,
+             error_message TEXT DEFAULT '',
+             UNIQUE(event_id,attempt_no)
+           )'''
+
     )
     return conn
 
