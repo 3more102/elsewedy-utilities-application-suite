@@ -424,8 +424,8 @@ def _evaluate_telemetry_alarm(conn, channel:dict, value:float, captured_at:str, 
             return {'action':'updated','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':severity}
         no=next_no(conn,'operational_alarms','alarm_no','ALM-',50001)
         cur=conn.execute("INSERT INTO operational_alarms(alarm_no,channel_id,asset_id,site_id,severity,status,alarm_type,message,trigger_value,threshold_value,opened_at,last_seen_at,occurrence_count) VALUES(?,?,?,?,?,'Open','Threshold',?,?,?,?,?,1)",(no,channel['id'],channel['asset_id'],site.get('site_id'),severity,message,value,threshold,captured_at,captured_at))
-        notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'maintenance_manager','operations',no)
-        notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'asset_manager','operations',no)
+        notify_once(conn,'Operational alarm',f"{no} â€” {message}",severity,None,'maintenance_manager','operations',no)
+        notify_once(conn,'Operational alarm',f"{no} â€” {message}",severity,None,'asset_manager','operations',no)
         emit_event(conn,'operations.alarm.opened','alarm',no,{'alarm_no':no,'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'severity':severity,'value':value,'threshold':threshold,'captured_at':captured_at})
         if actor_id:audit(conn,actor_id,'ALARM OPEN','Utilities Operations',no,'',{'channel':channel['channel_code'],'severity':severity,'value':value,'threshold':threshold})
         return {'action':'opened','alarm_id':cur.lastrowid,'alarm_no':no,'severity':severity}
@@ -492,7 +492,7 @@ def _run_sla_scan(conn,actor_id:int,target:date):
             if cur.rowcount:
                 response_breaches+=1
                 recipients={x for x in (w['assigned_to'],w['supervisor_id']) if x}
-                for uid in recipients: notify_once(conn,'SLA response breach',f"{w['wo_no']} — {w['title']} exceeded response target",'Critical',uid,None,'work',w['wo_no']+':sla-response')
+                for uid in recipients: notify_once(conn,'SLA response breach',f"{w['wo_no']} â€” {w['title']} exceeded response target",'Critical',uid,None,'work',w['wo_no']+':sla-response')
                 notify_once(conn,'SLA response breach',f"{w['wo_no']} exceeded response target",'Critical',None,'maintenance_manager','work',w['wo_no']+':sla-response')
                 emit_event(conn,'sla.response_breached','work_order',w['wo_no'],{'work_order_id':w['id'],'due_at':w['response_due']})
             conn.execute("UPDATE work_order_sla SET response_status='Breached',escalated_level=CASE WHEN escalated_level<1 THEN 1 ELSE escalated_level END,updated_at=? WHERE work_order_id=?",(now(),w['id']))
@@ -501,7 +501,7 @@ def _run_sla_scan(conn,actor_id:int,target:date):
             if cur.rowcount:
                 resolution_breaches+=1
                 recipients={x for x in (w['assigned_to'],w['supervisor_id']) if x}
-                for uid in recipients: notify_once(conn,'SLA resolution breach',f"{w['wo_no']} — {w['title']} exceeded resolution target",'Critical',uid,None,'work',w['wo_no']+':sla-resolution')
+                for uid in recipients: notify_once(conn,'SLA resolution breach',f"{w['wo_no']} â€” {w['title']} exceeded resolution target",'Critical',uid,None,'work',w['wo_no']+':sla-resolution')
                 notify_once(conn,'SLA resolution breach',f"{w['wo_no']} exceeded resolution target",'Critical',None,'maintenance_manager','work',w['wo_no']+':sla-resolution')
                 emit_event(conn,'sla.resolution_breached','work_order',w['wo_no'],{'work_order_id':w['id'],'due_at':w['resolution_due']})
             conn.execute("UPDATE work_order_sla SET resolution_status='Breached',escalated_level=CASE WHEN escalated_level<1 THEN 1 ELSE escalated_level END,updated_at=? WHERE work_order_id=?",(now(),w['id']))
@@ -550,7 +550,7 @@ def _generate_due_pm(conn, actor_id:int, target:date):
         no=next_no(conn,'work_orders','wo_no','WO-',10026)
         cur=conn.execute('''INSERT INTO work_orders(wo_no,title,description,asset_id,location_id,priority,status,work_type,requested_by,target_start,target_finish,instructions,pm_plan_id,created_at,updated_at) VALUES(?,?,?,?,?,?, 'Submitted','Preventive Maintenance',?,?,?,?,?,?,?)''',(no,p['name'],p['job_plan'],p['asset_id'],p['location_id'],p['priority'],actor_id,target.isoformat(),target.isoformat(),p['job_plan'],p['id'],now(),now()))
         _ensure_work_sla(conn,cur.lastrowid)
-        create_approval(conn,'Work Management','work_order',cur.lastrowid,no,f'Approve {no} — {p["name"]}',actor_id,assigned_role='supervisor')
+        create_approval(conn,'Work Management','work_order',cur.lastrowid,no,f'Approve {no} â€” {p["name"]}',actor_id,assigned_role='supervisor')
         workflow_event(conn,'Work Management','work_order',cur.lastrowid,no,'AUTO SUBMIT','', 'Submitted',actor_id,f'Generated from {p["pm_no"]}')
         next_due=p['next_due'];last_meter=p['last_meter']
         if p['trigger_type']=='Calendar' and p['interval_days']:
@@ -570,9 +570,9 @@ def _run_reorder_scan(conn, actor_id:int):
         existing=conn.execute("SELECT pr.id FROM purchase_requisitions pr JOIN purchase_requisition_items x ON x.pr_id=pr.id WHERE x.inventory_item_id=? AND pr.status NOT IN ('Received','Cancelled','Rejected') LIMIT 1",(i['id'],)).fetchone()
         if existing:continue
         qty=max(i['max_level']-i['current_stock'],i['reorder_point']-i['current_stock']+1,1);no=next_no(conn,'purchase_requisitions','pr_no','PR-',8001)
-        cur=conn.execute('INSERT INTO purchase_requisitions(pr_no,title,requester_id,site_id,status,justification,total_estimate,created_at) VALUES(?,?,?,?,?,?,?,?)',(no,f"Auto-replenishment — {i['item_no']}",actor_id,i['site_id'],'Submitted','Automatically generated because available stock reached reorder point.',qty*i['unit_price'],now()))
+        cur=conn.execute('INSERT INTO purchase_requisitions(pr_no,title,requester_id,site_id,status,justification,total_estimate,created_at) VALUES(?,?,?,?,?,?,?,?)',(no,f"Auto-replenishment â€” {i['item_no']}",actor_id,i['site_id'],'Submitted','Automatically generated because available stock reached reorder point.',qty*i['unit_price'],now()))
         conn.execute('INSERT INTO purchase_requisition_items(pr_id,inventory_item_id,description,quantity,estimated_unit_cost) VALUES(?,?,?,?,?)',(cur.lastrowid,i['id'],i['name'],qty,i['unit_price']))
-        create_approval(conn,'Procurement','purchase_requisition',cur.lastrowid,no,f'Approve {no} — Auto-replenishment',actor_id,assigned_role='procurement')
+        create_approval(conn,'Procurement','purchase_requisition',cur.lastrowid,no,f'Approve {no} â€” Auto-replenishment',actor_id,assigned_role='procurement')
         workflow_event(conn,'Procurement','purchase_requisition',cur.lastrowid,no,'AUTO SUBMIT','', 'Submitted',actor_id,'Automatic reorder')
         audit(conn,actor_id,'AUTO CREATE','Procurement',no,'',{'item':i['item_no'],'qty':qty});created.append(no)
         notify_once(conn,'Purchase requisition created',f'{no} created for {i["item_no"]}','Info',None,'procurement','procurement',no)
@@ -589,12 +589,12 @@ def _execute_automation(conn, actor_id:int, trigger_source='manual', as_of:Optio
         for w in overdue:
             recipients={x for x in (w['assigned_to'],w['supervisor_id']) if x}
             for uid in recipients:
-                overdue_alerts += int(notify_once(conn,'Overdue work order',f"{w['wo_no']} — {w['title']} is overdue",'Warning',uid,None,'work',w['wo_no']))
+                overdue_alerts += int(notify_once(conn,'Overdue work order',f"{w['wo_no']} â€” {w['title']} is overdue",'Warning',uid,None,'work',w['wo_no']))
         horizon=(target+timedelta(days=30)).isoformat()
         for a in rows(conn.execute("SELECT asset_no,name,warranty_expiry FROM assets WHERE warranty_expiry IS NOT NULL AND warranty_expiry>=? AND warranty_expiry<=?",(target.isoformat(),horizon))):
-            warranty_alerts += int(notify_once(conn,'Asset warranty expiring',f"{a['asset_no']} — {a['name']} warranty expires {a['warranty_expiry']}",'Warning',None,'asset_manager','assets',a['asset_no']))
+            warranty_alerts += int(notify_once(conn,'Asset warranty expiring',f"{a['asset_no']} â€” {a['name']} warranty expires {a['warranty_expiry']}",'Warning',None,'asset_manager','assets',a['asset_no']))
         for c in rows(conn.execute("SELECT contract_no,title,end_date FROM contracts WHERE status='Active' AND end_date IS NOT NULL AND end_date>=? AND end_date<=?",(target.isoformat(),horizon))):
-            contract_alerts += int(notify_once(conn,'Contract expiring',f"{c['contract_no']} — {c['title']} expires {c['end_date']}",'Warning',None,'procurement','contracts',c['contract_no']))
+            contract_alerts += int(notify_once(conn,'Contract expiring',f"{c['contract_no']} â€” {c['title']} expires {c['end_date']}",'Warning',None,'procurement','contracts',c['contract_no']))
         stale_cutoff=(datetime.combine(target,datetime.min.time())-timedelta(days=2)).isoformat(timespec='seconds')
         for ap in rows(conn.execute("SELECT * FROM approval_requests WHERE status='Pending' AND requested_at<?",(stale_cutoff,))):
             approval_alerts += int(notify_once(conn,'Approval overdue',f"{ap['record_code']} has been waiting for approval",'Warning',ap['assigned_user_id'],ap['assigned_role'],'approvals',ap['approval_no']))
@@ -603,7 +603,7 @@ def _execute_automation(conn, actor_id:int, trigger_source='manual', as_of:Optio
         for h in health_results:
             if h['risk_band']=='Critical':
                 critical_health+=1
-                notify_once(conn,'Critical asset health',f"{h['asset_no']} — {h['name']} health score {h['score']}",'Critical',None,'asset_manager','assets',h['asset_no']+':health')
+                notify_once(conn,'Critical asset health',f"{h['asset_no']} â€” {h['name']} health score {h['score']}",'Critical',None,'asset_manager','assets',h['asset_no']+':health')
         expired=conn.execute('UPDATE approval_delegations SET active=0 WHERE active=1 AND end_at<?',(now(),)).rowcount
         outbox=_process_outbox(conn)
         health_avg=round(sum(x['score'] for x in health_results)/max(len(health_results),1),1)
@@ -1088,7 +1088,7 @@ def alarm_create_work_order(alarm_id:int,body:AlarmWorkOrderIn,user=Depends(requ
             w=conn.execute('SELECT id,wo_no FROM work_orders WHERE id=?',(alarm['work_order_id'],)).fetchone();return {'id':w['id'],'wo_no':w['wo_no'],'existing':True}
         no=next_no(conn,'work_orders','wo_no','WO-',10026);priority='Critical' if alarm['severity']=='Critical' else 'High';finish=body.target_finish or (date.today()+timedelta(days=1 if priority=='Critical' else 2)).isoformat();title=f"Investigate {alarm['channel_name']} alarm";desc=f"Generated from {alarm['alarm_no']} on {alarm['asset_no']}. {alarm['message']}"
         cur=conn.execute("INSERT INTO work_orders(wo_no,title,description,asset_id,location_id,priority,status,work_type,failure_code,requested_by,assigned_to,supervisor_id,target_start,target_finish,estimated_hours,instructions,created_at,updated_at) VALUES(?,?,?,?,?,?,'Submitted','Corrective Maintenance',?,?,?,?,?,?,?,?,?,?)",(no,title,desc,alarm['asset_id'],alarm['location_id'],priority,f"ALARM-{alarm['channel_code']}",user['id'],body.assigned_to,body.supervisor_id,date.today().isoformat(),finish,2,body.notes or f"Validate {alarm['channel_name']} reading and investigate root cause.",now(),now()))
-        conn.execute('UPDATE operational_alarms SET work_order_id=? WHERE id=?',(cur.lastrowid,alarm_id));_ensure_work_sla(conn,cur.lastrowid);create_approval(conn,'Work Management','work_order',cur.lastrowid,no,f"Approve {no} — {title}",user['id'],assigned_user_id=body.supervisor_id,assigned_role=None if body.supervisor_id else 'maintenance_manager');workflow_event(conn,'Work Management','work_order',cur.lastrowid,no,'ALARM GENERATED','', 'Submitted',user['id'],alarm['alarm_no']);emit_event(conn,'operations.alarm.work_order_created','alarm',alarm['alarm_no'],{'alarm_no':alarm['alarm_no'],'work_order':no});audit(conn,user['id'],'CREATE WORK FROM ALARM','Utilities Operations',alarm['alarm_no'],'',no);return {'id':cur.lastrowid,'wo_no':no,'existing':False}
+        conn.execute('UPDATE operational_alarms SET work_order_id=? WHERE id=?',(cur.lastrowid,alarm_id));_ensure_work_sla(conn,cur.lastrowid);create_approval(conn,'Work Management','work_order',cur.lastrowid,no,f"Approve {no} â€” {title}",user['id'],assigned_user_id=body.supervisor_id,assigned_role=None if body.supervisor_id else 'maintenance_manager');workflow_event(conn,'Work Management','work_order',cur.lastrowid,no,'ALARM GENERATED','', 'Submitted',user['id'],alarm['alarm_no']);emit_event(conn,'operations.alarm.work_order_created','alarm',alarm['alarm_no'],{'alarm_no':alarm['alarm_no'],'work_order':no});audit(conn,user['id'],'CREATE WORK FROM ALARM','Utilities Operations',alarm['alarm_no'],'',no);return {'id':cur.lastrowid,'wo_no':no,'existing':False}
 
 @app.get('/api/operations/intelligence')
 def operations_intelligence(site_id:Optional[int]=None,user=Depends(current_user)):
@@ -1104,74 +1104,6 @@ def operations_intelligence(site_id:Optional[int]=None,user=Depends(current_user
 
 # ---------- assets ----------
 ASSET_SELECT='''SELECT a.*,at.name asset_type,at.utility_domain,l.name location_name,l.location_code,s.id site_id,s.name site_name,p.asset_no parent_asset_no,p.name parent_asset_name,u.full_name responsible_person,v.name vendor_name FROM assets a LEFT JOIN asset_types at ON at.id=a.asset_type_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id LEFT JOIN assets p ON p.id=a.parent_asset_id LEFT JOIN users u ON u.id=a.responsible_user_id LEFT JOIN vendors v ON v.id=a.vendor_id'''
-@app.get('/api/assets')
-def list_assets(q:str='',condition:str='',status:str='',site_id:Optional[int]=None,sort:str='asset_no',user=Depends(current_user)):
-    allowed={'asset_no':'a.asset_no','name':'a.name','condition':'a.condition','criticality':'a.criticality','current_value':'a.current_value'}; order=allowed.get(sort,'a.asset_no')
-    sql=ASSET_SELECT+' WHERE 1=1';args=[]
-    if q: sql+=' AND (a.asset_no LIKE ? OR a.name LIKE ? OR a.serial_no LIKE ? OR l.name LIKE ?)';like=f'%{q}%';args += [like]*4
-    if condition: sql+=' AND a.condition=?';args.append(condition)
-    if status: sql+=' AND a.status=?';args.append(status)
-    if site_id: sql+=' AND s.id=?';args.append(site_id)
-    sql+=f' ORDER BY {order}'
-    with db() as conn:return rows(conn.execute(sql,args))
-@app.get('/api/assets/{asset_id}')
-def get_asset(asset_id:int,user=Depends(current_user)):
-    with db() as conn:
-        a=get_or_404(conn,ASSET_SELECT+' WHERE a.id=?',(asset_id,),'Asset not found')
-        a['children']=rows(conn.execute('SELECT id,asset_no,name,condition,status FROM assets WHERE parent_asset_id=? ORDER BY asset_no',(asset_id,)))
-        a['meters']=rows(conn.execute('SELECT * FROM meters WHERE asset_id=?',(asset_id,)))
-        a['work_history']=rows(conn.execute('SELECT id,wo_no,title,status,priority,work_type,actual_finish,actual_cost FROM work_orders WHERE asset_id=? ORDER BY id DESC',(asset_id,)))
-        a['inspections']=rows(conn.execute('SELECT id,inspection_no,template_name,status,result,inspected_at FROM inspections WHERE asset_id=? ORDER BY id DESC',(asset_id,)))
-        a['documents']=rows(conn.execute('SELECT id,document_no,title,category,file_name,uploaded_at FROM documents WHERE asset_id=? ORDER BY id DESC',(asset_id,)))
-        a['outages']=rows(conn.execute('SELECT * FROM asset_outages WHERE asset_id=? ORDER BY start_at DESC',(asset_id,)))
-        a['telemetry_channels']=rows(conn.execute('SELECT * FROM telemetry_channels WHERE asset_id=? ORDER BY channel_code',(asset_id,)))
-        a['operational_alarms']=rows(conn.execute("SELECT oa.*,tc.channel_code,tc.name channel_name,tc.unit FROM operational_alarms oa JOIN telemetry_channels tc ON tc.id=oa.channel_id WHERE oa.asset_id=? ORDER BY oa.id DESC",(asset_id,)))
-        a['cost_ledger']=rows(conn.execute('''SELECT c.*,w.wo_no,u.full_name posted_by_name FROM maintenance_cost_ledger c LEFT JOIN work_orders w ON w.id=c.work_order_id LEFT JOIN users u ON u.id=c.posted_by WHERE c.asset_id=? ORDER BY c.id DESC''',(asset_id,)))
-        a['cost_summary']=rows(conn.execute('SELECT cost_type,COUNT(*) entries,COALESCE(SUM(amount),0) amount FROM maintenance_cost_ledger WHERE asset_id=? GROUP BY cost_type ORDER BY amount DESC',(asset_id,)))
-        a['lifetime_maintenance_cost']=sum(float(x['amount']) for x in a['cost_summary'])
-        return a
-@app.get('/api/assets/{asset_id}/timeline')
-def asset_timeline(asset_id:int,user=Depends(current_user)):
-    with db() as conn:
-        a=get_or_404(conn,'SELECT id,asset_no,name FROM assets WHERE id=?',(asset_id,),'Asset not found')
-        events=[]
-        for w in rows(conn.execute('SELECT id,wo_no,title,status,priority,created_at,actual_finish,actual_cost FROM work_orders WHERE asset_id=?',(asset_id,))):
-            events.append({'at':w['created_at'],'type':'Work Order','code':w['wo_no'],'title':w['title'],'detail':f"Created · {w['priority']} · {w['status']}",'module':'work','id':w['id']})
-            if w['actual_finish']:events.append({'at':w['actual_finish'],'type':'Maintenance','code':w['wo_no'],'title':w['title'],'detail':f"Completed · cost {float(w['actual_cost']):.2f}",'module':'work','id':w['id']})
-        for i in rows(conn.execute('SELECT id,inspection_no,template_name,status,result,created_at,inspected_at FROM inspections WHERE asset_id=?',(asset_id,))):
-            events.append({'at':i['inspected_at'] or i['created_at'],'type':'Inspection','code':i['inspection_no'],'title':i['template_name'],'detail':f"{i['result'] or i['status']}",'module':'inspections','id':i['id']})
-        for m in rows(conn.execute('''SELECT mr.id,m.meter_code,m.unit,mr.reading,mr.reading_at,u.full_name FROM meter_readings mr JOIN meters m ON m.id=mr.meter_id JOIN users u ON u.id=mr.entered_by WHERE m.asset_id=?''',(asset_id,))):
-            events.append({'at':m['reading_at'],'type':'Meter','code':m['meter_code'],'title':f"Meter reading {m['reading']} {m['unit']}",'detail':m['full_name'],'module':'assets','id':asset_id})
-        for d in rows(conn.execute('SELECT id,document_no,title,category,uploaded_at FROM documents WHERE asset_id=?',(asset_id,))):
-            events.append({'at':d['uploaded_at'],'type':'Document','code':d['document_no'],'title':d['title'],'detail':d['category'],'module':'documents','id':d['id']})
-        for c in rows(conn.execute('SELECT id,entry_no,cost_type,amount,reference,posted_at FROM maintenance_cost_ledger WHERE asset_id=?',(asset_id,))):
-            events.append({'at':c['posted_at'],'type':'Cost','code':c['entry_no'],'title':c['cost_type'],'detail':f"{float(c['amount']):.2f} · {c['reference']}",'module':'analytics','id':c['id']})
-        for aev in rows(conn.execute('SELECT oa.id,oa.alarm_no,oa.severity,oa.status,oa.message,oa.opened_at,tc.channel_code FROM operational_alarms oa JOIN telemetry_channels tc ON tc.id=oa.channel_id WHERE oa.asset_id=?',(asset_id,))):
-            events.append({'at':aev['opened_at'],'type':'Operational Alarm','code':aev['alarm_no'],'title':aev['message'],'detail':f"{aev['severity']} · {aev['status']} · {aev['channel_code']}",'module':'telemetry','id':aev['id']})
-        events.sort(key=lambda x:x['at'] or '',reverse=True)
-        return {'asset':a,'events':events}
-
-def _asset_dossier(conn,asset_id:int):
-    a=get_or_404(conn,ASSET_SELECT+' WHERE a.id=?',(asset_id,),'Asset not found')
-    return {
-      'asset':a,
-      'children':rows(conn.execute('SELECT asset_no,name,condition,status FROM assets WHERE parent_asset_id=? ORDER BY asset_no',(asset_id,))),
-      'work_orders':rows(conn.execute('SELECT wo_no,title,status,priority,work_type,actual_start,actual_finish,actual_hours,actual_cost FROM work_orders WHERE asset_id=? ORDER BY id DESC',(asset_id,))),
-      'inspections':rows(conn.execute('SELECT inspection_no,template_name,status,result,inspected_at,remarks FROM inspections WHERE asset_id=? ORDER BY id DESC',(asset_id,))),
-      'documents':rows(conn.execute('SELECT document_no,title,category,file_name,uploaded_at FROM documents WHERE asset_id=? ORDER BY id DESC',(asset_id,))),
-      'costs':rows(conn.execute('SELECT entry_no,cost_type,amount,quantity,reference,posted_at FROM maintenance_cost_ledger WHERE asset_id=? ORDER BY id DESC',(asset_id,))),
-      'meter_readings':rows(conn.execute('''SELECT m.meter_code,m.meter_type,m.unit,mr.reading,mr.reading_at FROM meter_readings mr JOIN meters m ON m.id=mr.meter_id WHERE m.asset_id=? ORDER BY mr.id DESC''',(asset_id,)))
-    }
-
-@app.post('/api/assets/{asset_id}/dossier')
-def generate_asset_dossier(asset_id:int,user=Depends(current_user)):
-    with db() as conn:
-        payload=_asset_dossier(conn,asset_id);a=payload['asset'];serialized=json.dumps(payload,ensure_ascii=False,sort_keys=True,default=str,separators=(',',':'))
-        digest=hashlib.sha256(serialized.encode()).hexdigest();no=next_no(conn,'report_snapshots','report_no','RPT-',10001)
-        cur=conn.execute('INSERT INTO report_snapshots(report_no,report_type,scope_type,scope_id,title,snapshot_json,content_hash,generated_by,generated_at) VALUES(?,?,?,?,?,?,?,?,?)',(no,'Asset Dossier','asset',a['asset_no'],f"{a['asset_no']} — {a['name']} Asset Dossier",serialized,digest,user['id'],now()))
-        audit(conn,user['id'],'GENERATE REPORT','Reports',no,'',{'scope':a['asset_no'],'sha256':digest})
-        return {'id':cur.lastrowid,'report_no':no,'title':f"{a['asset_no']} — {a['name']} Asset Dossier",'content_hash':digest}
-
 @app.get('/api/reports/snapshots')
 def report_snapshots(scope_type:str='',scope_id:str='',limit:int=Query(100,ge=1,le=500),user=Depends(current_user)):
     sql='''SELECT r.id,r.report_no,r.report_type,r.scope_type,r.scope_id,r.title,r.content_hash,r.generated_at,u.full_name generated_by_name FROM report_snapshots r JOIN users u ON u.id=r.generated_by WHERE 1=1''';args=[]
@@ -1196,39 +1128,11 @@ def verify_report_snapshot(report_id:int,user=Depends(current_user)):
 def report_snapshot_html(report_id:int,user=Depends(current_user)):
     with db() as conn:r=get_or_404(conn,'SELECT * FROM report_snapshots WHERE id=?',(report_id,),'Report snapshot not found')
     d=json.loads(r['snapshot_json']);a=d['asset'];works=d['work_orders'];costs=d['costs'];total=sum(float(x['amount']) for x in costs)
-    html=f'''<html><head><title>{r['report_no']}</title><style>body{{font-family:Arial;margin:40px;color:#172033}}h1{{color:#c9272c}}table{{border-collapse:collapse;width:100%;margin:12px 0}}td,th{{border:1px solid #ddd;padding:8px;text-align:left}}small{{color:#666}}</style></head><body><h1>ELSEWEDY UTILITIES</h1><h2>{r['title']}</h2><p><b>Report:</b> {r['report_no']}<br><b>Snapshot:</b> {r['generated_at']}<br><b>SHA-256:</b> {r['content_hash']}</p><h3>Asset</h3><p><b>{a['asset_no']} — {a['name']}</b><br>{a.get('site_name') or ''} · {a.get('location_name') or ''}<br>Condition: {a['condition']} | Status: {a['status']} | Criticality: {a['criticality']}</p><h3>Maintenance Cost</h3><p><b>{total:.2f}</b></p><h3>Work History</h3><table><tr><th>WO</th><th>Description</th><th>Status</th><th>Hours</th><th>Cost</th></tr>{''.join(f"<tr><td>{x['wo_no']}</td><td>{x['title']}</td><td>{x['status']}</td><td>{x['actual_hours']}</td><td>{x['actual_cost']}</td></tr>" for x in works)}</table><small>Immutable EUAS report snapshot · Developed by Omar & Seif</small></body></html>'''
+    html=f'''<html><head><title>{r['report_no']}</title><style>body{{font-family:Arial;margin:40px;color:#172033}}h1{{color:#c9272c}}table{{border-collapse:collapse;width:100%;margin:12px 0}}td,th{{border:1px solid #ddd;padding:8px;text-align:left}}small{{color:#666}}</style></head><body><h1>ELSEWEDY UTILITIES</h1><h2>{r['title']}</h2><p><b>Report:</b> {r['report_no']}<br><b>Snapshot:</b> {r['generated_at']}<br><b>SHA-256:</b> {r['content_hash']}</p><h3>Asset</h3><p><b>{a['asset_no']} ??? {a['name']}</b><br>{a.get('site_name') or ''} ?? {a.get('location_name') or ''}<br>Condition: {a['condition']} | Status: {a['status']} | Criticality: {a['criticality']}</p><h3>Maintenance Cost</h3><p><b>{total:.2f}</b></p><h3>Work History</h3><table><tr><th>WO</th><th>Description</th><th>Status</th><th>Hours</th><th>Cost</th></tr>{''.join(f"<tr><td>{x['wo_no']}</td><td>{x['title']}</td><td>{x['status']}</td><td>{x['actual_hours']}</td><td>{x['actual_cost']}</td></tr>" for x in works)}</table><small>Immutable EUAS report snapshot ?? Developed by Omar & Seif</small></body></html>'''
     return HTMLResponse(html)
 
-@app.post('/api/assets')
-def create_asset(body:AssetIn,user=Depends(require_roles(*WRITE_ROLES))):
-    with db() as conn:
-        asset_no=body.asset_no or next_no(conn,'assets','asset_no','AST-',1000)
-        vals=body.model_dump(); vals['asset_no']=asset_no
-        cols=list(vals); qs=','.join('?'*len(cols))
-        cur=conn.execute(f"INSERT INTO assets({','.join(cols)},created_at,updated_at) VALUES({qs},?,?)",(*[vals[c] for c in cols],now(),now()))
-        audit(conn,user['id'],'CREATE','Assets',asset_no,'',vals)
-        return {'id':cur.lastrowid,'asset_no':asset_no}
-@app.patch('/api/assets/{asset_id}')
-def update_asset(asset_id:int,body:AssetPatch,user=Depends(require_roles(*WRITE_ROLES))):
-    changes={k:v for k,v in body.model_dump().items() if v is not None}
-    with db() as conn:
-        old=get_or_404(conn,'SELECT * FROM assets WHERE id=?',(asset_id,),'Asset not found')
-        if changes:
-            conn.execute('UPDATE assets SET '+','.join(f'{k}=?' for k in changes)+',updated_at=? WHERE id=?',(*changes.values(),now(),asset_id)); audit(conn,user['id'],'UPDATE','Assets',old['asset_no'],old,changes)
-        return {'ok':True}
-@app.delete('/api/assets/{asset_id}')
-def delete_asset(asset_id:int,user=Depends(require_roles('admin','asset_manager'))):
-    with db() as conn:
-        old=get_or_404(conn,'SELECT * FROM assets WHERE id=?',(asset_id,),'Asset not found')
-        refs=conn.execute('SELECT COUNT(*) FROM work_orders WHERE asset_id=?',(asset_id,)).fetchone()[0]+conn.execute('SELECT COUNT(*) FROM assets WHERE parent_asset_id=?',(asset_id,)).fetchone()[0]
-        if refs: raise HTTPException(409,'Asset has linked history or child assets; retire it instead of deleting it')
-        conn.execute('DELETE FROM assets WHERE id=?',(asset_id,));audit(conn,user['id'],'DELETE','Assets',old['asset_no'],old,'')
-        return {'ok':True}
-@app.get('/api/assets-export.csv')
-def export_assets(user=Depends(current_user)):
-    with db() as conn:data=rows(conn.execute(ASSET_SELECT+' ORDER BY a.asset_no'))
-    out=io.StringIO(); fields=['asset_no','name','category','manufacturer','model','serial_no','criticality','condition','status','site_name','location_name','department','responsible_person','current_value','next_maintenance'];w=csv.DictWriter(out,fieldnames=fields,extrasaction='ignore');w.writeheader();w.writerows(data)
-    return StreamingResponse(iter([out.getvalue()]),media_type='text/csv',headers={'Content-Disposition':'attachment; filename=EUAS_assets.csv'})
+# Asset registry API ownership lives in asset_store.py; ASSET_SELECT and the
+# shared health engine remain here for cross-domain consumers.
 @app.post('/api/meters/{meter_id}/readings')
 def add_meter_reading(meter_id:int,body:MeterReadingIn,user=Depends(require_roles(*WORK_ROLES))):
     with db() as conn:
@@ -1274,7 +1178,7 @@ def create_work(body:WorkOrderIn,user=Depends(require_roles(*WRITE_ROLES))):
         for seq,task in enumerate(checklist,1): conn.execute("INSERT INTO work_order_tasks(work_order_id,sequence_no,task,status) VALUES(?,?,?,'Pending')",(cur.lastrowid,seq,task))
         _ensure_work_sla(conn,cur.lastrowid)
         workflow_event(conn,'Work Management','work_order',cur.lastrowid,no,'CREATE','', 'Draft',user['id'])
-        if body.assigned_to: notify(conn,'Work order assigned',f'{no} — {body.title}','High' if body.priority in ('High','Critical','Emergency') else 'Info',body.assigned_to,None,'work',no)
+        if body.assigned_to: notify(conn,'Work order assigned',f'{no} â€” {body.title}','High' if body.priority in ('High','Critical','Emergency') else 'Info',body.assigned_to,None,'work',no)
         audit(conn,user['id'],'CREATE','Work Management',no,'',body.model_dump());return {'id':cur.lastrowid,'wo_no':no}
 @app.patch('/api/work-orders/{wo_id}')
 def update_work(wo_id:int,body:WorkOrderPatch,user=Depends(require_roles(*WRITE_ROLES))):
@@ -1284,7 +1188,7 @@ def update_work(wo_id:int,body:WorkOrderPatch,user=Depends(require_roles(*WRITE_
         if changes:
             conn.execute('UPDATE work_orders SET '+','.join(f'{k}=?' for k in changes)+',updated_at=? WHERE id=?',(*changes.values(),now(),wo_id));audit(conn,user['id'],'UPDATE','Work Management',old['wo_no'],old,changes)
             if 'priority' in changes:_ensure_work_sla(conn,wo_id,force=True)
-            if 'assigned_to' in changes and changes['assigned_to']:notify(conn,'Work order assigned',f"{old['wo_no']} — {changes.get('title',old['title'])}",'Info',changes['assigned_to'],None,'work',old['wo_no'])
+            if 'assigned_to' in changes and changes['assigned_to']:notify(conn,'Work order assigned',f"{old['wo_no']} â€” {changes.get('title',old['title'])}",'Info',changes['assigned_to'],None,'work',old['wo_no'])
         return {'ok':True}
 TRANSITIONS={'Draft':{'submit':'Submitted'},'Rejected':{'resubmit':'Submitted'},'Submitted':{'approve':'Approved'},'Approved':{'assign':'Assigned'},'Assigned':{'start':'In Progress'},'In Progress':{'pause':'Assigned','complete':'Completed'},'Completed':{'close':'Closed'}}
 ACTION_ROLES={
@@ -1309,7 +1213,7 @@ def transition_work(wo_id:int,body:TransitionIn,user=Depends(require_roles(*WORK
         if action=='start':_mark_sla_response(conn,wo_id,fields['actual_start'])
         if action=='complete':_mark_sla_resolution(conn,wo_id,fields['actual_finish'])
         if action in ('submit','resubmit'):
-            create_approval(conn,'Work Management','work_order',wo_id,w['wo_no'],f"Approve {w['wo_no']} — {w['title']}",user['id'],assigned_user_id=w['supervisor_id'],assigned_role=None if w['supervisor_id'] else 'maintenance_manager')
+            create_approval(conn,'Work Management','work_order',wo_id,w['wo_no'],f"Approve {w['wo_no']} â€” {w['title']}",user['id'],assigned_user_id=w['supervisor_id'],assigned_role=None if w['supervisor_id'] else 'maintenance_manager')
         if action=='approve':resolve_approval(conn,'Work Management','work_order',wo_id,'approve',user['id'],body.notes)
         if target=='Closed' and w['asset_id']:
             conn.execute('UPDATE assets SET last_maintenance=?,updated_at=? WHERE id=?',(date.today().isoformat(),now(),w['asset_id']))
@@ -1425,7 +1329,7 @@ def add_work_craft_requirement(wo_id:int,body:CraftRequirementIn,user=Depends(re
 def add_labor(wo_id:int,body:LaborIn,user=Depends(require_roles(*WORK_ROLES))):
     with db() as conn:
         w=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(wo_id,),'Work order not found');uid=body.user_id or user['id'];work_date=body.work_date or date.today().isoformat();cost=body.hours*body.labor_rate
-        conn.execute('INSERT INTO labor_entries(work_order_id,user_id,hours,labor_rate,notes,work_date) VALUES(?,?,?,?,?,?)',(wo_id,uid,body.hours,body.labor_rate,body.notes,work_date));conn.execute('UPDATE work_orders SET actual_hours=actual_hours+?,actual_cost=actual_cost+?,updated_at=? WHERE id=?',(body.hours,cost,now(),wo_id));post_cost(conn,w,'Labor',cost,body.hours,f'{body.hours:g} h × {body.labor_rate:g}',user['id']);audit(conn,user['id'],'ADD LABOR','Work Management',w['wo_no'],'',{'hours':body.hours,'user_id':uid,'cost':cost});return {'ok':True}
+        conn.execute('INSERT INTO labor_entries(work_order_id,user_id,hours,labor_rate,notes,work_date) VALUES(?,?,?,?,?,?)',(wo_id,uid,body.hours,body.labor_rate,body.notes,work_date));conn.execute('UPDATE work_orders SET actual_hours=actual_hours+?,actual_cost=actual_cost+?,updated_at=? WHERE id=?',(body.hours,cost,now(),wo_id));post_cost(conn,w,'Labor',cost,body.hours,f'{body.hours:g} h Ã— {body.labor_rate:g}',user['id']);audit(conn,user['id'],'ADD LABOR','Work Management',w['wo_no'],'',{'hours':body.hours,'user_id':uid,'cost':cost});return {'ok':True}
 @app.post('/api/work-orders/{wo_id}/materials')
 def add_material(wo_id:int,body:MaterialIn,user=Depends(require_roles(*INV_ROLES))):
     with db() as conn:
@@ -1448,7 +1352,7 @@ def add_material(wo_id:int,body:MaterialIn,user=Depends(require_roles(*INV_ROLES
             issued=conn.execute('SELECT COALESCE(SUM(quantity),0) FROM work_order_materials WHERE work_order_id=? AND inventory_item_id=?',(wo_id,body.item_id)).fetchone()[0] or 0
             conn.execute('UPDATE work_order_requirements SET status=? WHERE id=?',('Fulfilled' if float(issued)>=float(req['quantity']) else 'Required',req['id']))
         fresh=conn.execute('SELECT current_stock,reserved_stock,reorder_point FROM inventory_items WHERE id=?',(body.item_id,)).fetchone();new_stock=float(fresh['current_stock'])
-        if new_stock-float(fresh['reserved_stock'])<=float(fresh['reorder_point']):notify(conn,'Inventory below reorder point',f"{i['item_no']} — {i['name']} has {new_stock:g} {i['unit']} remaining",'Warning',None,'storekeeper','inventory',i['item_no'])
+        if new_stock-float(fresh['reserved_stock'])<=float(fresh['reorder_point']):notify(conn,'Inventory below reorder point',f"{i['item_no']} â€” {i['name']} has {new_stock:g} {i['unit']} remaining",'Warning',None,'storekeeper','inventory',i['item_no'])
         return {'ok':True,'stock':new_stock,'cost':cost,'readiness':_work_order_parts_readiness(conn,wo_id)}
 @app.post('/api/work-orders/{wo_id}/notes')
 def add_work_note(wo_id:int,body:NoteIn,user=Depends(require_roles(*WORK_ROLES))):
@@ -1473,7 +1377,7 @@ def field_asset_update(asset_id:int,body:FieldAssetUpdate,user=Depends(require_r
 def work_report(wo_id:int,user=Depends(current_user)):
     with db() as conn:
         w=get_or_404(conn,WO_SELECT+' WHERE w.id=?',(wo_id,),'Work order not found');labor=rows(conn.execute('SELECT le.*,u.full_name FROM labor_entries le JOIN users u ON u.id=le.user_id WHERE work_order_id=?',(wo_id,)));mats=rows(conn.execute('SELECT wom.*,i.item_no,i.name FROM work_order_materials wom JOIN inventory_items i ON i.id=wom.inventory_item_id WHERE work_order_id=?',(wo_id,)))
-    html=f'''<html><head><title>{w['wo_no']}</title><style>body{{font-family:Arial;margin:40px;color:#172033}}h1{{color:#c9272c}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;text-align:left}}small{{color:#666}}</style></head><body><h1>ELSEWEDY UTILITIES</h1><h2>{w['wo_no']} — {w['title']}</h2><p><b>Asset:</b> {w.get('asset_no') or '-'} {w.get('asset_name') or ''}<br><b>Status:</b> {w['status']} | <b>Priority:</b> {w['priority']} | <b>Type:</b> {w['work_type']}<br><b>Assigned:</b> {w.get('assigned_to_name') or '-'} | <b>Supervisor:</b> {w.get('supervisor_name') or '-'}</p><h3>Description</h3><p>{w['description']}</p><h3>Instructions / Safety</h3><p>{w['instructions']}<br>{w['safety_requirements']}</p><h3>Labor</h3><table><tr><th>Person</th><th>Hours</th><th>Notes</th></tr>{''.join(f"<tr><td>{x['full_name']}</td><td>{x['hours']}</td><td>{x['notes']}</td></tr>" for x in labor)}</table><h3>Materials</h3><table><tr><th>Item</th><th>Qty</th><th>Unit Cost</th></tr>{''.join(f"<tr><td>{x['item_no']} {x['name']}</td><td>{x['quantity']}</td><td>{x['unit_cost']}</td></tr>" for x in mats)}</table><p><b>Actual Cost:</b> {w['actual_cost']:.2f}</p><small>Generated by EUAS — Developed by Omar & Seif</small></body></html>'''
+    html=f'''<html><head><title>{w['wo_no']}</title><style>body{{font-family:Arial;margin:40px;color:#172033}}h1{{color:#c9272c}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;text-align:left}}small{{color:#666}}</style></head><body><h1>ELSEWEDY UTILITIES</h1><h2>{w['wo_no']} â€” {w['title']}</h2><p><b>Asset:</b> {w.get('asset_no') or '-'} {w.get('asset_name') or ''}<br><b>Status:</b> {w['status']} | <b>Priority:</b> {w['priority']} | <b>Type:</b> {w['work_type']}<br><b>Assigned:</b> {w.get('assigned_to_name') or '-'} | <b>Supervisor:</b> {w.get('supervisor_name') or '-'}</p><h3>Description</h3><p>{w['description']}</p><h3>Instructions / Safety</h3><p>{w['instructions']}<br>{w['safety_requirements']}</p><h3>Labor</h3><table><tr><th>Person</th><th>Hours</th><th>Notes</th></tr>{''.join(f"<tr><td>{x['full_name']}</td><td>{x['hours']}</td><td>{x['notes']}</td></tr>" for x in labor)}</table><h3>Materials</h3><table><tr><th>Item</th><th>Qty</th><th>Unit Cost</th></tr>{''.join(f"<tr><td>{x['item_no']} {x['name']}</td><td>{x['quantity']}</td><td>{x['unit_cost']}</td></tr>" for x in mats)}</table><p><b>Actual Cost:</b> {w['actual_cost']:.2f}</p><small>Generated by EUAS â€” Developed by Omar & Seif</small></body></html>'''
     return HTMLResponse(html)
 
 # Maintenance-plan API ownership lives in pm_store.py (installed with the
@@ -1516,7 +1420,7 @@ def inventory_tx(item_id:int,body:InventoryTxIn,user=Depends(require_roles(*INV_
             conn.execute('INSERT INTO inventory_transactions(item_id,tx_type,quantity,from_warehouse_id,to_warehouse_id,reference,user_id,created_at) VALUES(?,?,?,?,?,?,?,?)',(dest_id,'TRANSFER',move,i['warehouse_id'],body.to_warehouse_id,body.reference or i['item_no'],user['id'],now()))
         else:raise HTTPException(400,'Invalid transaction type')
         new=i['current_stock']+q;conn.execute('UPDATE inventory_items SET current_stock=? WHERE id=?',(new,item_id));conn.execute('INSERT INTO inventory_transactions(item_id,tx_type,quantity,from_warehouse_id,to_warehouse_id,work_order_id,reference,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(item_id,tx,q,i['warehouse_id'],body.to_warehouse_id,body.work_order_id,body.reference,user['id'],now()));audit(conn,user['id'],tx,'Inventory',i['item_no'],i['current_stock'],new)
-        if new-i['reserved_stock']<=i['reorder_point']:notify(conn,'Inventory below reorder point',f"{i['item_no']} — {i['name']} is below reorder point",'Warning',None,'storekeeper','inventory',i['item_no'])
+        if new-i['reserved_stock']<=i['reorder_point']:notify(conn,'Inventory below reorder point',f"{i['item_no']} â€” {i['name']} is below reorder point",'Warning',None,'storekeeper','inventory',i['item_no'])
         return {'ok':True,'current_stock':new}
 @app.get('/api/inventory/{item_id}/transactions')
 def inventory_history(item_id:int,user=Depends(current_user)):
@@ -1548,7 +1452,7 @@ def submit_pr(pr_id:int,user=Depends(require_roles('admin','storekeeper','mainte
         pr=get_or_404(conn,'SELECT * FROM purchase_requisitions WHERE id=?',(pr_id,),'PR not found')
         if pr['status'] not in ('Draft','Rejected'): raise HTTPException(409,'Only Draft or Rejected requisitions can be submitted')
         conn.execute("UPDATE purchase_requisitions SET status='Submitted' WHERE id=?",(pr_id,))
-        create_approval(conn,'Procurement','purchase_requisition',pr_id,pr['pr_no'],f"Approve {pr['pr_no']} — {pr['title']}",user['id'],assigned_role='procurement')
+        create_approval(conn,'Procurement','purchase_requisition',pr_id,pr['pr_no'],f"Approve {pr['pr_no']} â€” {pr['title']}",user['id'],assigned_role='procurement')
         workflow_event(conn,'Procurement','purchase_requisition',pr_id,pr['pr_no'],'SUBMIT',pr['status'],'Submitted',user['id'])
         audit(conn,user['id'],'SUBMIT','Procurement',pr['pr_no'],pr['status'],'Submitted');return {'ok':True,'status':'Submitted'}
 
@@ -1610,7 +1514,7 @@ def create_outage(body:OutageIn,user=Depends(require_roles('admin','asset_manage
         cur=conn.execute("INSERT INTO asset_outages(outage_no,asset_id,site_id,work_order_id,outage_type,status,cause_code,impact,lost_capacity,capacity_unit,start_at,reported_by,created_at,updated_at) VALUES(?,?,?,?,?,'Open',?,?,?,?,?,?,?,?)",(no,body.asset_id,a.get('site_id'),body.work_order_id,body.outage_type,body.cause_code,body.impact,body.lost_capacity,body.capacity_unit,start_at,user['id'],now(),now()))
         if a['status'] in ('Operating','Standby'):conn.execute("UPDATE assets SET status='Under Maintenance',updated_at=? WHERE id=?",(now(),body.asset_id))
         audit(conn,user['id'],'OPEN OUTAGE','Operations',no,'',body.model_dump());emit_event(conn,'asset.outage.opened','asset',body.asset_id,{'outage_no':no,'asset_no':a['asset_no'],'type':body.outage_type,'start_at':start_at})
-        notify(conn,'Asset outage opened',f'{no} — {a["asset_no"]} is unavailable','High' if body.outage_type=='Forced' else 'Warning',None,'maintenance_manager','operations',no)
+        notify(conn,'Asset outage opened',f'{no} â€” {a["asset_no"]} is unavailable','High' if body.outage_type=='Forced' else 'Warning',None,'maintenance_manager','operations',no)
         return {'id':cur.lastrowid,'outage_no':no,'status':'Open'}
 
 # ---------- technician dispatch ----------
@@ -1649,8 +1553,8 @@ def dispatch_work(wo_id:int,body:DispatchIn,user=Depends(require_roles('admin','
         conn.execute("UPDATE dispatch_assignments SET status='Cancelled',cancelled_at=? WHERE work_order_id=? AND status IN ('Dispatched','Accepted','En Route','On Site')",(now(),wo_id))
         no=next_no(conn,'dispatch_assignments','dispatch_no','DSP-',40001);cur=conn.execute("INSERT INTO dispatch_assignments(dispatch_no,work_order_id,technician_user_id,dispatched_by,status,eta_minutes,notes,dispatched_at) VALUES(?,?,?,?, 'Dispatched',?,?,?)",(no,wo_id,body.technician_user_id,user['id'],body.eta_minutes,body.notes,now()))
         old=w['status'];conn.execute("UPDATE work_orders SET assigned_to=?,status='Assigned',updated_at=? WHERE id=?",(body.technician_user_id,now(),wo_id))
-        workflow_event(conn,'Work Management','work_order',wo_id,w['wo_no'],'DISPATCH',old,'Assigned',user['id'],f'{no} → {tech["full_name"]}');audit(conn,user['id'],'DISPATCH','Field Service',no,'',{'work_order':w['wo_no'],'technician':tech['full_name'],'eta_minutes':body.eta_minutes})
-        notify(conn,'Dispatch assigned',f'{no} — {w["wo_no"]}: {w["title"]}','High' if w['priority'] in ('Emergency','Critical','High') else 'Info',body.technician_user_id,None,'dispatch',no)
+        workflow_event(conn,'Work Management','work_order',wo_id,w['wo_no'],'DISPATCH',old,'Assigned',user['id'],f'{no} â†’ {tech["full_name"]}');audit(conn,user['id'],'DISPATCH','Field Service',no,'',{'work_order':w['wo_no'],'technician':tech['full_name'],'eta_minutes':body.eta_minutes})
+        notify(conn,'Dispatch assigned',f'{no} â€” {w["wo_no"]}: {w["title"]}','High' if w['priority'] in ('Emergency','Critical','High') else 'Info',body.technician_user_id,None,'dispatch',no)
         return {'id':cur.lastrowid,'dispatch_no':no,'status':'Dispatched'}
 
 @app.post('/api/dispatch/{dispatch_id}/transition')
@@ -2060,14 +1964,14 @@ def search(q:str=Query(min_length=2),user=Depends(current_user)):
     like=f'%{q}%'
     with db() as conn:
         out=[]
-        for r in rows(conn.execute(ASSET_SELECT+' WHERE a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10',(like,like))):out.append({'module':'assets','id':r['id'],'code':r['asset_no'],'title':r['name'],'subtitle':f"{r.get('site_name') or ''} · {r['condition']}"})
-        for r in rows(conn.execute(WO_SELECT+' WHERE w.wo_no LIKE ? OR w.title LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10',(like,like,like,like))):out.append({'module':'work','id':r['id'],'code':r['wo_no'],'title':r['title'],'subtitle':f"{r.get('asset_no') or ''} · {r['status']}"})
+        for r in rows(conn.execute(ASSET_SELECT+' WHERE a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10',(like,like))):out.append({'module':'assets','id':r['id'],'code':r['asset_no'],'title':r['name'],'subtitle':f"{r.get('site_name') or ''} Â· {r['condition']}"})
+        for r in rows(conn.execute(WO_SELECT+' WHERE w.wo_no LIKE ? OR w.title LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10',(like,like,like,like))):out.append({'module':'work','id':r['id'],'code':r['wo_no'],'title':r['title'],'subtitle':f"{r.get('asset_no') or ''} Â· {r['status']}"})
         for r in rows(conn.execute('SELECT d.*,a.asset_no FROM documents d LEFT JOIN assets a ON a.id=d.asset_id WHERE d.document_no LIKE ? OR d.title LIKE ? OR a.asset_no LIKE ? LIMIT 10',(like,like,like))):out.append({'module':'documents','id':r['id'],'code':r['document_no'],'title':r['title'],'subtitle':r['category']})
         for r in rows(conn.execute('SELECT i.*,a.asset_no FROM inspections i LEFT JOIN assets a ON a.id=i.asset_id WHERE i.inspection_no LIKE ? OR i.template_name LIKE ? OR a.asset_no LIKE ? LIMIT 10',(like,like,like))):out.append({'module':'inspections','id':r['id'],'code':r['inspection_no'],'title':r['template_name'],'subtitle':r.get('asset_no') or ''})
-        for r in rows(conn.execute('''SELECT o.*,a.asset_no,a.name asset_name FROM asset_outages o JOIN assets a ON a.id=o.asset_id WHERE o.outage_no LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? OR o.cause_code LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'operations','id':r['id'],'code':r['outage_no'],'title':f"Outage — {r['asset_no']}",'subtitle':f"{r['status']} · {r['outage_type']}"})
-        for r in rows(conn.execute('''SELECT d.*,w.wo_no,w.title,u.full_name technician_name FROM dispatch_assignments d JOIN work_orders w ON w.id=d.work_order_id JOIN users u ON u.id=d.technician_user_id WHERE d.dispatch_no LIKE ? OR w.wo_no LIKE ? OR w.title LIKE ? OR u.full_name LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'dispatch','id':r['id'],'code':r['dispatch_no'],'title':f"{r['wo_no']} — {r['technician_name']}",'subtitle':r['status']})
-        for r in rows(conn.execute('''SELECT oa.*,tc.channel_code,tc.name channel_name,a.asset_no,a.name asset_name FROM operational_alarms oa JOIN telemetry_channels tc ON tc.id=oa.channel_id JOIN assets a ON a.id=oa.asset_id WHERE oa.alarm_no LIKE ? OR tc.channel_code LIKE ? OR tc.name LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10''',(like,like,like,like,like))):out.append({'module':'telemetry','id':r['id'],'code':r['alarm_no'],'title':f"{r['asset_no']} — {r['channel_name']} alarm",'subtitle':f"{r['severity']} · {r['status']}"})
-        for r in rows(conn.execute('''SELECT tc.*,a.asset_no,a.name asset_name FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id WHERE tc.channel_code LIKE ? OR tc.name LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'telemetry','id':r['id'],'code':r['channel_code'],'title':r['name'],'subtitle':f"{r['asset_no']} · {r['metric_type']}"})
+        for r in rows(conn.execute('''SELECT o.*,a.asset_no,a.name asset_name FROM asset_outages o JOIN assets a ON a.id=o.asset_id WHERE o.outage_no LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? OR o.cause_code LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'operations','id':r['id'],'code':r['outage_no'],'title':f"Outage â€” {r['asset_no']}",'subtitle':f"{r['status']} Â· {r['outage_type']}"})
+        for r in rows(conn.execute('''SELECT d.*,w.wo_no,w.title,u.full_name technician_name FROM dispatch_assignments d JOIN work_orders w ON w.id=d.work_order_id JOIN users u ON u.id=d.technician_user_id WHERE d.dispatch_no LIKE ? OR w.wo_no LIKE ? OR w.title LIKE ? OR u.full_name LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'dispatch','id':r['id'],'code':r['dispatch_no'],'title':f"{r['wo_no']} â€” {r['technician_name']}",'subtitle':r['status']})
+        for r in rows(conn.execute('''SELECT oa.*,tc.channel_code,tc.name channel_name,a.asset_no,a.name asset_name FROM operational_alarms oa JOIN telemetry_channels tc ON tc.id=oa.channel_id JOIN assets a ON a.id=oa.asset_id WHERE oa.alarm_no LIKE ? OR tc.channel_code LIKE ? OR tc.name LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10''',(like,like,like,like,like))):out.append({'module':'telemetry','id':r['id'],'code':r['alarm_no'],'title':f"{r['asset_no']} â€” {r['channel_name']} alarm",'subtitle':f"{r['severity']} Â· {r['status']}"})
+        for r in rows(conn.execute('''SELECT tc.*,a.asset_no,a.name asset_name FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id WHERE tc.channel_code LIKE ? OR tc.name LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ? LIMIT 10''',(like,like,like,like))):out.append({'module':'telemetry','id':r['id'],'code':r['channel_code'],'title':r['name'],'subtitle':f"{r['asset_no']} Â· {r['metric_type']}"})
         return out
 @app.get('/api/analytics')
 def analytics(user=Depends(current_user)):
