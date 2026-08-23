@@ -154,6 +154,8 @@ def _ensure_schema_columns(conn):
     cols=_table_columns(conn,'audit_logs')
     if 'prev_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT DEFAULT ''")
     if 'audit_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN audit_hash TEXT DEFAULT ''")
+    notify_cols=_table_columns(conn,'notifications')
+    if 'dedup_key' not in notify_cols: conn.execute('ALTER TABLE notifications ADD COLUMN dedup_key TEXT')
 
 def _backfill_audit_chain(conn):
     prev=''
@@ -328,9 +330,11 @@ def init_db(hash_password):
         );
         CREATE TABLE IF NOT EXISTS notifications(
           id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER REFERENCES users(id), role_code TEXT, title TEXT NOT NULL, message TEXT NOT NULL,
-          severity TEXT NOT NULL DEFAULT 'Info', link_module TEXT DEFAULT '', link_id TEXT DEFAULT '', is_read INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+          severity TEXT NOT NULL DEFAULT 'Info', link_module TEXT DEFAULT '', link_id TEXT DEFAULT '', is_read INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+          dedup_key TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id,is_read,created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_dedupe ON notifications(dedup_key) WHERE is_read=0 AND dedup_key IS NOT NULL;
         CREATE TABLE IF NOT EXISTS approval_requests(
           id INTEGER PRIMARY KEY AUTOINCREMENT, approval_no TEXT UNIQUE NOT NULL, module TEXT NOT NULL, record_type TEXT NOT NULL,
           record_id INTEGER NOT NULL, record_code TEXT NOT NULL, title TEXT NOT NULL, requested_by INTEGER NOT NULL REFERENCES users(id),

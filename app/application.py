@@ -350,6 +350,9 @@ def _site_reliability_rows(conn, period_days:int=365):
         s['period_hours']=round(s['period_hours'],1);s['downtime_hours']=round(s['downtime_hours'],2);out.append(s)
     return sorted(out,key=lambda x:(x['availability_pct'],x['site_name'] or ''))
 
+def _notification_dedup_key(title,user_id,role_code,module,record_id):
+    return '|'.join((title,module,str(record_id),str(user_id if user_id is not None else -1),'' if role_code is None else str(role_code)))
+
 def notify(conn,title,message,severity='Info',user_id=None,role_code=None,module='',record_id=''):
     conn.execute('INSERT INTO notifications(user_id,role_code,title,message,severity,link_module,link_id,created_at) VALUES(?,?,?,?,?,?,?,?)',(user_id,role_code,title,message,severity,module,record_id,now()))
 
@@ -527,11 +530,15 @@ def _process_outbox(conn):
     return {'delivered':delivered,'failed':failed,'skipped':skipped,'processed':delivered+failed+skipped}
 
 def notify_once(conn,title,message,severity='Info',user_id=None,role_code=None,module='',record_id=''):
-    existing=conn.execute('''SELECT id FROM notifications WHERE title=? AND link_module=? AND link_id=? AND is_read=0
-      AND ((user_id=? ) OR (user_id IS NULL AND ? IS NULL))
-      AND ((role_code=? ) OR (role_code IS NULL AND ? IS NULL)) LIMIT 1''',(title,module,record_id,user_id,user_id,role_code,role_code)).fetchone()
-    if existing:return False
-    notify(conn,title,message,severity,user_id,role_code,module,record_id);return True
+    # The partial unique index uq_notifications_dedupe (created in init_db)
+    # makes the unread-deduplication key enforceable under concurrency: two
+    # simultaneous automation runs can no longer both pass a read-then-insert
+    # check and duplicate the same notification. Plain notify() inserts stay
+    # unconstrained (dedup_key IS NULL is outside the index). INSERT OR IGNORE
+    # becomes ON CONFLICT DO NOTHING on PostgreSQL and native OR IGNORE on SQLite.
+    dedup_key=_notification_dedup_key(title,user_id,role_code,module,record_id)
+    cur=conn.execute('INSERT OR IGNORE INTO notifications(user_id,role_code,title,message,severity,link_module,link_id,created_at,dedup_key) VALUES(?,?,?,?,?,?,?,?,?)',(user_id,role_code,title,message,severity,module,record_id,now(),dedup_key))
+    return int(cur.rowcount or 0)==1
 
 def csv_response(filename, headers, data_rows):
     buf=io.StringIO();w=csv.writer(buf);w.writerow(headers);w.writerows(data_rows)

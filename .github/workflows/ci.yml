@@ -143,6 +143,9 @@ jobs:
       - name: Run PostgreSQL outbox delivery concurrency smoke
         run: python scripts/outbox_delivery_concurrency_smoke.py
 
+      - name: Run PostgreSQL notification dedup concurrency smoke
+        run: python scripts/notification_dedup_concurrency_smoke.py
+
       - name: Run PostgreSQL telemetry temporal-ordering concurrency smoke
         run: python scripts/telemetry_temporal_ordering_concurrency_smoke.py
 
