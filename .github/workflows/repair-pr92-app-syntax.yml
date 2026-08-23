@@ -1,0 +1,45 @@
+name: Repair PR92 app syntax
+
+on:
+  push:
+    branches:
+      - fix/euas-frontend-packaged-credential-leak
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: contains(github.event.head_commit.message, 'trigger PR92 syntax repair')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/euas-frontend-packaged-credential-leak
+          fetch-depth: 0
+      - name: Restore missing inspection delimiter
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('static/app.js')
+          text = path.read_text(encoding='utf-8')
+          broken = "filter(Boolean):[]})})}\nwindow.inspectionDetail"
+          fixed = "filter(Boolean):[]})})})}\nwindow.inspectionDetail"
+          if broken not in text:
+              raise SystemExit('expected PR92 broken inspection delimiter not found')
+          text = text.replace(broken, fixed, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+          node --check static/app.js
+      - name: Commit repaired source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add static/app.js
+          git commit -m 'fix(ui): restore inspection constructor syntax'
+          git push origin HEAD:fix/euas-frontend-packaged-credential-leak
