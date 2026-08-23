@@ -415,26 +415,38 @@ def _telemetry_alarm_level(channel, value:float):
 
 def _evaluate_telemetry_alarm(conn, channel:dict, value:float, captured_at:str, actor_id:Optional[int]):
     severity,threshold=_telemetry_alarm_level(channel,value)
-    active=conn.execute("SELECT * FROM operational_alarms WHERE channel_id=? AND status IN ('Open','Acknowledged') ORDER BY id DESC LIMIT 1",(channel['id'],)).fetchone()
     site=_channel_site(conn,channel['asset_id']); unit=channel.get('unit') or ''
-    if severity:
-        message=f"{channel['name']} {severity.lower()}: {value:g} {unit}".strip()
+    # Telemetry ingestion serializes per channel but does not lock individual
+    # alarms, so under PostgreSQL READ COMMITTED an operator acknowledge/close
+    # can commit between the active-alarm lookup and the mutation below. Every
+    # transition therefore carries a live Open/Acknowledged guard and a lost
+    # claim re-reads current state instead of overwriting it, so a terminal
+    # Closed alarm can never regress to Cleared or be silently mutated.
+    for _attempt in range(5):
+        active=conn.execute("SELECT * FROM operational_alarms WHERE channel_id=? AND status IN ('Open','Acknowledged') ORDER BY id DESC LIMIT 1",(channel['id'],)).fetchone()
+        if severity:
+            message=f"{channel['name']} {severity.lower()}: {value:g} {unit}".strip()
+            if active:
+                changed=conn.execute("UPDATE operational_alarms SET severity=?,message=?,trigger_value=?,threshold_value=?,last_seen_at=?,occurrence_count=occurrence_count+1 WHERE id=? AND status IN ('Open','Acknowledged')",(severity,message,value,threshold,captured_at,active['id']))
+                if int(changed.rowcount or 0)!=1:
+                    continue
+                return {'action':'updated','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':severity}
+            no=next_no(conn,'operational_alarms','alarm_no','ALM-',50001)
+            cur=conn.execute("INSERT INTO operational_alarms(alarm_no,channel_id,asset_id,site_id,severity,status,alarm_type,message,trigger_value,threshold_value,opened_at,last_seen_at,occurrence_count) VALUES(?,?,?,?,?,'Open','Threshold',?,?,?,?,?,1)",(no,channel['id'],channel['asset_id'],site.get('site_id'),severity,message,value,threshold,captured_at,captured_at))
+            notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'maintenance_manager','operations',no)
+            notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'asset_manager','operations',no)
+            emit_event(conn,'operations.alarm.opened','alarm',no,{'alarm_no':no,'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'severity':severity,'value':value,'threshold':threshold,'captured_at':captured_at})
+            if actor_id:audit(conn,actor_id,'ALARM OPEN','Utilities Operations',no,'',{'channel':channel['channel_code'],'severity':severity,'value':value,'threshold':threshold})
+            return {'action':'opened','alarm_id':cur.lastrowid,'alarm_no':no,'severity':severity}
         if active:
-            conn.execute('UPDATE operational_alarms SET severity=?,message=?,trigger_value=?,threshold_value=?,last_seen_at=?,occurrence_count=occurrence_count+1 WHERE id=?',(severity,message,value,threshold,captured_at,active['id']))
-            return {'action':'updated','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':severity}
-        no=next_no(conn,'operational_alarms','alarm_no','ALM-',50001)
-        cur=conn.execute("INSERT INTO operational_alarms(alarm_no,channel_id,asset_id,site_id,severity,status,alarm_type,message,trigger_value,threshold_value,opened_at,last_seen_at,occurrence_count) VALUES(?,?,?,?,?,'Open','Threshold',?,?,?,?,?,1)",(no,channel['id'],channel['asset_id'],site.get('site_id'),severity,message,value,threshold,captured_at,captured_at))
-        notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'maintenance_manager','operations',no)
-        notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'asset_manager','operations',no)
-        emit_event(conn,'operations.alarm.opened','alarm',no,{'alarm_no':no,'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'severity':severity,'value':value,'threshold':threshold,'captured_at':captured_at})
-        if actor_id:audit(conn,actor_id,'ALARM OPEN','Utilities Operations',no,'',{'channel':channel['channel_code'],'severity':severity,'value':value,'threshold':threshold})
-        return {'action':'opened','alarm_id':cur.lastrowid,'alarm_no':no,'severity':severity}
-    if active:
-        conn.execute("UPDATE operational_alarms SET status='Cleared',cleared_at=?,last_seen_at=?,trigger_value=? WHERE id=?",(captured_at,captured_at,value,active['id']))
-        emit_event(conn,'operations.alarm.cleared','alarm',active['alarm_no'],{'alarm_no':active['alarm_no'],'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'value':value,'captured_at':captured_at})
-        if actor_id:audit(conn,actor_id,'ALARM CLEAR','Utilities Operations',active['alarm_no'],active['status'],'Cleared')
-        return {'action':'cleared','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':active['severity']}
-    return {'action':'normal','alarm_id':None,'alarm_no':None,'severity':None}
+            changed=conn.execute("UPDATE operational_alarms SET status='Cleared',cleared_at=?,last_seen_at=?,trigger_value=? WHERE id=? AND status IN ('Open','Acknowledged')",(captured_at,captured_at,value,active['id']))
+            if int(changed.rowcount or 0)!=1:
+                continue
+            emit_event(conn,'operations.alarm.cleared','alarm',active['alarm_no'],{'alarm_no':active['alarm_no'],'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'value':value,'captured_at':captured_at})
+            if actor_id:audit(conn,actor_id,'ALARM CLEAR','Utilities Operations',active['alarm_no'],active['status'],'Cleared')
+            return {'action':'cleared','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':active['severity']}
+        return {'action':'normal','alarm_id':None,'alarm_no':None,'severity':None}
+    raise RuntimeError(f"Alarm evaluation for channel {channel['channel_code']} lost repeated lifecycle races")
 
 def _operations_intelligence(conn, site_id:Optional[int]=None):
     args=[];site_clause=''
