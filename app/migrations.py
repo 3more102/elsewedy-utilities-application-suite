@@ -319,13 +319,10 @@ def _rotate_insecure_demo_credentials(conn, hash_password, verify_password, secr
             'UPDATE users SET password_hash=? WHERE id=?',
             (hash_password(replacement), int(row['id'])),
         )
-        try:
-            conn.execute(
-                'UPDATE auth_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL',
-                (stamp, int(row['id'])),
-            )
-        except Exception:
-            pass
+        conn.execute(
+            'UPDATE auth_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL',
+            (stamp, int(row['id'])),
+        )
         conn.execute('DELETE FROM sessions WHERE user_id=?', (int(row['id']),))
         rotated.append(username)
     return rotated
