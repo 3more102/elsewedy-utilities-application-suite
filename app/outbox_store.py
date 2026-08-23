@@ -233,7 +233,10 @@ def retry_outbox_event_atomic(conn, event_id: int, user: dict) -> dict:
         fresh['status'] != initial['status']
         or int(fresh['attempts']) != int(initial['attempts'])
     )
-    if generation_changed or fresh['status'] == 'Pending':
+    # Pending retries are already idempotent. Delivered is also terminal for this
+    # retry surface: returning the established success response without mutating
+    # it prevents an operator retry from creating a second external side effect.
+    if generation_changed or fresh['status'] in ('Pending', 'Delivered'):
         return {'ok': True, 'event_no': fresh['event_no']}
 
     # An explicit operator retry of an attempt-exhausted event resets the
