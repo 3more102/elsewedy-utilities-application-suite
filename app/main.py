@@ -17,6 +17,7 @@ from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow
 from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record
 from apps.maintenance import ACTION_ROLES, TRANSITIONS, InvalidWorkTransition, WorkTransitionForbidden, transition_target, validate_transition_actor
 from apps.procurement import InvalidProcurementTransition, purchase_order_receive_target, requisition_target
+from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
 from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
@@ -2788,30 +2789,14 @@ def create_inventory(body:InventoryIn,user=Depends(require_permission('inventory
 @app.post('/api/inventory/{item_id}/transaction')
 def inventory_tx(item_id:int,body:InventoryTxIn,user=Depends(require_permission('inventory.transact',*INV_ROLES))):
     with db() as conn:
-        i=get_or_404(conn,'SELECT * FROM inventory_items WHERE id=?',(item_id,),'Item not found');tx=body.tx_type.upper();q=body.quantity
-        if tx=='ISSUE':
-            q=-abs(q)
-            available=max(float(i['current_stock'])-float(i['reserved_stock']),0)
-            if available<abs(q):raise HTTPException(409,'Insufficient unreserved stock; release or issue the work-order reservation first')
-        elif tx=='RETURN' or tx=='RECEIPT':q=abs(q)
-        elif tx=='ADJUSTMENT':q=body.quantity-i['current_stock']
-        elif tx=='TRANSFER':
-            if not body.to_warehouse_id:raise HTTPException(400,'Destination warehouse required')
-            if body.to_warehouse_id==i['warehouse_id']:raise HTTPException(400,'Destination warehouse must be different')
-            move=abs(q)
-            available=max(float(i['current_stock'])-float(i['reserved_stock']),0)
-            if available<move:raise HTTPException(409,'Insufficient unreserved stock; reserved material cannot be transferred')
-            q=-move
-            dest=conn.execute('SELECT * FROM inventory_items WHERE warehouse_id=? AND name=? AND category=?',(body.to_warehouse_id,i['name'],i['category'])).fetchone()
-            if dest:
-                conn.execute('UPDATE inventory_items SET current_stock=current_stock+? WHERE id=?',(move,dest['id']));dest_id=dest['id']
-            else:
-                dno=next_no(conn,'inventory_items','item_no','ITM-',1000);curd=conn.execute('''INSERT INTO inventory_items(item_no,name,description,category,warehouse_id,current_stock,reserved_stock,min_level,max_level,reorder_point,unit_price,unit,vendor_id,bin) VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?)''',(dno,i['name'],i['description'],i['category'],body.to_warehouse_id,move,i['min_level'],i['max_level'],i['reorder_point'],i['unit_price'],i['unit'],i['vendor_id'],i['bin']));dest_id=curd.lastrowid
-            conn.execute('INSERT INTO inventory_transactions(item_id,tx_type,quantity,from_warehouse_id,to_warehouse_id,reference,user_id,created_at) VALUES(?,?,?,?,?,?,?,?)',(dest_id,'TRANSFER',move,i['warehouse_id'],body.to_warehouse_id,body.reference or i['item_no'],user['id'],now()))
-        else:raise HTTPException(400,'Invalid transaction type')
-        new=i['current_stock']+q;conn.execute('UPDATE inventory_items SET current_stock=? WHERE id=?',(new,item_id));conn.execute('INSERT INTO inventory_transactions(item_id,tx_type,quantity,from_warehouse_id,to_warehouse_id,work_order_id,reference,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(item_id,tx,q,i['warehouse_id'],body.to_warehouse_id,body.work_order_id,body.reference,user['id'],now()));audit(conn,user['id'],tx,'Inventory',i['item_no'],i['current_stock'],new)
-        if new-i['reserved_stock']<=i['reorder_point']:notify(conn,'Inventory below reorder point',f"{i['item_no']} — {i['name']} is below reorder point",'Warning',None,'storekeeper','inventory',i['item_no'])
-        return {'ok':True,'current_stock':new}
+        try:
+            result=apply_inventory_transaction(conn,item_id,body.model_dump(),user['id'])
+        except InventoryItemNotFound as exc:raise HTTPException(404,str(exc))
+        except InventoryTransactionConflict as exc:raise HTTPException(409,str(exc))
+        except InventoryTransactionInvalid as exc:raise HTTPException(400,str(exc))
+        if result['low_stock']:
+            notify(conn,'Inventory below reorder point',f"{result['item_no']} — {result['item_name']} is below reorder point",'Warning',None,'storekeeper','inventory',result['item_no'])
+        return {'ok':True,'current_stock':result['current_stock']}
 @app.get('/api/inventory/{item_id}/transactions')
 def inventory_history(item_id:int,user=Depends(current_user)):
     with db() as conn:return rows(conn.execute('''SELECT t.*,u.full_name,w.wo_no FROM inventory_transactions t JOIN users u ON u.id=t.user_id LEFT JOIN work_orders w ON w.id=t.work_order_id WHERE t.item_id=? ORDER BY t.id DESC''',(item_id,)))
