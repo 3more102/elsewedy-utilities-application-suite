@@ -3,8 +3,8 @@
 The check deliberately discovers CSS/JS/manifest references from the served root
 page instead of duplicating the asset list in CI. This makes the production
 container gate fail when a UI layer is referenced by HTML but missing from the
-image, served as an empty/fallback response, or returned with an implausible
-content type.
+image, served as an empty/fallback response, returned with an implausible
+content type, or exposes the ASGI server implementation through a Server header.
 
 Example:
     python scripts/http_ui_smoke.py http://127.0.0.1:8879
@@ -55,6 +55,7 @@ def _expected_content_type(path: str) -> tuple[str, ...]:
 
 
 def _assert_security_headers(headers: dict[str, str]) -> None:
+    assert 'server' not in headers, headers
     assert headers.get('x-content-type-options', '').casefold() == 'nosniff', headers
     assert headers.get('x-frame-options', '').casefold() == 'deny', headers
     assert headers.get('referrer-policy', '').casefold() == 'strict-origin-when-cross-origin', headers
