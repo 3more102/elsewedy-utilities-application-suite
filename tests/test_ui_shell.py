@@ -3,6 +3,7 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 INDEX = ROOT / "static" / "index.html"
 BASE_CSS = ROOT / "static" / "styles.css"
 REFRESH_CSS = ROOT / "static" / "ui-refresh.css"
@@ -25,7 +26,9 @@ SERVICE_WORKER = ROOT / "static" / "sw.js"
 def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     html = INDEX.read_text(encoding="utf-8")
     service_worker = SERVICE_WORKER.read_text(encoding="utf-8")
+    ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 
+    assert CI_WORKFLOW.exists()
     assert BASE_CSS.exists()
     assert REFRESH_CSS.exists()
     assert UX_CSS.exists()
@@ -64,6 +67,15 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert html_assets
     for asset in sorted(html_assets):
         assert f"'{asset}'" in service_worker, f'{asset} is missing from service-worker precache'
+
+    assert "find static -maxdepth 1 -type f -name '*.js' -print0" in ci_workflow
+    assert "mapfile -d '' js_files" in ci_workflow
+    assert "sort -z" in ci_workflow
+    assert 'node --check "$js"' in ci_workflow
+    assert "No static JavaScript assets found" in ci_workflow
+    assert "node --check static/app.js" not in ci_workflow
+    assert "node --check static/shortcut-center.js" not in ci_workflow
+    assert "Reject packaged credentials in login shell" in ci_workflow
 
     required_ids = {
         "login",

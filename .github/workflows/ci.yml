@@ -23,17 +23,19 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Validate browser JavaScript syntax
+        shell: bash
         run: |
-          node --check static/app.js
-          node --check static/ux-enhancements.js
-          node --check static/dashboard-enhancements.js
-          node --check static/productivity-enhancements.js
-          node --check static/operational-enhancements.js
-          node --check static/workspace-preferences.js
-          node --check static/command-palette.js
-          node --check static/navigation-history.js
-          node --check static/shortcut-center.js
-          node --check static/sw.js
+          set -euo pipefail
+          mapfile -d '' js_files < <(find static -maxdepth 1 -type f -name '*.js' -print0 | sort -z)
+          if (( ${#js_files[@]} == 0 )); then
+            echo "No static JavaScript assets found" >&2
+            exit 1
+          fi
+          printf 'Validating %d JavaScript assets\n' "${#js_files[@]}"
+          for js in "${js_files[@]}"; do
+            echo "node --check $js"
+            node --check "$js"
+          done
 
       - name: Validate web manifest JSON
         run: node -e "JSON.parse(require('fs').readFileSync('static/manifest.webmanifest', 'utf8'))"
