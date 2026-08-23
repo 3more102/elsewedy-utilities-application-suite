@@ -1,9 +1,11 @@
 """Production ASGI entrypoint for deployment-only HTTP security policy.
 
 The historical FastAPI application still emits a compatibility CSP that permits
-inline scripts. The browser shell no longer needs inline JavaScript, so the
-production entrypoint replaces only that response header after the inner
-application/middleware stack has run. Development entrypoints remain unchanged.
+inline scripts. The production browser shell loads script elements from static
+assets, so the deployment entrypoint blocks inline script elements. The legacy
+runtime still generates a small set of HTML event-handler attributes, therefore
+those attributes retain a narrowly scoped compatibility allowance until they are
+migrated to delegated event listeners. Development entrypoints remain unchanged.
 """
 from __future__ import annotations
 
@@ -15,7 +17,8 @@ STRICT_CONTENT_SECURITY_POLICY = (
     "img-src 'self' data: blob:; "
     "style-src 'self' 'unsafe-inline'; "
     "script-src 'self'; "
-    "script-src-attr 'none'; "
+    "script-src-elem 'self'; "
+    "script-src-attr 'unsafe-inline'; "
     "connect-src 'self'; "
     "object-src 'none'; "
     "base-uri 'self'; "
