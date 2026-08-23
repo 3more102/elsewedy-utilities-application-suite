@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app import application as _application
 from app.auth import hash_password
+from app.config import OUTBOX_LEASE_SECONDS
 from app.database import db, now
 from app.main import app
 from app.outbox_observability import outbox_operational_snapshot
@@ -54,7 +55,7 @@ def test_operational_snapshot_classifies_backlog_without_payloads():
             active = now()
             stale = (
                 datetime.now()
-                - timedelta(seconds=60)
+                - timedelta(seconds=OUTBOX_LEASE_SECONDS + 5)
             ).isoformat(timespec='seconds')
             _seed(conn, suffix, 1, status='Pending', attempts=0, processed_at=None)
             _seed(conn, suffix, 2, status='Failed', attempts=1, processed_at=None)
@@ -114,7 +115,8 @@ def test_outbox_status_endpoint_is_available_to_admin_and_payload_free():
             'unresolved',
         }
         assert body['config']['max_attempts'] == _application.OUTBOX_MAX_ATTEMPTS
-        assert body['config']['lease_seconds'] >= 10
+        assert body['config']['lease_seconds'] == OUTBOX_LEASE_SECONDS
+        assert body['oldest_retryable_age_seconds'] is None or body['oldest_retryable_age_seconds'] >= 0
         assert 'payload' not in json.dumps(body).lower()
 
 
