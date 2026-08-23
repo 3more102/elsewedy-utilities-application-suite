@@ -114,11 +114,15 @@ def evaluate_configuration(
 
 def run_database_checks() -> list[Check]:
     # Import after CLI/environment handling so app.config sees deployment values.
-    from app.auth import hash_password
+    from app.auth import hash_password, verify_password
     from app.audit_verification import verify_audit_chain_report
     from app.config import DB_BACKEND, SCHEMA_VERSION
     from app.database import db
-    from app.migrations import initialize_database, migration_status
+    from app.migrations import (
+        find_insecure_demo_users,
+        initialize_database,
+        migration_status,
+    )
 
     checks: list[Check] = []
     try:
@@ -178,6 +182,20 @@ def run_database_checks() -> list[Check]:
                         f"pending={migration['pending_versions']}, invalid={migration['invalid_versions']}, "
                         f"future={migration['future_versions']}."
                     ),
+                )
+            )
+
+            insecure_demo_users = find_insecure_demo_users(conn, verify_password)
+            checks.append(
+                Check(
+                    "default_credentials",
+                    "FAIL" if insecure_demo_users else "PASS",
+                    (
+                        "Packaged demo credentials remain active for: "
+                        + ", ".join(insecure_demo_users)
+                    )
+                    if insecure_demo_users
+                    else "No active user retains a packaged demo password.",
                 )
             )
 
