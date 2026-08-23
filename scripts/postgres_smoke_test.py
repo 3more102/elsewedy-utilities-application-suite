@@ -49,6 +49,10 @@ def main() -> int:
     if not url.startswith(('postgresql://', 'postgres://')):
         print('FAIL: EUAS_DATABASE_URL must point to PostgreSQL.', file=sys.stderr)
         return 2
+    admin_password = os.getenv('EUAS_BOOTSTRAP_ADMIN_PASSWORD', '').strip()
+    if len(admin_password) < 16:
+        print('FAIL: EUAS_BOOTSTRAP_ADMIN_PASSWORD must be configured for production smoke.', file=sys.stderr)
+        return 2
 
     env = os.environ.copy()
     env.setdefault('EUAS_ENV', 'test')
@@ -90,7 +94,7 @@ def main() -> int:
         status, _, login = request(
             '/api/auth/login',
             method='POST',
-            data={'username': 'omar', 'password': 'EUAS@2026'},
+            data={'username': 'omar', 'password': admin_password},
         )
         assert status == 200 and login['user']['role'] == 'admin'
         token = login['token']
