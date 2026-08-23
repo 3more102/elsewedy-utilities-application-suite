@@ -220,8 +220,14 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "nonRecentModules" in command_js
     assert "MutationObserver" in command_js
 
-    assert "euas-shell-v3.9.0-ui8" in service_worker
+    assert "euas-shell-v3.9.0-ui9" in service_worker
     assert "'/static/command-palette.css'" in service_worker
     assert "'/static/command-palette.js'" in service_worker
     assert "'/static/workspace-preferences.css'" in service_worker
     assert "'/static/operational-enhancements.js'" in service_worker
+    assert "url.origin===self.location.origin" in service_worker
+    assert "url.pathname==='/'||url.pathname.startsWith('/static/')" in service_worker
+    assert "response.ok&&response.type==='basic'" in service_worker
+    assert "await cache.put(request,response.clone())" in service_worker
+    assert "request.mode==='navigate'" in service_worker
+    assert "throw error" in service_worker

@@ -1,4 +1,4 @@
-const CACHE='euas-shell-v3.9.0-ui8';
+const CACHE='euas-shell-v3.9.0-ui9';
 const ASSETS=[
   '/',
   '/static/styles.css',
@@ -30,12 +30,29 @@ self.addEventListener('activate',event=>{
 });
 
 self.addEventListener('fetch',event=>{
-  if(event.request.method!=='GET'||event.request.url.includes('/api/')) return;
-  event.respondWith(
-    fetch(event.request).then(response=>{
-      const copy=response.clone();
-      caches.open(CACHE).then(cache=>cache.put(event.request,copy));
+  const request=event.request;
+  if(request.method!=='GET') return;
+
+  const url=new URL(request.url);
+  const isShellRequest=url.origin===self.location.origin&&(url.pathname==='/'||url.pathname.startsWith('/static/'));
+  if(!isShellRequest) return;
+
+  event.respondWith((async()=>{
+    try{
+      const response=await fetch(request);
+      if(response.ok&&response.type==='basic'){
+        const cache=await caches.open(CACHE);
+        await cache.put(request,response.clone());
+      }
       return response;
-    }).catch(()=>caches.match(event.request))
-  );
+    }catch(error){
+      const cached=await caches.match(request);
+      if(cached) return cached;
+      if(request.mode==='navigate'){
+        const shell=await caches.match('/');
+        if(shell) return shell;
+      }
+      throw error;
+    }
+  })());
 });
