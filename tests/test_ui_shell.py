@@ -9,6 +9,8 @@ REFRESH_CSS = ROOT / "static" / "ui-refresh.css"
 UX_CSS = ROOT / "static" / "ux-enhancements.css"
 UX_JS = ROOT / "static" / "ux-enhancements.js"
 DASHBOARD_JS = ROOT / "static" / "dashboard-enhancements.js"
+PRODUCTIVITY_CSS = ROOT / "static" / "productivity-enhancements.css"
+PRODUCTIVITY_JS = ROOT / "static" / "productivity-enhancements.js"
 
 
 def test_ui_shell_keeps_application_hooks_and_refresh_layer():
@@ -19,12 +21,16 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert UX_CSS.exists()
     assert UX_JS.exists()
     assert DASHBOARD_JS.exists()
+    assert PRODUCTIVITY_CSS.exists()
+    assert PRODUCTIVITY_JS.exists()
     assert 'href="/static/styles.css"' in html
     assert 'href="/static/ui-refresh.css"' in html
     assert 'href="/static/ux-enhancements.css"' in html
+    assert 'href="/static/productivity-enhancements.css"' in html
     assert 'src="/static/app.js"' in html
     assert 'src="/static/ux-enhancements.js"' in html
     assert 'src="/static/dashboard-enhancements.js"' in html
+    assert 'src="/static/productivity-enhancements.js"' in html
 
     required_ids = {
         "login",
@@ -76,6 +82,8 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     ux_css = UX_CSS.read_text(encoding="utf-8")
     ux_js = UX_JS.read_text(encoding="utf-8")
     dashboard_js = DASHBOARD_JS.read_text(encoding="utf-8")
+    productivity_css = PRODUCTIVITY_CSS.read_text(encoding="utf-8")
+    productivity_js = PRODUCTIVITY_JS.read_text(encoding="utf-8")
 
     assert ".nav-btn.active" in css
     assert ":focus-visible" in css
@@ -106,3 +114,19 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "Attention signals" in dashboard_js
     assert "dashboard-chart-panel" in dashboard_js
     assert "aria-label" in dashboard_js
+
+    assert ".table-wrap.has-horizontal-overflow" in productivity_css
+    assert ".data-table thead th" in productivity_css
+    assert ".required-field" in productivity_css
+    assert ".field-invalid" in productivity_css
+    assert ".toolbar" in productivity_css
+    assert "@media(max-width:820px)" in productivity_css
+    assert "@media(prefers-reduced-motion:reduce)" in productivity_css
+
+    assert "decorateTable" in productivity_js
+    assert "decorateForm" in productivity_js
+    assert "aria-rowcount" in productivity_js
+    assert "aria-required" in productivity_js
+    assert "Ctrl" not in productivity_js
+    assert "event.ctrlKey || event.metaKey" in productivity_js
+    assert "MutationObserver" in productivity_js
