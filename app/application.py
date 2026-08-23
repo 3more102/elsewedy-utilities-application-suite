@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio, csv, hashlib, hmac, io, json, logging, secrets, shutil, sqlite3, time, uuid, zipfile
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib import request as urllib_request, error as urllib_error
@@ -413,6 +413,31 @@ def _telemetry_alarm_level(channel, value:float):
         if direction=='low' and value<=threshold:return severity,threshold
     return None,None
 
+def _event_instant_or_none(value) -> Optional[datetime]:
+    """Normalize a stored capture timestamp to a UTC-naive instant.
+
+    Historical rows mix naive local strings with offset/Z-suffixed values, so
+    raw lexicographic comparison misclassifies staleness; unparseable markers
+    normalize to None and are treated as stale by callers.
+    """
+    if value is None: return None
+    if isinstance(value,datetime): parsed=value
+    else:
+        text=str(value).strip()
+        if text.endswith('Z'): text=text[:-1]+'+00:00'
+        try: parsed=datetime.fromisoformat(text)
+        except ValueError: return None
+    if parsed.tzinfo is not None:
+        parsed=parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+def _count_stale_channels(rows, stale_cut:datetime) -> int:
+    stale=0
+    for row in rows:
+        instant=_event_instant_or_none(row[0])
+        if instant is None or instant<stale_cut: stale+=1
+    return stale
+
 def _evaluate_telemetry_alarm(conn, channel:dict, value:float, captured_at:str, actor_id:Optional[int]):
     severity,threshold=_telemetry_alarm_level(channel,value)
     site=_channel_site(conn,channel['asset_id']); unit=channel.get('unit') or ''
@@ -456,8 +481,9 @@ def _operations_intelligence(conn, site_id:Optional[int]=None):
     ch_args=[];ch_clause=''
     if site_id is not None:ch_clause=' AND s.id=?';ch_args.append(site_id)
     channels=int(conn.execute('SELECT COUNT(*) FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE tc.active=1'+ch_clause,ch_args).fetchone()[0])
-    stale_cut=(datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds')
-    stale=int(conn.execute('SELECT COUNT(*) FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE tc.active=1 AND (tc.last_reading_at IS NULL OR tc.last_reading_at<?)'+ch_clause,[stale_cut]+ch_args).fetchone()[0])
+    stale_cut=datetime.now()-timedelta(hours=24)
+    last_readings=conn.execute('SELECT tc.last_reading_at FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE tc.active=1'+ch_clause,ch_args).fetchall()
+    stale=_count_stale_channels(last_readings,stale_cut)
     return {'active_alarms':active_alarms,'critical_alarms':critical,'telemetry_channels':channels,'stale_channels_24h':stale}
 
 def _ensure_work_sla(conn,work_order_id:int,force:bool=False):
@@ -2047,8 +2073,9 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
         active_alarms=conn.execute("SELECT COUNT(*) FROM operational_alarms WHERE status IN ('Open','Acknowledged')").fetchone()[0]
         critical_alarms=conn.execute("SELECT COUNT(*) FROM operational_alarms WHERE status IN ('Open','Acknowledged') AND severity='Critical'").fetchone()[0]
         telemetry_channels=conn.execute("SELECT COUNT(*) FROM telemetry_channels WHERE active=1").fetchone()[0]
-        stale_cut=(datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds')
-        telemetry_stale=conn.execute("SELECT COUNT(*) FROM telemetry_channels WHERE active=1 AND (last_reading_at IS NULL OR last_reading_at<?)",(stale_cut,)).fetchone()[0]
+        stale_cut=datetime.now()-timedelta(hours=24)
+        last_readings=conn.execute("SELECT last_reading_at FROM telemetry_channels WHERE active=1").fetchall()
+        telemetry_stale=_count_stale_channels(last_readings,stale_cut)
     lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {_REQUEST_METRICS["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_outbox_attempt_exhausted {outbox_exhausted}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}',f'euas_telemetry_stale_channels_24h {telemetry_stale}']
     for code,count in sorted(_REQUEST_METRICS['status'].items()):lines.append(f'euas_http_responses_total{{status="{code}"}} {count}')
     return '\n'.join(lines)+'\n'

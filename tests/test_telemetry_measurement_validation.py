@@ -277,3 +277,55 @@ def test_metrics_expose_stale_telemetry_gauge():
         assert ingested.status_code == 200, ingested.text
         after_fresh = stale_gauge(client.get('/api/metrics', headers=headers).text)
         assert after_fresh == baseline
+
+
+def _set_last_reading_at(channel_id, value):
+    with db() as conn:
+        conn.execute(
+            'UPDATE telemetry_channels SET last_reading_at=? WHERE id=?',
+            (value, channel_id),
+        )
+
+
+def test_stale_gauge_classifies_offset_timestamps_by_instant():
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    stale_cut = now - timedelta(hours=24)
+
+    # A '+14:00' local string sorts lexicographically AFTER the cutoff, but
+    # its UTC instant (25 hours ago) is genuinely stale.
+    stale_instant = (now - timedelta(hours=25)).replace(tzinfo=timezone.utc)
+    stale_offset_value = stale_instant.astimezone(
+        timezone(timedelta(hours=14))
+    ).isoformat()
+    assert stale_offset_value > stale_cut.isoformat(timespec='seconds')
+
+    # A '-03:00' local string sorts BEFORE the cutoff, but its UTC instant
+    # (one minute past the cutoff) is genuinely fresh.
+    fresh_instant = (stale_cut + timedelta(minutes=1)).replace(tzinfo=timezone.utc)
+    fresh_offset_value = fresh_instant.astimezone(
+        timezone(timedelta(hours=-3))
+    ).isoformat()
+    assert fresh_offset_value < stale_cut.isoformat(timespec='seconds')
+
+    with TestClient(app) as client:
+        headers = auth(client)
+
+        def gauge():
+            return int(
+                next(
+                    line.rsplit(' ', 1)[1]
+                    for line in client.get('/api/metrics', headers=headers).text.splitlines()
+                    if line.startswith('euas_telemetry_stale_channels_24h ')
+                )
+            )
+
+        baseline = gauge()
+        stale_channel = create_channel(client, headers, 'TEL-STALE-OFFSET-STALE')
+        fresh_channel = create_channel(client, headers, 'TEL-STALE-OFFSET-FRESH')
+        assert gauge() == baseline + 2
+
+        _set_last_reading_at(stale_channel, stale_offset_value)
+        _set_last_reading_at(fresh_channel, fresh_offset_value)
+        assert gauge() == baseline + 1
