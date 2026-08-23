@@ -18,6 +18,16 @@ jobs:
           ref: oxalpha/euas-zero-inline-style-csp
           fetch-depth: 0
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Extract staged refactor
         shell: bash
         run: |
