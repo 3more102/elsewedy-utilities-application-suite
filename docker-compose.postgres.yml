@@ -5,7 +5,7 @@ services:
     environment:
       POSTGRES_DB: euas
       POSTGRES_USER: euas
-      POSTGRES_PASSWORD: ${EUAS_POSTGRES_PASSWORD:-change-this-password}
+      POSTGRES_PASSWORD: ${EUAS_POSTGRES_PASSWORD:?set EUAS_POSTGRES_PASSWORD}
     volumes:
       - euas_postgres:/var/lib/postgresql/data
     healthcheck:
@@ -23,7 +23,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      EUAS_DATABASE_URL: postgresql://euas:${EUAS_POSTGRES_PASSWORD:-change-this-password}@postgres:5432/euas
+      EUAS_DATABASE_URL: postgresql://euas:${EUAS_POSTGRES_PASSWORD:?set EUAS_POSTGRES_PASSWORD}@postgres:5432/euas
+      EUAS_BOOTSTRAP_ADMIN_PASSWORD: ${EUAS_BOOTSTRAP_ADMIN_PASSWORD:?set EUAS_BOOTSTRAP_ADMIN_PASSWORD}
       EUAS_ENV: production
       EUAS_VERSION: 3.9.0
       EUAS_SESSION_HOURS: 12
