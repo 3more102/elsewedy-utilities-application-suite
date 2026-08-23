@@ -24,6 +24,8 @@ from apps.projects import InvalidProjectTask, normalize_task_changes, recalculat
 from apps.observability import health_snapshot, readiness_snapshot, request_metrics_snapshot
 from apps.integrations import IntegrationKeyNotFound, create_integration_api_key as create_integration_key_record, list_integration_api_keys, revoke_integration_api_key as revoke_integration_key_record, telemetry_ingest_principal
 from apps.telemetry import TelemetryChannelNotFound, TelemetryValidationError, ingest_batch as ingest_telemetry_batch, quality_summary as _telemetry_quality_summary, readings as telemetry_reading_rows, telemetry_series as _telemetry_series
+from apps.alarm_correlation import correlate_alarm as correlate_alarm_record, graph_distance as _graph_distance, incident_member_summary as correlation_incident_member_summary, refresh_incident as refresh_correlated_incident, refresh_incidents_for_alarm as refresh_correlated_incidents_for_alarm, topology_graph as _topology_graph
+from apps.alarms import AlarmNotFound as OperationalAlarmNotFound, InvalidAlarmTransition, acknowledge_alarm as acknowledge_alarm_record, close_alarm as close_alarm_record, evaluate_telemetry_alarm as evaluate_alarm_record
 from api.middleware import security_headers
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
@@ -409,173 +411,20 @@ def _dt(value):
     if isinstance(value,datetime): return value
     return datetime.fromisoformat(str(value))
 
-def _channel_site(conn, asset_id:int):
-    r=conn.execute('SELECT s.id site_id,s.site_code,s.name site_name FROM assets a LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE a.id=?',(asset_id,)).fetchone()
-    return dict(r) if r else {'site_id':None,'site_code':None,'site_name':None}
-
-SEVERITY_RANK={'Info':0,'Warning':1,'Critical':2}
-
-
-def _topology_graph(conn):
-    links=rows(conn.execute("SELECT * FROM asset_topology_links WHERE active=1 ORDER BY id"))
-    down={};undirected={}
-    for link in links:
-        u=int(link['upstream_asset_id']);v=int(link['downstream_asset_id'])
-        down.setdefault(u,[]).append(v)
-        undirected.setdefault(u,[]).append(v);undirected.setdefault(v,[]).append(u)
-    return links,down,undirected
-
-
-def _graph_distance(graph:dict[int,list[int]], start:int, target:int, max_hops:int=3):
-    if start==target:return 0
-    seen={start};front=[(start,0)]
-    while front:
-        node,hops=front.pop(0)
-        if hops>=max_hops:continue
-        for nxt in graph.get(node,[]):
-            if nxt==target:return hops+1
-            if nxt not in seen:
-                seen.add(nxt);front.append((nxt,hops+1))
-    return None
-
-
-def _incident_root_cause(conn, members:list[dict]):
-    asset_ids=sorted({int(x['asset_id']) for x in members})
-    if not asset_ids:return {'asset_id':None,'asset_no':'','mode':'Asset','score':0,'reason':'No alarm members','hops':0}
-    placeholders=','.join('?' for _ in asset_ids)
-    meta={int(r['id']):dict(r) for r in conn.execute(f'SELECT id,asset_no,name FROM assets WHERE id IN ({placeholders})',asset_ids).fetchall()}
-    if len(asset_ids)==1:
-        a=meta[asset_ids[0]]
-        return {'asset_id':asset_ids[0],'asset_no':a['asset_no'],'mode':'Asset','score':100.0,'reason':f"All correlated alarms originate from {a['asset_no']}.",'hops':0}
-    _,down,undirected=_topology_graph(conn)
-    first_seen={aid:min(_dt(x['opened_at']) for x in members if int(x['asset_id'])==aid) for aid in asset_ids}
-    severity={aid:max((SEVERITY_RANK.get(x['severity'],0) for x in members if int(x['asset_id'])==aid),default=0) for aid in asset_ids}
-    candidates=[]
-    for aid in asset_ids:
-        directed=[_graph_distance(down,aid,other,3) for other in asset_ids if other!=aid]
-        downstream_count=sum(d is not None for d in directed)
-        connected=[_graph_distance(undirected,aid,other,3) for other in asset_ids if other!=aid]
-        connected_count=sum(d is not None for d in connected)
-        candidates.append((aid,downstream_count,connected_count,first_seen[aid],severity[aid],directed,connected))
-    candidates.sort(key=lambda x:(-x[1],-x[2],x[3],-x[4],x[0]))
-    aid,downstream_count,connected_count,opened,sev,directed,connected=candidates[0]
-    other_count=max(len(asset_ids)-1,1)
-    earliest=min(first_seen.values())==opened
-    score=min(95.0,60.0+25.0*(downstream_count/other_count)+(10.0 if earliest else 0.0))
-    reachable=[d for d in directed if d is not None] or [d for d in connected if d is not None]
-    hops=max(reachable,default=0)
-    a=meta[aid]
-    if downstream_count:
-        reason=f"{a['asset_no']} is upstream of {downstream_count} of {other_count} other alarmed asset(s) within the configured topology"
-        if earliest:reason+=' and its alarm evidence appeared earliest'
-        reason+='.'
-    else:
-        reason=f"{a['asset_no']} is the earliest alarmed asset in the connected topology; no alarmed asset is upstream of another alarmed member."
-    return {'asset_id':aid,'asset_no':a['asset_no'],'mode':'Topology','score':round(score,1),'reason':reason,'hops':hops}
-
-
-def _incident_candidate_distance(conn, incident_id:int, asset_id:int, max_hops:int=2):
-    member_assets=[int(r['asset_id']) for r in conn.execute('SELECT DISTINCT oa.asset_id FROM alarm_incident_members m JOIN operational_alarms oa ON oa.id=m.alarm_id WHERE m.incident_id=?',(incident_id,)).fetchall()]
-    if asset_id in member_assets:return 0
-    _,_,undirected=_topology_graph(conn)
-    ds=[_graph_distance(undirected,asset_id,x,max_hops) for x in member_assets]
-    ds=[x for x in ds if x is not None]
-    return min(ds) if ds else None
-
-
-def _active_alarm_suppression(conn, channel:dict, captured_at:str):
-    """Return the most specific active suppression window for a telemetry channel."""
-    site=_channel_site(conn,channel['asset_id'])
-    rows_=rows(conn.execute("""SELECT s.*,u.full_name created_by_name FROM alarm_suppressions s
-      LEFT JOIN users u ON u.id=s.created_by
-      WHERE s.active=1 AND s.start_at<=? AND s.end_at>=?
-      AND ((s.channel_id=? ) OR (s.channel_id IS NULL AND s.asset_id=? )
-           OR (s.channel_id IS NULL AND s.asset_id IS NULL AND s.site_id=?))""",
-      (captured_at,captured_at,channel['id'],channel['asset_id'],site.get('site_id'))))
-    if not rows_:return None
-    rows_.sort(key=lambda x:(1 if x.get('channel_id') else 0,1 if x.get('asset_id') else 0,1 if x.get('site_id') else 0),reverse=True)
-    return rows_[0]
-
-
 def _incident_member_summary(conn, incident_id:int):
-    members=rows(conn.execute("""SELECT oa.*,tc.channel_code,tc.name channel_name,tc.unit,a.asset_no,a.name asset_name
-      FROM alarm_incident_members m JOIN operational_alarms oa ON oa.id=m.alarm_id
-      JOIN telemetry_channels tc ON tc.id=oa.channel_id JOIN assets a ON a.id=oa.asset_id
-      WHERE m.incident_id=? ORDER BY oa.opened_at""",(incident_id,)))
-    active=[x for x in members if x['status'] in ('Open','Acknowledged')]
-    severity=max((x['severity'] for x in members),key=lambda x:SEVERITY_RANK.get(x,0),default='Warning')
-    return members,active,severity
+    return correlation_incident_member_summary(conn,incident_id)
 
 
 def _refresh_incident(conn, incident_id:int, actor_id:Optional[int]=None):
-    incident=conn.execute('SELECT * FROM alarm_incidents WHERE id=?',(incident_id,)).fetchone()
-    if not incident:return None
-    incident=dict(incident)
-    members,active,severity=_incident_member_summary(conn,incident_id)
-    last=max((x['last_seen_at'] for x in members),default=incident['last_seen_at'])
-    root=_incident_root_cause(conn,members)
-    title=incident['title'];key=incident['correlation_key']
-    if root['asset_id']:
-        if root['mode']=='Topology':
-            title=f"{root['asset_no']} topology-correlated operational incident";key=f"topology:{root['asset_id']}"
-        else:
-            title=f"{root['asset_no']} operational alarm incident";key=f"asset:{root['asset_id']}"
-    updates={'severity':severity,'alarm_count':len(members),'last_seen_at':last,'root_cause_asset_id':root['asset_id'],
-             'correlation_mode':root['mode'],'root_cause_score':root['score'],'root_cause_reason':root['reason'],'topology_hops':root['hops'],
-             'title':title,'correlation_key':key,'updated_at':now()}
-    if not active and incident['status'] in ('Open','Acknowledged'):
-        updates['status']='Resolved';updates['resolved_at']=now();updates['resolved_by']=actor_id
-    conn.execute('UPDATE alarm_incidents SET '+','.join(f'{k}=?' for k in updates)+' WHERE id=?',(*updates.values(),incident_id))
-    updated=one(conn.execute('SELECT * FROM alarm_incidents WHERE id=?',(incident_id,)))
-    if root['mode']=='Topology' and incident.get('root_cause_asset_id') not in (None,root['asset_id']):
-        emit_event(conn,'operations.incident.root_cause_updated','alarm_incident',incident['incident_no'],{'incident_no':incident['incident_no'],'root_cause_asset_id':root['asset_id'],'score':root['score'],'reason':root['reason']})
-        if actor_id:audit(conn,actor_id,'UPDATE INCIDENT ROOT CAUSE','Utilities Operations',incident['incident_no'],incident.get('root_cause_asset_id'),root)
-    if incident['status'] in ('Open','Acknowledged') and updated and updated['status']=='Resolved':
-        emit_event(conn,'operations.incident.auto_resolved','alarm_incident',incident['incident_no'],{'incident_no':incident['incident_no'],'alarm_count':len(members)})
-        if actor_id:audit(conn,actor_id,'AUTO RESOLVE INCIDENT','Utilities Operations',incident['incident_no'],incident['status'],'Resolved')
-    return updated
+    return refresh_correlated_incident(conn,incident_id,actor_id)
 
 
 def _correlate_alarm(conn, alarm_id:int, actor_id:Optional[int]=None):
-    alarm=get_or_404(conn,"""SELECT oa.*,a.asset_no,a.name asset_name FROM operational_alarms oa
-      JOIN assets a ON a.id=oa.asset_id WHERE oa.id=?""",(alarm_id,),'Alarm not found')
-    existing=conn.execute('SELECT incident_id FROM alarm_incident_members WHERE alarm_id=? ORDER BY incident_id DESC LIMIT 1',(alarm_id,)).fetchone()
-    if existing:return _refresh_incident(conn,existing['incident_id'],actor_id)
-    cutoff=(_dt(alarm['last_seen_at'])-timedelta(minutes=30)).isoformat(timespec='seconds')
-    sql="SELECT * FROM alarm_incidents WHERE status IN ('Open','Acknowledged') AND last_seen_at>=?";args=[cutoff]
-    if alarm.get('site_id') is None:sql+=' AND site_id IS NULL'
-    else:sql+=' AND site_id=?';args.append(alarm['site_id'])
-    candidates=[]
-    for inc in rows(conn.execute(sql,args)):
-        dist=_incident_candidate_distance(conn,inc['id'],alarm['asset_id'],1)
-        if dist is not None:candidates.append((dist,-_dt(inc['last_seen_at']).timestamp(),inc))
-    candidates.sort(key=lambda x:(x[0],x[1],x[2]['id']))
-    incident=candidates[0][2] if candidates else None
-    if not incident:
-        no=next_no(conn,'alarm_incidents','incident_no','INC-',60001)
-        cur=conn.execute("""INSERT INTO alarm_incidents(incident_no,correlation_key,site_id,asset_id,title,severity,status,opened_at,last_seen_at,alarm_count,root_cause_asset_id,correlation_mode,root_cause_score,root_cause_reason,topology_hops,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,'Open',?,?,0,?,'Asset',100,?,0,?,?)""",
-          (no,f"asset:{alarm['asset_id']}",alarm.get('site_id'),alarm['asset_id'],f"{alarm['asset_no']} operational alarm incident",alarm['severity'],alarm['opened_at'],alarm['last_seen_at'],alarm['asset_id'],f"Initial alarm evidence originates from {alarm['asset_no']}.",now(),now()))
-        incident_id=cur.lastrowid
-        emit_event(conn,'operations.incident.opened','alarm_incident',no,{'incident_no':no,'asset_id':alarm['asset_id'],'alarm_no':alarm['alarm_no'],'severity':alarm['severity']})
-        notify_once(conn,'Operational incident',f"{no} — {alarm['asset_no']} correlated alarm incident",alarm['severity'],None,'maintenance_manager','commandcenter',no)
-        if actor_id:audit(conn,actor_id,'INCIDENT OPEN','Utilities Operations',no,'',{'alarm':alarm['alarm_no'],'asset':alarm['asset_no']})
-    else:
-        incident_id=incident['id'];no=incident['incident_no']
-    conn.execute('INSERT OR IGNORE INTO alarm_incident_members(incident_id,alarm_id,added_at) VALUES(?,?,?)',(incident_id,alarm_id,now()))
-    updated=_refresh_incident(conn,incident_id,actor_id)
-    if updated and updated.get('correlation_mode')=='Topology':
-        emit_event(conn,'operations.incident.topology_correlated','alarm_incident',no,{'incident_no':no,'alarm_no':alarm['alarm_no'],'asset_id':alarm['asset_id'],'root_cause_asset_id':updated.get('root_cause_asset_id'),'score':updated.get('root_cause_score')})
-    return updated
+    return correlate_alarm_record(conn,alarm_id,actor_id,notify=notify_once)
 
 
 def _refresh_incidents_for_alarm(conn, alarm_id:int, actor_id:Optional[int]=None):
-    result=[]
-    for r in conn.execute('SELECT incident_id FROM alarm_incident_members WHERE alarm_id=?',(alarm_id,)).fetchall():
-        updated=_refresh_incident(conn,r['incident_id'],actor_id)
-        if updated:result.append(updated)
-    return result
-
+    return refresh_correlated_incidents_for_alarm(conn,alarm_id,actor_id)
 
 def _fmea_risk(severity:int, occurrence:int, detectability:int):
     vals=(int(severity),int(occurrence),int(detectability))
@@ -744,48 +593,17 @@ def _evaluate_cbm_rules(conn, channel:dict, value:float, captured_at:str, readin
         results.append({'rule_no':rule['rule_no'],'action':'opened','event_no':event_no,'work_order':work['wo_no'] if work else None})
     return results
 
-def _telemetry_alarm_level(channel, value:float):
-    checks=[('Critical','critical_high','high'),('Critical','critical_low','low'),('Warning','warning_high','high'),('Warning','warning_low','low')]
-    for severity,key,direction in checks:
-        threshold=channel.get(key)
-        if threshold is None: continue
-        threshold=float(threshold)
-        if direction=='high' and value>=threshold:return severity,threshold
-        if direction=='low' and value<=threshold:return severity,threshold
-    return None,None
-
 def _evaluate_telemetry_alarm(conn, channel:dict, value:float, captured_at:str, actor_id:Optional[int]):
-    severity,threshold=_telemetry_alarm_level(channel,value)
-    active=conn.execute("SELECT * FROM operational_alarms WHERE channel_id=? AND status IN ('Open','Acknowledged') ORDER BY id DESC LIMIT 1",(channel['id'],)).fetchone()
-    site=_channel_site(conn,channel['asset_id']); unit=channel.get('unit') or ''
-    if severity:
-        suppression=_active_alarm_suppression(conn,channel,captured_at)
-        if suppression:
-            return {'action':'suppressed','alarm_id':None,'alarm_no':None,'severity':severity,'threshold':threshold,
-                    'suppression_id':suppression['id'],'suppression_no':suppression['suppression_no'],'suppression_reason':suppression['reason']}
-        message=f"{channel['name']} {severity.lower()}: {value:g} {unit}".strip()
-        if active:
-            conn.execute('UPDATE operational_alarms SET severity=?,message=?,trigger_value=?,threshold_value=?,last_seen_at=?,occurrence_count=occurrence_count+1 WHERE id=?',(severity,message,value,threshold,captured_at,active['id']))
-            incident=_correlate_alarm(conn,active['id'],actor_id)
-            return {'action':'updated','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':severity,
-                    'incident_id':incident['id'] if incident else None,'incident_no':incident['incident_no'] if incident else None}
-        no=next_no(conn,'operational_alarms','alarm_no','ALM-',50001)
-        cur=conn.execute("INSERT INTO operational_alarms(alarm_no,channel_id,asset_id,site_id,severity,status,alarm_type,message,trigger_value,threshold_value,opened_at,last_seen_at,occurrence_count) VALUES(?,?,?,?,?,'Open','Threshold',?,?,?,?,?,1)",(no,channel['id'],channel['asset_id'],site.get('site_id'),severity,message,value,threshold,captured_at,captured_at))
-        notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'maintenance_manager','operations',no)
-        notify_once(conn,'Operational alarm',f"{no} — {message}",severity,None,'asset_manager','operations',no)
-        emit_event(conn,'operations.alarm.opened','alarm',no,{'alarm_no':no,'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'severity':severity,'value':value,'threshold':threshold,'captured_at':captured_at})
-        if actor_id:audit(conn,actor_id,'ALARM OPEN','Utilities Operations',no,'',{'channel':channel['channel_code'],'severity':severity,'value':value,'threshold':threshold})
-        incident=_correlate_alarm(conn,cur.lastrowid,actor_id)
-        return {'action':'opened','alarm_id':cur.lastrowid,'alarm_no':no,'severity':severity,
-                'incident_id':incident['id'] if incident else None,'incident_no':incident['incident_no'] if incident else None}
-    if active:
-        conn.execute("UPDATE operational_alarms SET status='Cleared',cleared_at=?,last_seen_at=?,trigger_value=? WHERE id=?",(captured_at,captured_at,value,active['id']))
-        emit_event(conn,'operations.alarm.cleared','alarm',active['alarm_no'],{'alarm_no':active['alarm_no'],'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'value':value,'captured_at':captured_at})
-        if actor_id:audit(conn,actor_id,'ALARM CLEAR','Utilities Operations',active['alarm_no'],active['status'],'Cleared')
-        incidents=_refresh_incidents_for_alarm(conn,active['id'],actor_id)
-        return {'action':'cleared','alarm_id':active['id'],'alarm_no':active['alarm_no'],'severity':active['severity'],
-                'incidents_resolved':[x['incident_no'] for x in incidents if x.get('status')=='Resolved']}
-    return {'action':'normal','alarm_id':None,'alarm_no':None,'severity':None}
+    return evaluate_alarm_record(
+        conn,
+        channel,
+        value,
+        captured_at,
+        actor_id,
+        correlate=_correlate_alarm,
+        refresh_incidents=_refresh_incidents_for_alarm,
+        notify=notify_once,
+    )
 
 def _operations_intelligence(conn, site_id:Optional[int]=None):
     args=[];site_clause=''
@@ -2206,16 +2024,20 @@ def alarms(status:str='',severity:str='',asset_id:Optional[int]=None,site_id:Opt
 @app.post('/api/alarms/{alarm_id}/acknowledge')
 def acknowledge_alarm(alarm_id:int,user=Depends(require_permission('alarms.operate','admin','asset_manager','maintenance_manager','planner','supervisor','technician'))):
     with db() as conn:
-        a=get_or_404(conn,'SELECT * FROM operational_alarms WHERE id=?',(alarm_id,),'Alarm not found')
-        if a['status'] not in ('Open','Acknowledged'):raise HTTPException(409,f"Alarm is {a['status']}")
-        conn.execute("UPDATE operational_alarms SET status='Acknowledged',acknowledged_at=?,acknowledged_by=? WHERE id=?",(now(),user['id'],alarm_id));_correlate_alarm(conn,alarm_id,user['id']);audit(conn,user['id'],'ACKNOWLEDGE ALARM','Utilities Operations',a['alarm_no'],a['status'],'Acknowledged');return {'ok':True,'status':'Acknowledged'}
+        try:
+            return acknowledge_alarm_record(conn,alarm_id,user['id'],correlate=_correlate_alarm)
+        except OperationalAlarmNotFound as exc:
+            raise HTTPException(404,str(exc))
+        except InvalidAlarmTransition as exc:
+            raise HTTPException(409,str(exc))
 
 @app.post('/api/alarms/{alarm_id}/close')
 def close_alarm(alarm_id:int,user=Depends(require_permission('alarms.operate','admin','asset_manager','maintenance_manager','planner','supervisor'))):
     with db() as conn:
-        a=get_or_404(conn,'SELECT * FROM operational_alarms WHERE id=?',(alarm_id,),'Alarm not found')
-        if a['status']=='Closed':return {'ok':True,'status':'Closed'}
-        conn.execute("UPDATE operational_alarms SET status='Closed',closed_at=?,closed_by=? WHERE id=?",(now(),user['id'],alarm_id));_refresh_incidents_for_alarm(conn,alarm_id,user['id']);emit_event(conn,'operations.alarm.closed','alarm',a['alarm_no'],{'alarm_no':a['alarm_no'],'asset_id':a['asset_id']});audit(conn,user['id'],'CLOSE ALARM','Utilities Operations',a['alarm_no'],a['status'],'Closed');return {'ok':True,'status':'Closed'}
+        try:
+            return close_alarm_record(conn,alarm_id,user['id'],refresh_incidents=_refresh_incidents_for_alarm)
+        except OperationalAlarmNotFound as exc:
+            raise HTTPException(404,str(exc))
 
 @app.post('/api/alarms/{alarm_id}/work-order')
 def alarm_create_work_order(alarm_id:int,body:AlarmWorkOrderIn,user=Depends(require_permission('work.write','admin','asset_manager','maintenance_manager','planner','supervisor'))):
