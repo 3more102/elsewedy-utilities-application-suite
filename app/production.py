@@ -56,7 +56,7 @@ PRODUCTION_BROWSER_HEADERS = {
     b'x-content-type-options': b'nosniff',
     b'x-frame-options': b'DENY',
     b'referrer-policy': b'strict-origin-when-cross-origin',
-    b'permissions-policy': b'camera=(self), geolocation=(self), microphone=()',
+    b'permissions-policy': b'camera=(), geolocation=(), microphone=()',
 }
 PRODUCTION_ISOLATION_HEADERS = {
     b'cross-origin-opener-policy': b'same-origin',

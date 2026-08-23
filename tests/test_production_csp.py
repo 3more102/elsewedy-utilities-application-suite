@@ -265,7 +265,7 @@ def test_production_wrapper_replaces_browser_and_isolation_headers():
     assert headers[b'x-content-type-options'] == b'nosniff'
     assert headers[b'x-frame-options'] == b'DENY'
     assert headers[b'referrer-policy'] == b'strict-origin-when-cross-origin'
-    assert headers[b'permissions-policy'] == b'camera=(self), geolocation=(self), microphone=()'
+    assert headers[b'permissions-policy'] == b'camera=(), geolocation=(), microphone=()'
     assert headers[b'cross-origin-opener-policy'] == b'same-origin'
     assert headers[b'cross-origin-resource-policy'] == b'same-origin'
     assert headers[b'x-permitted-cross-domain-policies'] == b'none'
@@ -317,6 +317,10 @@ def test_production_entrypoint_matches_external_script_shell_contract():
     action_bridge = (ROOT / 'static' / 'csp-action-bridge.js').read_text(encoding='utf-8')
     postgres_smoke = (ROOT / 'scripts' / 'postgres_smoke_test.py').read_text(encoding='utf-8')
     production_source = (ROOT / 'app' / 'production.py').read_text(encoding='utf-8')
+    static_js = '\n'.join(
+        path.read_text(encoding='utf-8')
+        for path in sorted((ROOT / 'static').glob('*.js'))
+    )
 
     assert '"app.production:app"' in dockerfile
     assert '"app.main:app"' not in dockerfile
@@ -331,6 +335,9 @@ def test_production_entrypoint_matches_external_script_shell_contract():
     assert "must not contain the unrestricted '*' wildcard" in production_source
     assert 'PRODUCTION_API_CACHE_HEADERS' in production_source
     assert "path == '/api' or path.startswith('/api/')" in production_source
+    assert 'navigator.geolocation' not in static_js
+    assert 'getUserMedia' not in static_js
+    assert 'mediaDevices' not in static_js
 
     script_tags = re.findall(r'<script\b[^>]*>.*?</script>', html, flags=re.I | re.S)
     assert script_tags
