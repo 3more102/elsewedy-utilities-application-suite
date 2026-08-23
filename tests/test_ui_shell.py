@@ -93,6 +93,7 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
         "Planner@2026",
         "Supervisor@2026",
         "Tech@2026",
+        "Tech2@2026",
         "Store@2026",
         "Proc@2026",
         "HSE@2026",
