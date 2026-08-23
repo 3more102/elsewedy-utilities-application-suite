@@ -70,7 +70,10 @@ def test_production_wrapper_replaces_legacy_inline_script_policy():
     assert "script-src 'self' 'unsafe-inline'" not in csp
     assert "script-src-attr 'none'" in csp
     assert "form-action 'self'" in csp
-    assert "style-src 'self' 'unsafe-inline'" in csp
+    assert "style-src 'self'" in csp
+    assert "style-src 'self' 'unsafe-inline'" not in csp
+    assert "style-src-attr 'none'" in csp
+    assert "'unsafe-inline'" not in csp
 
 
 def test_production_wrapper_emits_one_year_hsts_only_for_https_scope():
@@ -134,3 +137,8 @@ def test_production_entrypoint_matches_external_script_shell_contract():
     assert script_tags
     assert all(re.search(r'\bsrc="/static/[^"]+"', tag, flags=re.I) for tag in script_tags)
     assert not re.search(r'\son[a-z]+\s*=', html, flags=re.I)
+    application_source = (ROOT / 'app' / 'application.py').read_text(encoding='utf-8')
+    report_css = (ROOT / 'static' / 'report.css').read_text(encoding='utf-8')
+    assert application_source.count('/static/report.css') == 2
+    assert '<style' not in application_source.casefold()
+    assert '.report{' in report_css

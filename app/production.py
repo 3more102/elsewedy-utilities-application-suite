@@ -15,7 +15,8 @@ from .main import app as _application
 STRICT_CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
     "img-src 'self' data: blob:; "
-    "style-src 'self' 'unsafe-inline'; "
+    "style-src 'self'; "
+    "style-src-attr 'none'; "
     "script-src 'self'; "
     "script-src-attr 'none'; "
     "connect-src 'self'; "

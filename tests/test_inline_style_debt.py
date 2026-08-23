@@ -59,6 +59,14 @@ def test_inline_style_debt_is_confined_to_known_app_renderer_patterns():
         assert f'data-csp-style="{hook}"' in app_source
         assert f'[data-csp-style="{hook}"]{{{declaration}}}' in styles_css
 
+    assert 'style="width:${' not in app_source
+    assert 'background:conic-gradient(' not in app_source
+    assert 'style="left:${' not in app_source
+    assert '<progress class="project-progress"' in app_source
+    assert '<svg class="bar-svg"' in app_source
+    assert '<svg class="donut-svg"' in app_source
+    assert '<svg class="geo-map-svg"' in app_source
+
     total = 0
     unexpected: list[tuple[str, str]] = []
     for path in sorted(STATIC.glob('*.js')):
@@ -68,12 +76,10 @@ def test_inline_style_debt_is_confined_to_known_app_renderer_patterns():
             unexpected.extend((path.name, value) for value in styles)
             continue
         total = len(styles)
-        unexpected.extend((path.name, value) for value in styles if not _allowed_app_style(value))
+        unexpected.extend((path.name, value) for value in styles)
 
     assert not unexpected, unexpected
-    # PR #101 removed 22 fixed source attributes from the measured baseline of
-    # 26. Only four dynamic source attributes remain; freeze that reduced debt.
-    assert total <= 4, f'inline style debt grew to {total} app.js attributes'
+    assert total == 0, f'inline style debt returned with {total} app.js attributes'
 
 
 def test_frontend_does_not_add_direct_dom_style_mutation_apis():

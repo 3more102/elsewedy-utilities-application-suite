@@ -70,6 +70,9 @@ def _assert_security_headers(headers: dict[str, str]) -> None:
     assert "script-src-attr 'none'" in csp, csp
     assert "form-action 'self'" in csp, csp
     assert "frame-ancestors 'none'" in csp, csp
+    assert "style-src 'self'" in csp, csp
+    assert "style-src-attr 'none'" in csp, csp
+    assert "'unsafe-inline'" not in csp, csp
 
 
 def run(base_url: str) -> dict:
