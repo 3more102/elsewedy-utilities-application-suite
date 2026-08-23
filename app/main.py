@@ -21,6 +21,7 @@ from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, 
 from apps.inspections import corrective_required, inspection_result
 from apps.hse import is_high_risk, risk_score, validate_hse_status
 from apps.projects import InvalidProjectTask, normalize_task_changes, recalculate_project_progress
+from apps.observability import record_request, request_metrics_snapshot
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
 from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
@@ -48,7 +49,6 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url='/api/docs', redoc_u
 
 # Lightweight hardening suitable for the self-contained EUAS reference deployment.
 # Production deployments should place EUAS behind a reverse proxy/WAF as well.
-_REQUEST_METRICS = {'started_at': time.time(), 'requests_total': 0, 'errors_total': 0, 'latency_ms_total': 0.0, 'status': {}}
 logger = logging.getLogger('euas')
 
 @app.middleware('http')
@@ -57,12 +57,7 @@ async def security_headers(request: Request, call_next):
     started = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - started) * 1000
-    _REQUEST_METRICS['requests_total'] += 1
-    _REQUEST_METRICS['latency_ms_total'] += elapsed_ms
-    code = str(response.status_code)
-    _REQUEST_METRICS['status'][code] = _REQUEST_METRICS['status'].get(code, 0) + 1
-    if response.status_code >= 500:
-        _REQUEST_METRICS['errors_total'] += 1
+    record_request(response.status_code, elapsed_ms)
     response.headers['X-Request-ID'] = request_id
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
@@ -3390,7 +3385,7 @@ def automation_run(as_of:Optional[str]=None,user=Depends(require_permission('aut
 
 @app.get('/api/metrics',response_class=PlainTextResponse)
 def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'))):
-    uptime=max(time.time()-_REQUEST_METRICS['started_at'],0.001);total=_REQUEST_METRICS['requests_total'];avg=_REQUEST_METRICS['latency_ms_total']/max(total,1)
+    request_stats=request_metrics_snapshot();uptime=request_stats['uptime_seconds'];total=request_stats['requests_total'];avg=request_stats['latency_ms_avg']
     with db() as conn:
         active_sessions=conn.execute('SELECT COUNT(*) FROM sessions WHERE expires_at>?',(now(),)).fetchone()[0]
         jobs=conn.execute("SELECT COUNT(*) FROM job_runs WHERE status='Succeeded'").fetchone()[0]
@@ -3435,8 +3430,8 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
         critical_fmea_without_rcm=conn.execute("""SELECT COUNT(*) FROM asset_fmea f WHERE f.status<>'Retired' AND f.risk_band='Critical' AND NOT EXISTS(SELECT 1 FROM rcm_strategies r WHERE r.asset_fmea_id=f.id AND r.status IN ('Approved','Active'))""").fetchone()[0]
         rcm_coverage_pct=100*float(rcm_covered)/max(int(rcm_eligible),1)
         q24=_telemetry_quality_summary(conn,24,None);bad_quality_24h=q24['bad'];duplicates_24h=conn.execute("SELECT COALESCE(SUM(duplicate_count),0) FROM telemetry_ingest_batches WHERE started_at>=?",((datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds'),)).fetchone()[0] or 0
-    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {_REQUEST_METRICS["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_outbox_dead_lettered {outbox_dead_lettered}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}',f'euas_open_alarm_incidents {open_incidents}',f'euas_active_alarm_suppressions {active_suppressions}',f'euas_active_alarm_shelves {active_shelves}',f'euas_active_topology_links {active_topology_links}',f'euas_topology_correlated_incidents {topology_incidents}',f'euas_field_sync_pending {field_sync_pending}',f'euas_field_sync_conflicts {field_sync_conflicts}',f'euas_field_sync_applied_24h {field_sync_applied_24h}',f'euas_signed_approvals_total {signed_approvals}',f'euas_approval_signature_chain_valid {1 if signature_integrity['valid'] else 0}',f'euas_retention_runs_total {retention_runs_total}',f'euas_retention_purged_records_total {retention_purged_total}',f'euas_active_retention_holds {active_retention_holds}',f'euas_retention_run_chain_valid {1 if retention_integrity['valid'] else 0}',f'euas_permission_role_grants {permission_role_grants}',f'euas_active_permission_overrides {active_permission_overrides}',f'euas_active_permission_denies {active_permission_denies}',f'euas_active_cbm_rules {active_cbm_rules}',f'euas_open_cbm_events {open_cbm_events}',f'euas_cbm_work_orders_total {cbm_work_orders}',f'euas_active_fmea_records {active_fmea_records}',f'euas_critical_fmea_records {critical_fmea_records}',f'euas_overdue_fmea_reviews {overdue_fmea_reviews}',f'euas_active_rcm_strategies {active_rcm_strategies}',f'euas_overdue_rcm_reviews {overdue_rcm_reviews}',f'euas_rcm_strategy_coverage_pct {rcm_coverage_pct:.2f}',f'euas_critical_fmea_without_rcm {critical_fmea_without_rcm}',f'euas_bad_quality_readings_24h {bad_quality_24h}',f'euas_duplicate_telemetry_readings_24h {duplicates_24h}']
-    for code,count in sorted(_REQUEST_METRICS['status'].items()):lines.append(f'euas_http_responses_total{{status="{code}"}} {count}')
+    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {request_stats["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_outbox_dead_lettered {outbox_dead_lettered}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}',f'euas_open_alarm_incidents {open_incidents}',f'euas_active_alarm_suppressions {active_suppressions}',f'euas_active_alarm_shelves {active_shelves}',f'euas_active_topology_links {active_topology_links}',f'euas_topology_correlated_incidents {topology_incidents}',f'euas_field_sync_pending {field_sync_pending}',f'euas_field_sync_conflicts {field_sync_conflicts}',f'euas_field_sync_applied_24h {field_sync_applied_24h}',f'euas_signed_approvals_total {signed_approvals}',f'euas_approval_signature_chain_valid {1 if signature_integrity['valid'] else 0}',f'euas_retention_runs_total {retention_runs_total}',f'euas_retention_purged_records_total {retention_purged_total}',f'euas_active_retention_holds {active_retention_holds}',f'euas_retention_run_chain_valid {1 if retention_integrity['valid'] else 0}',f'euas_permission_role_grants {permission_role_grants}',f'euas_active_permission_overrides {active_permission_overrides}',f'euas_active_permission_denies {active_permission_denies}',f'euas_active_cbm_rules {active_cbm_rules}',f'euas_open_cbm_events {open_cbm_events}',f'euas_cbm_work_orders_total {cbm_work_orders}',f'euas_active_fmea_records {active_fmea_records}',f'euas_critical_fmea_records {critical_fmea_records}',f'euas_overdue_fmea_reviews {overdue_fmea_reviews}',f'euas_active_rcm_strategies {active_rcm_strategies}',f'euas_overdue_rcm_reviews {overdue_rcm_reviews}',f'euas_rcm_strategy_coverage_pct {rcm_coverage_pct:.2f}',f'euas_critical_fmea_without_rcm {critical_fmea_without_rcm}',f'euas_bad_quality_readings_24h {bad_quality_24h}',f'euas_duplicate_telemetry_readings_24h {duplicates_24h}']
+    for code,count in sorted(request_stats['status'].items()):lines.append(f'euas_http_responses_total{{status="{code}"}} {count}')
     return '\n'.join(lines)+'\n'
 
 @app.get('/api/exports/approval-signatures.csv')
