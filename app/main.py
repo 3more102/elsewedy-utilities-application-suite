@@ -14,6 +14,8 @@ from .config import APP_NAME, APP_VERSION, STATIC_DIR, UPLOAD_DIR, SESSION_HOURS
 from .database import db, init_db, now
 from apps.audit import audit, verify_audit_chain
 from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
+from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record
+from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
 from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
 
@@ -351,15 +353,6 @@ def resolve_approval(conn,module,record_type,record_id,decision,user_id,comments
     new_status='Approved' if decision.lower()=='approve' else 'Rejected'
     conn.execute('UPDATE approval_requests SET status=?,decided_at=?,decided_by=?,comments=? WHERE id=?',(new_status,now(),user_id,comments,ap['id']))
     return dict(ap)|{'status':new_status}
-
-def next_no(conn, table, field, prefix, start=1):
-    vals=[r[0] for r in conn.execute(f"SELECT {field} FROM {table} WHERE {field} LIKE ?",(prefix+'%',)).fetchall()]
-    nums=[]
-    for v in vals:
-        try: nums.append(int(str(v).replace(prefix,'')))
-        except: pass
-    n=max(nums,default=start-1)+1
-    return f'{prefix}{n}'
 
 def get_or_404(conn, sql, args, message='Record not found'):
     r=conn.execute(sql,args).fetchone()
@@ -2504,28 +2497,19 @@ def report_snapshot_html(report_id:int,user=Depends(current_user)):
 @app.post('/api/assets')
 def create_asset(body:AssetIn,user=Depends(require_permission('assets.write',*WRITE_ROLES))):
     with db() as conn:
-        asset_no=body.asset_no or next_no(conn,'assets','asset_no','AST-',1000)
-        vals=body.model_dump(); vals['asset_no']=asset_no
-        cols=list(vals); qs=','.join('?'*len(cols))
-        cur=conn.execute(f"INSERT INTO assets({','.join(cols)},created_at,updated_at) VALUES({qs},?,?)",(*[vals[c] for c in cols],now(),now()))
-        audit(conn,user['id'],'CREATE','Assets',asset_no,'',vals)
-        return {'id':cur.lastrowid,'asset_no':asset_no}
+        return create_asset_record(conn,body.model_dump(),user['id'])
 @app.patch('/api/assets/{asset_id}')
 def update_asset(asset_id:int,body:AssetPatch,user=Depends(require_permission('assets.write',*WRITE_ROLES))):
     changes={k:v for k,v in body.model_dump().items() if v is not None}
     with db() as conn:
-        old=get_or_404(conn,'SELECT * FROM assets WHERE id=?',(asset_id,),'Asset not found')
-        if changes:
-            conn.execute('UPDATE assets SET '+','.join(f'{k}=?' for k in changes)+',updated_at=? WHERE id=?',(*changes.values(),now(),asset_id)); audit(conn,user['id'],'UPDATE','Assets',old['asset_no'],old,changes)
-        return {'ok':True}
+        try:return update_asset_record(conn,asset_id,changes,user['id'])
+        except AssetNotFound as exc:raise HTTPException(404,str(exc))
 @app.delete('/api/assets/{asset_id}')
 def delete_asset(asset_id:int,user=Depends(require_permission('assets.write','admin','asset_manager'))):
     with db() as conn:
-        old=get_or_404(conn,'SELECT * FROM assets WHERE id=?',(asset_id,),'Asset not found')
-        refs=conn.execute('SELECT COUNT(*) FROM work_orders WHERE asset_id=?',(asset_id,)).fetchone()[0]+conn.execute('SELECT COUNT(*) FROM assets WHERE parent_asset_id=?',(asset_id,)).fetchone()[0]
-        if refs: raise HTTPException(409,'Asset has linked history or child assets; retire it instead of deleting it')
-        conn.execute('DELETE FROM assets WHERE id=?',(asset_id,));audit(conn,user['id'],'DELETE','Assets',old['asset_no'],old,'')
-        return {'ok':True}
+        try:return delete_asset_record(conn,asset_id,user['id'])
+        except AssetNotFound as exc:raise HTTPException(404,str(exc))
+        except AssetDeleteBlocked as exc:raise HTTPException(409,str(exc))
 @app.get('/api/assets-export.csv')
 def export_assets(user=Depends(current_user)):
     with db() as conn:data=rows(conn.execute(ASSET_SELECT+' ORDER BY a.asset_no'))
