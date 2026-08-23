@@ -2,6 +2,10 @@ services:
   euas:
     build: .
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "8000:8000"
     volumes:
