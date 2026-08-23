@@ -1778,7 +1778,10 @@ def outbox_list(status:str='',limit:int=Query(100,ge=1,le=500),user=Depends(requ
     sql='SELECT * FROM event_outbox WHERE 1=1';args=[]
     if status:sql+=' AND status=?';args.append(status)
     sql+=' ORDER BY id DESC LIMIT ?';args.append(limit)
-    with db() as conn:return rows(conn.execute(sql,args))
+    with db() as conn:
+        result=rows(conn.execute(sql,args))
+        for r in result:r['max_attempts']=OUTBOX_MAX_ATTEMPTS
+        return result
 
 @app.post('/api/events/outbox/{event_id}/retry')
 def retry_outbox_event(event_id:int,user=Depends(require_roles('admin','maintenance_manager'))):
