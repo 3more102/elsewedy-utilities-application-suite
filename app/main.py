@@ -17,6 +17,8 @@ from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow
 from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record
 from apps.maintenance import ACTION_ROLES, TRANSITIONS, DispatchError, InvalidWorkTransition, MaintenanceCommandError, WorkTransitionForbidden, backfill_work_order_slas as _backfill_work_order_slas, create_dispatch as create_dispatch_record, create_work_order as create_work_order_record, ensure_work_sla as _ensure_work_sla, mark_sla_resolution as _mark_sla_resolution, mark_sla_response as _mark_sla_response, post_cost, transition_dispatch as transition_dispatch_record, transition_target, transition_work_order as transition_work_order_record, update_work_order as update_work_order_record, validate_transition_actor
 from apps.procurement import ProcurementCommandError, approve_requisition as approve_requisition_record, create_purchase_order as create_purchase_order_record, create_requisition as create_requisition_record, receive_purchase_order as receive_purchase_order_record, submit_requisition as submit_requisition_record
+from apps.suppliers import SupplierError, create_supplier as create_supplier_record
+from apps.contracts import ContractError, create_contract as create_contract_record
 from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, ReservationCommandError, apply_inventory_transaction, issue_material_reservation, reconcile_reserved_stock as _reconcile_reserved_stock, release_material_reservation, reservation_rows as _reservation_rows, reserve_all_materials, reserve_material, sync_reserved_stock as _sync_reserved_stock, work_order_parts_readiness as _work_order_parts_readiness
 from apps.inspections import InspectionCommandError, create_inspection as create_inspection_record, submit_inspection as submit_inspection_record
 from apps.hse import HseCommandError, create_incident as create_hse_record, update_incident as update_hse_record
@@ -2406,14 +2408,16 @@ def vendors(user=Depends(current_user)):
 @app.post('/api/vendors')
 def create_vendor(body:VendorIn,user=Depends(require_permission('procurement.write','admin','procurement','maintenance_manager'))):
     with db() as conn:
-        code=body.vendor_code or next_no(conn,'vendors','vendor_code','VND-',100);cur=conn.execute('INSERT INTO vendors(vendor_code,name,category,contact_person,email,phone,status) VALUES(?,?,?,?,?,?,?)',(code,body.name,body.category,body.contact_person,body.email,body.phone,body.status));audit(conn,user['id'],'CREATE','Vendors',code,'',body.model_dump());return {'id':cur.lastrowid,'vendor_code':code}
+        try:return create_supplier_record(conn,body.model_dump(),user['id'])
+        except SupplierError as exc:raise HTTPException(exc.status_code,str(exc))
 @app.get('/api/contracts')
 def contracts(user=Depends(current_user)):
     with db() as conn:return rows(conn.execute('SELECT c.*,v.name vendor_name FROM contracts c LEFT JOIN vendors v ON v.id=c.vendor_id ORDER BY c.id DESC'))
 @app.post('/api/contracts')
 def create_contract(body:ContractIn,user=Depends(require_permission('procurement.write','admin','procurement','maintenance_manager'))):
     with db() as conn:
-        no=body.contract_no or next_no(conn,'contracts','contract_no','CTR-',4001);cur=conn.execute('INSERT INTO contracts(contract_no,title,vendor_id,start_date,end_date,value,status) VALUES(?,?,?,?,?,?,?)',(no,body.title,body.vendor_id,body.start_date,body.end_date,body.value,body.status));audit(conn,user['id'],'CREATE','Contracts',no,'',body.model_dump());return {'id':cur.lastrowid,'contract_no':no}
+        try:return create_contract_record(conn,body.model_dump(),user['id'])
+        except ContractError as exc:raise HTTPException(exc.status_code,str(exc))
 
 # ---------- documents ----------
 @app.get('/api/documents')

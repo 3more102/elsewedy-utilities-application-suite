@@ -5,6 +5,7 @@ from datetime import date
 from apps.approvals import create_approval, resolve_approval
 from apps.audit import audit
 from apps.events import emit_event, workflow_event
+from apps.suppliers import SupplierError, supplier_for_procurement
 from core.configuration import DB_BACKEND
 from core.database import now
 from core.shared import next_no
@@ -122,6 +123,10 @@ def create_purchase_order(conn, data: dict, actor_id: int) -> dict:
     _begin_write(conn)
     payload = dict(data)
     requisition = _row(conn, 'purchase_requisitions', int(payload['pr_id']), 'PR not found')
+    try:
+        supplier_for_procurement(conn, int(payload['vendor_id']))
+    except SupplierError as exc:
+        raise ProcurementConflict(str(exc)) from exc
     try:
         ordered_status = requisition_target(requisition['status'], 'order')
     except InvalidProcurementTransition as exc:

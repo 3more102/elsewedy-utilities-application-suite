@@ -1,15 +1,15 @@
 {
   "application": "Elsewedy Utilities Application Suite (EUAS)",
   "version": "4.9.0",
-  "release_focus": "Approval evidence, command atomicity, inventory idempotency, inspection and HSE lifecycle hardening",
+  "release_focus": "Approval evidence, command atomicity, inventory idempotency, inspection/HSE, supplier and contract boundaries",
   "schema_version": 23,
   "api_endpoints": 244,
   "api_routes_under_api": 243,
   "relational_tables": 89,
   "explicit_indexes": 89,
-  "automated_tests": 102,
+  "automated_tests": 104,
   "verification": {
-    "pytest": "PASS — 102 source test definitions / 104 collected tests",
+    "pytest": "PASS — 104 source test definitions / 106 collected tests",
     "fresh_uvicorn_http_smoke": "PASS — version=4.9.0 with RCM read surface",
     "fresh_sqlite_schema": "PASS — schema 23, 89 tables, 89 indexes, integrity ok",
     "python_compile": "PASS",
