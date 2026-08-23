@@ -30,6 +30,9 @@ from apps.condition_monitoring import ConditionRuleError, condition_matches as _
 from apps.notifications import notify, notify_once
 from apps.approvals import create_approval, resolve_approval
 from apps.cbm import evaluate_rules as evaluate_cbm_rules
+from apps.reliability import asset_reliability_rows as _asset_reliability_rows, outage_overlap_hours as _outage_overlap_hours, site_reliability_rows as _site_reliability_rows
+from apps.fmea import FmeaError, calculate_risk as calculate_fmea_risk, get_record as get_fmea_record, would_create_failure_mode_cycle
+from apps.rcm import RCM_CONSEQUENCES, RCM_STRATEGY_TYPES, RcmError, default_review_due as rcm_default_review_due, get_strategy as get_rcm_strategy, review_days as rcm_review_days, validate_payload as validate_rcm_payload
 from api.middleware import security_headers
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
@@ -265,58 +268,6 @@ def _maintenance_forecast(conn,horizon_days:int=90,site_id:Optional[int]=None):
                        'capacity_hours':total_capacity,'peak_utilization_pct':max([x['utilization_pct'] for x in out] or [0]),
                        'parts_shortage_jobs':sum(x['parts_shortage_jobs'] for x in out),'parts_ready_jobs':sum(x['parts_ready_jobs'] for x in out)}}
 
-def _outage_overlap_hours(start_value, end_value, window_start:datetime, window_end:datetime):
-    try:start=_dt(start_value)
-    except Exception:return 0.0
-    try:end=_dt(end_value) if end_value else min(datetime.now(),window_end)
-    except Exception:end=min(datetime.now(),window_end)
-    left=max(start,window_start);right=min(end,window_end)
-    return max(0.0,(right-left).total_seconds()/3600.0)
-
-def _asset_reliability_rows(conn, period_days:int=365, site_id:Optional[int]=None):
-    today=date.today();cutoff=today-timedelta(days=period_days);window_end=datetime.now()
-    sql="""SELECT a.id,a.asset_no,a.name,a.commissioning_date,a.criticality,a.condition,s.id site_id,s.site_code,s.name site_name
-             FROM assets a LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE 1=1"""
-    args=[]
-    if site_id is not None:sql+=' AND s.id=?';args.append(site_id)
-    assets=rows(conn.execute(sql,args));result=[]
-    for a in assets:
-        start=cutoff
-        if a.get('commissioning_date'):
-            try:start=max(start,date.fromisoformat(str(a['commissioning_date'])[:10]))
-            except Exception:pass
-        window_start=datetime.combine(start,datetime.min.time());period_hours=max(24.0,(window_end-window_start).total_seconds()/3600.0)
-        outages=rows(conn.execute("""SELECT * FROM asset_outages WHERE asset_id=? AND outage_type='Forced' AND start_at<=? AND (end_at IS NULL OR end_at>=?) ORDER BY start_at""",(a['id'],window_end.isoformat(timespec='seconds'),window_start.isoformat(timespec='seconds'))))
-        if outages:
-            failure_count=len(outages);downtime=sum(_outage_overlap_hours(x['start_at'],x.get('end_at'),window_start,window_end) for x in outages);source='outage_events'
-        else:
-            failures=rows(conn.execute("""SELECT id,wo_no,actual_hours,actual_cost,COALESCE(actual_finish,created_at) event_date FROM work_orders
-              WHERE asset_id=? AND status IN ('Completed','Closed') AND (work_type LIKE 'Corrective%' OR work_type='Breakdown')
-              AND COALESCE(actual_finish,created_at)>=?""",(a['id'],start.isoformat())))
-            failure_count=len(failures);downtime=sum(float(x.get('actual_hours') or 0) for x in failures);source='work_order_hours_fallback' if failures else 'no_failures'
-        uptime=max(0.0,period_hours-downtime);mttr=round(downtime/failure_count,2) if failure_count else 0.0
-        mtbf=round(uptime/failure_count,2) if failure_count else None
-        availability=round(100*uptime/period_hours,3) if period_hours else 100.0
-        cost=conn.execute('SELECT COALESCE(SUM(amount),0) FROM maintenance_cost_ledger WHERE asset_id=? AND posted_at>=?',(a['id'],start.isoformat())).fetchone()[0] or 0
-        result.append({**a,'period_days':max(1,(today-start).days),'period_hours':round(period_hours,1),'failures':failure_count,'downtime_hours':round(downtime,2),
-                       'downtime_source':source,'mtbf_hours':mtbf,'mttr_hours':mttr,'availability_pct':availability,'maintenance_cost':round(float(cost),2)})
-    return result
-
-def _site_reliability_rows(conn, period_days:int=365):
-    assets=_asset_reliability_rows(conn,period_days,None);sites={}
-    for a in assets:
-        key=a.get('site_id');
-        if key is None:continue
-        s=sites.setdefault(key,{'site_id':key,'site_code':a.get('site_code'),'site_name':a.get('site_name'),'assets':0,'failures':0,'period_hours':0.0,'downtime_hours':0.0,'maintenance_cost':0.0})
-        s['assets']+=1;s['failures']+=a['failures'];s['period_hours']+=a['period_hours'];s['downtime_hours']+=a['downtime_hours'];s['maintenance_cost']+=a['maintenance_cost']
-    out=[]
-    for s in sites.values():
-        uptime=max(0.0,s['period_hours']-s['downtime_hours']);failures=s['failures']
-        s['mtbf_hours']=round(uptime/failures,2) if failures else None;s['mttr_hours']=round(s['downtime_hours']/failures,2) if failures else 0.0
-        s['availability_pct']=round(100*uptime/s['period_hours'],3) if s['period_hours'] else 100.0;s['maintenance_cost']=round(s['maintenance_cost'],2)
-        s['period_hours']=round(s['period_hours'],1);s['downtime_hours']=round(s['downtime_hours'],2);out.append(s)
-    return sorted(out,key=lambda x:(x['availability_pct'],x['site_name'] or ''))
-
 def get_or_404(conn, sql, args, message='Record not found'):
     r=conn.execute(sql,args).fetchone()
     if not r: raise HTTPException(404,message)
@@ -413,77 +364,37 @@ def _refresh_incidents_for_alarm(conn, alarm_id:int, actor_id:Optional[int]=None
     return refresh_correlated_incidents_for_alarm(conn,alarm_id,actor_id)
 
 def _fmea_risk(severity:int, occurrence:int, detectability:int):
-    vals=(int(severity),int(occurrence),int(detectability))
-    if any(v<1 or v>10 for v in vals):raise HTTPException(422,'FMEA severity, occurrence and detectability must be between 1 and 10')
-    rpn=vals[0]*vals[1]*vals[2]
-    band='Critical' if rpn>=300 else 'High' if rpn>=160 else 'Medium' if rpn>=80 else 'Low'
-    return rpn,band
+    try:
+        return calculate_fmea_risk(severity, occurrence, detectability)
+    except FmeaError as exc:
+        raise HTTPException(exc.status_code, str(exc))
 
 def _fmea_record(conn, asset_fmea_id:int, expected_asset_id:Optional[int]=None, active_required:bool=True):
-    rec=one(conn.execute("""SELECT f.*,a.asset_no,a.name asset_name,fm.mode_no,fm.name failure_mode_name,fm.category failure_mode_category
-      FROM asset_fmea f JOIN assets a ON a.id=f.asset_id JOIN failure_modes fm ON fm.id=f.failure_mode_id WHERE f.id=?""",(asset_fmea_id,)))
-    if not rec:raise HTTPException(404,'Asset FMEA record not found')
-    if expected_asset_id is not None and int(rec['asset_id'])!=int(expected_asset_id):raise HTTPException(422,'FMEA record must belong to the same asset')
-    if active_required and rec['status']=='Retired':raise HTTPException(409,'Retired FMEA records cannot be linked to new work or CBM rules')
-    return rec
+    try:
+        return get_fmea_record(conn, asset_fmea_id, expected_asset_id, active_required)
+    except FmeaError as exc:
+        raise HTTPException(exc.status_code, str(exc))
 
 def _failure_mode_cycle(conn, mode_id:int, parent_id:Optional[int]):
-    if parent_id is None:return False
-    if int(parent_id)==int(mode_id):return True
-    seen=set();cur=parent_id
-    while cur is not None and cur not in seen:
-        if int(cur)==int(mode_id):return True
-        seen.add(cur);row=conn.execute('SELECT parent_id FROM failure_modes WHERE id=?',(cur,)).fetchone();cur=row['parent_id'] if row else None
-    return False
-
-RCM_CONSEQUENCES=('Safety','Environmental','Operational','Non-Operational','Hidden')
-RCM_STRATEGY_TYPES=('Condition-Based','Time-Based','Run-to-Failure','Failure-Finding','Redesign')
+    return would_create_failure_mode_cycle(conn, mode_id, parent_id)
 
 def _rcm_review_days(risk_band:str):
-    return {'Critical':90,'High':180,'Medium':365,'Low':730}.get(str(risk_band),365)
+    return rcm_review_days(risk_band)
 
 def _rcm_default_review_due(fmea:dict):
-    return (date.today()+timedelta(days=_rcm_review_days(fmea.get('risk_band') or 'Medium'))).isoformat()
+    return rcm_default_review_due(fmea)
 
 def _rcm_strategy_record(conn, strategy_id:int):
-    rec=one(conn.execute("""SELECT r.*,f.fmea_no,f.asset_id,f.rpn,f.risk_band,f.status fmea_status,a.asset_no,a.name asset_name,
-      fm.mode_no,fm.name failure_mode_name,ou.full_name owner_name,ap.full_name approved_by_name,ac.full_name activated_by_name,
-      cb.rule_no linked_cbm_rule_no,cb.name linked_cbm_rule_name,pm.pm_no linked_pm_no,pm.name linked_pm_name
-      FROM rcm_strategies r JOIN asset_fmea f ON f.id=r.asset_fmea_id JOIN assets a ON a.id=f.asset_id
-      JOIN failure_modes fm ON fm.id=f.failure_mode_id LEFT JOIN users ou ON ou.id=r.owner_id LEFT JOIN users ap ON ap.id=r.approved_by
-      LEFT JOIN users ac ON ac.id=r.activated_by LEFT JOIN cbm_rules cb ON cb.id=r.linked_cbm_rule_id
-      LEFT JOIN maintenance_plans pm ON pm.id=r.linked_pm_plan_id WHERE r.id=?""",(strategy_id,)))
-    if not rec:raise HTTPException(404,'RCM strategy not found')
-    return rec
+    try:
+        return get_rcm_strategy(conn, strategy_id)
+    except RcmError as exc:
+        raise HTTPException(exc.status_code, str(exc))
 
 def _validate_rcm_payload(conn, fmea:dict, data:dict, require_ready:bool=False):
-    consequence=str(data.get('consequence_classification') or '')
-    strategy=str(data.get('strategy_type') or '')
-    if consequence not in RCM_CONSEQUENCES:raise HTTPException(422,'Invalid RCM consequence classification')
-    if strategy not in RCM_STRATEGY_TYPES:raise HTTPException(422,'Invalid RCM maintenance strategy type')
-    if fmea.get('status')=='Retired':raise HTTPException(409,'Retired FMEA records cannot have new or submitted RCM strategies')
-    interval=data.get('interval_days')
-    if strategy in ('Time-Based','Failure-Finding') and not interval:raise HTTPException(422,f'{strategy} strategies require interval_days')
-    if interval is not None and (int(interval)<1 or int(interval)>3650):raise HTTPException(422,'RCM interval_days must be between 1 and 3650')
-    if strategy=='Run-to-Failure' and consequence in ('Safety','Environmental'):
-        raise HTTPException(422,'Run-to-Failure is not permitted for Safety or Environmental consequence classifications')
-    cbm_id=data.get('linked_cbm_rule_id')
-    if cbm_id:
-        cb=one(conn.execute('SELECT id,asset_fmea_id,active FROM cbm_rules WHERE id=?',(cbm_id,)))
-        if not cb:raise HTTPException(404,'Linked CBM rule not found')
-        if int(cb.get('asset_fmea_id') or 0)!=int(fmea['id']):raise HTTPException(422,'Linked CBM rule must reference the same FMEA record')
-        if require_ready and not cb.get('active'):raise HTTPException(409,'Linked CBM rule must be active before RCM submission or activation')
-    if require_ready and strategy=='Condition-Based' and not cbm_id:
-        raise HTTPException(422,'Condition-Based RCM strategies require a linked active CBM rule before submission')
-    pm_id=data.get('linked_pm_plan_id')
-    if pm_id:
-        pm=one(conn.execute('SELECT id,asset_id,active FROM maintenance_plans WHERE id=?',(pm_id,)))
-        if not pm:raise HTTPException(404,'Linked maintenance plan not found')
-        if int(pm['asset_id'])!=int(fmea['asset_id']):raise HTTPException(422,'Linked maintenance plan must belong to the same asset')
-        if require_ready and not pm.get('active'):raise HTTPException(409,'Linked maintenance plan must be active before RCM submission or activation')
-    if require_ready and strategy=='Time-Based' and not pm_id:
-        raise HTTPException(422,'Time-Based RCM strategies require a linked active maintenance plan before submission')
-    return True
+    try:
+        return validate_rcm_payload(conn, fmea, data, require_ready)
+    except RcmError as exc:
+        raise HTTPException(exc.status_code, str(exc))
 
 def _evaluate_cbm_rules(conn, channel:dict, value:float, captured_at:str, reading_id:int, actor_id:int):
     return evaluate_cbm_rules(
