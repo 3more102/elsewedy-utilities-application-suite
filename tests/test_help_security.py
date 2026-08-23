@@ -7,6 +7,10 @@ INDEX = ROOT / 'static' / 'index.html'
 HELP_SECURITY = ROOT / 'static' / 'help-security.js'
 SERVICE_WORKER = ROOT / 'static' / 'sw.js'
 APP_JS = ROOT / 'static' / 'app.js'
+LEGACY_CREDENTIAL_DISPLAY = re.compile(
+    r'\b(?:omar|seif|planner|supervisor|tech1|tech2|store|proc|hse|exec)\s*/\s*\S+@\d{4}\b',
+    re.IGNORECASE,
+)
 
 
 def test_help_override_is_last_credential_free_and_precached():
@@ -29,8 +33,8 @@ def test_help_override_is_last_credential_free_and_precached():
 
     # The legacy monolith currently contains reference-account copy in more than
     # one render path. Until that monolith is decomposed, the last-loaded guard
-    # must protect both initial and later DOM writes rather than Help alone.
-    assert legacy_app.count('@2026') >= 2
+    # must protect every matching display shape rather than Help alone.
+    assert len(LEGACY_CREDENTIAL_DISPLAY.findall(legacy_app)) >= 2
 
     assert "const CACHE='euas-shell-v3.9.0-ui12'" in service_worker
     assert "'/static/help-security.js'" in service_worker
