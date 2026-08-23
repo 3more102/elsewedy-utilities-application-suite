@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.database import audit_digest
+from core.database import audit_digest
 
 
 _AUDIT_SELECT = (

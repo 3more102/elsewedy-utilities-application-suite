@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastapi import Header, HTTPException
 
-from app.database import db, now
+from core.database import db, now
 from apps.audit import audit
 from apps.identity import current_user
 from core.shared import next_no

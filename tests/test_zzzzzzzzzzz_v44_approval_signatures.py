@@ -122,13 +122,13 @@ def test_v44_signature_chain_detects_tampering_and_preserves_delegation_evidence
         root = Path(__file__).resolve().parents[1]
         manifest = json.loads((root / 'RELEASE_MANIFEST.json').read_text(encoding='utf-8'))
         main_src = (root / 'app' / 'main.py').read_text(encoding='utf-8')
-        db_src = (root / 'app' / 'database.py').read_text(encoding='utf-8')
+        db_src = (root / 'core' / 'database' / 'runtime.py').read_text(encoding='utf-8')
         readme = (root / 'README.md').read_text(encoding='utf-8')
         sw = (root / 'static' / 'sw.js').read_text(encoding='utf-8')
         all_routes = re.findall(r"@app\.(?:get|post|put|patch|delete)\((['\"])(.*?)\1", main_src)
         api_routes = [path for _, path in all_routes if path.startswith('/api/')]
         current_version = (root / 'VERSION').read_text(encoding='utf-8').strip()
-        config_src = (root / 'app' / 'config.py').read_text(encoding='utf-8')
+        config_src = (root / 'core' / 'configuration' / 'settings.py').read_text(encoding='utf-8')
         schema_version = int(re.search(r'SCHEMA_VERSION\s*=\s*(\d+)', config_src).group(1))
         test_count = sum(len(re.findall(r'^def test_', f.read_text(encoding='utf-8'), re.M)) for f in (root / 'tests').glob('test_*.py'))
         assert manifest['version'] == current_version and manifest['schema_version'] == schema_version

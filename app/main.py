@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, Pla
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .config import APP_NAME, APP_VERSION, STATIC_DIR, UPLOAD_DIR, SESSION_HOURS, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, ALLOWED_DOC_SUFFIXES, DB_BACKEND, DB_PATH, SCHEMA_VERSION, AUTOMATION_INTERVAL_MINUTES, EVENT_WEBHOOK_URL, EVENT_WEBHOOK_SECRET, OUTBOX_MAX_ATTEMPTS
-from .database import db, init_db, now
+from core.configuration import APP_NAME, APP_VERSION, STATIC_DIR, UPLOAD_DIR, SESSION_HOURS, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, ALLOWED_DOC_SUFFIXES, DB_BACKEND, DB_PATH, SCHEMA_VERSION, AUTOMATION_INTERVAL_MINUTES, EVENT_WEBHOOK_URL, EVENT_WEBHOOK_SECRET, OUTBOX_MAX_ATTEMPTS
+from core.database import db, init_db, now
 from apps.audit import audit, verify_audit_chain
 from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
 from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.database import now
+from core.database import now
 from .outbox import emit_event
 
 

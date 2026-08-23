@@ -6,7 +6,7 @@ import json
 import uuid
 from urllib import request as urllib_request
 
-from app.database import now
+from core.database import now
 
 
 def emit_event(conn, event_type: str, aggregate_type: str, aggregate_id, payload: dict) -> dict:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from app.database import audit_digest, now
+from core.database import audit_digest, now
 
 
 def _serialize(value: Any) -> str:

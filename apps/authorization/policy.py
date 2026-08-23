@@ -4,7 +4,7 @@ from datetime import datetime
 
 from fastapi import Depends, HTTPException
 
-from app.database import db
+from core.database import db
 from apps.identity import current_user
 
 

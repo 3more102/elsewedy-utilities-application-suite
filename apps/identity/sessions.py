@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import Header, HTTPException
 
-from app.database import db
+from core.database import db
 
 
 def current_user(authorization: Optional[str] = Header(default=None)):

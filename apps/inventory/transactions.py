@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.database import now
+from core.database import now
 from apps.audit import audit
 from core.shared import next_no
 
