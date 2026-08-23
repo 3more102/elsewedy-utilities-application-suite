@@ -24,10 +24,10 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -79,10 +79,10 @@ jobs:
       EUAS_VERSION: 3.9.0
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -154,6 +154,9 @@ jobs:
 
       - name: Run PostgreSQL telemetry temporal-ordering concurrency smoke
         run: python scripts/telemetry_temporal_ordering_concurrency_smoke.py
+
+      - name: Run PostgreSQL telemetry temporal integrity concurrency smoke
+        run: python scripts/telemetry_temporal_integrity_concurrency_smoke.py
 
       - name: Run live PostgreSQL HTTP smoke
         run: python scripts/postgres_smoke_test.py

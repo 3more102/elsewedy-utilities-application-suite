@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException
 
@@ -32,7 +32,9 @@ def _event_instant(value: str | datetime) -> datetime:
 
     EUAS historically stores ``now()`` values without an offset. For backwards
     compatibility those naive values are interpreted in the server's local
-    timezone; offset-aware SCADA/client timestamps are converted directly to UTC.
+    timezone; offset-aware SCADA/client timestamps are converted directly to
+    UTC. Timezone-equivalent instants therefore compare equal regardless of the
+    offset they were written with.
     """
     if isinstance(value, datetime):
         parsed = value
@@ -49,28 +51,61 @@ def _event_instant(value: str | datetime) -> datetime:
     return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def _is_temporally_current(captured_at: str, last_reading_at: str | None) -> bool:
-    """Only a strictly newer explicit event-time reading may advance live state."""
+def _is_temporally_current(
+    captured_at: str,
+    last_reading_at: str | None,
+    *,
+    allow_equal: bool = False,
+) -> bool:
+    """Decide whether a reading may advance the live channel generation.
+
+    Explicit event timestamps use strict ordering: an equal instant is treated
+    as replay/historical evidence and cannot duplicate alarm side effects.
+    Readings that omit captured_at inherit server arrival time; because the
+    historical ``now()`` format has second resolution, equal generated values
+    retain legacy arrival-order behavior via ``allow_equal``.
+    """
     if not last_reading_at:
         return True
     try:
-        return _event_instant(captured_at) > _event_instant(last_reading_at)
+        captured = _event_instant(captured_at)
+        current = _event_instant(last_reading_at)
+        return captured > current or (allow_equal and captured == current)
     except (TypeError, ValueError):
-        # Allow valid incoming evidence to repair an invalid legacy marker.
+        # Incoming capture values are validated before this helper. If legacy
+        # state contains an invalid timestamp, allow the valid incoming reading
+        # to repair the channel's latest-state marker instead of freezing it.
         return True
 
 
 def _implicit_capture_after(last_reading_at: str | None) -> str:
-    """Return the historical server-arrival marker for untimestamped telemetry.
+    """Return the server arrival marker for one untimestamped reading.
 
-    Untimestamped callers historically use ``now()`` and may therefore share a
-    second-resolution timestamp. Canonical channel locking serializes those live
-    generations, so equal implicit timestamps remain safe and preserve the
-    established storage/API contract. Strict event-time ordering applies only to
-    explicit device/client timestamps.
+    Called only while the channel row lock is held so concurrent legacy callers
+    are serialized by the database rather than by request-start timing. Equal
+    second-level markers stay live generations (historical arrival-order
+    behavior). When the stored marker is ahead of the host clock — for example
+    after a future-dated explicit sample — synthesize a marker one microsecond
+    past it instead of silently classifying every untimestamped reading as
+    historical until the clock catches up.
     """
-    del last_reading_at
-    return now()
+    candidate = now()
+    if not last_reading_at:
+        return candidate
+    try:
+        if _event_instant(candidate) >= _event_instant(last_reading_at):
+            return candidate
+        target_utc = (
+            _event_instant(last_reading_at).replace(tzinfo=timezone.utc)
+            + timedelta(microseconds=1)
+        )
+        return (
+            target_utc.astimezone()
+            .replace(tzinfo=None)
+            .isoformat(timespec='microseconds')
+        )
+    except (TypeError, ValueError):
+        return candidate
 
 
 def _resolve_and_lock_channels(conn, channel_codes: list[str]) -> dict[str, int]:
@@ -82,6 +117,7 @@ def _resolve_and_lock_channels(conn, channel_codes: list[str]) -> dict[str, int]
     """
     ids: dict[str, int] = {}
     for code in sorted(set(channel_codes)):
+        code = code.strip().upper()
         row = conn.execute(
             'SELECT id FROM telemetry_channels WHERE channel_code=? AND active=1',
             (code,),
@@ -317,7 +353,16 @@ def evaluate_telemetry_alarm_atomic(
 
 
 def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
-    """Persist every reading; advance current state only by explicit event time."""
+    """Persist every reading; advance live state only by event time.
+
+    Delayed or explicit equal-time readings remain queryable in
+    telemetry_readings but cannot regress telemetry_channels.last_* or mutate
+    active alarm state. Untimestamped readings preserve legacy arrival-order
+    behavior. All participating channels are locked in canonical ID order
+    before any mutation, and telemetry alarm mutation coordinates with the
+    manual lifecycle through locked reloads, keeping the invariants
+    deterministic under concurrent PostgreSQL ingestion.
+    """
     normalized: list[tuple[object, str, str | None]] = []
     for reading in body.readings:
         code = reading.channel_code.strip().upper()
@@ -326,7 +371,10 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
             try:
                 _event_instant(explicit_capture)
             except (TypeError, ValueError):
-                raise HTTPException(400, f'Invalid captured_at for telemetry channel {code}')
+                raise HTTPException(
+                    400,
+                    f'Invalid captured_at for telemetry channel {code}',
+                )
         normalized.append((reading, code, explicit_capture))
 
     channel_ids = _resolve_and_lock_channels(
@@ -367,9 +415,10 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
         )
         summary['accepted'] += 1
 
-        if explicit_capture is not None and not _is_temporally_current(
+        if not _is_temporally_current(
             captured,
             channel.get('last_reading_at'),
+            allow_equal=not explicit_capture,
         ):
             summary['historical'] += 1
             summary['results'].append(

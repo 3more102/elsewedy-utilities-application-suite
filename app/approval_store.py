@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import Depends, HTTPException
 
 from . import application as _application
@@ -10,6 +12,13 @@ from .database import db, now
 
 class ApprovalTransitionConflict(RuntimeError):
     """Raised when an approval's target record changed before it was claimed."""
+
+
+APPROVAL_SELECT = """SELECT ap.*,req.full_name requested_by_name,dec.full_name decided_by_name,ass.full_name assigned_user_name
+FROM approval_requests ap
+JOIN users req ON req.id=ap.requested_by
+LEFT JOIN users dec ON dec.id=ap.decided_by
+LEFT JOIN users ass ON ass.id=ap.assigned_user_id"""
 
 
 def _rowcount_one(cursor) -> bool:
@@ -144,6 +153,206 @@ def decide_approval_atomic(conn, approval_id: int, body, user: dict) -> dict:
         approval['record_code'],
     )
     return {'ok': True, 'status': target, 'record_code': approval['record_code']}
+
+
+def list_approvals_view(conn, status: str, module: str, user: dict) -> list[dict]:
+    """Approval queue with historical visibility scoping and delegation flags.
+
+    Privileged roles see the whole queue; every other authenticated role sees
+    only approvals assigned to their user/role, requested by them, or actively
+    delegated to them. This mirrors the historical role ceiling exactly.
+    """
+    sql = APPROVAL_SELECT + ' WHERE 1=1'
+    args: list[object] = []
+    if status:
+        sql += ' AND ap.status=?'
+        args.append(status)
+    if module:
+        sql += ' AND ap.module=?'
+        args.append(module)
+    if user['role'] not in ('admin', 'maintenance_manager', 'executive'):
+        sql += """ AND (ap.assigned_user_id=? OR ap.assigned_role=? OR ap.requested_by=? OR EXISTS (
+          SELECT 1 FROM approval_delegations d WHERE d.delegator_user_id=ap.assigned_user_id AND d.delegate_user_id=?
+          AND d.active=1 AND d.start_at<=? AND d.end_at>=? AND (d.module='*' OR d.module=ap.module)
+        ))"""
+        stamp = now()
+        args += [user['id'], user['role'], user['id'], user['id'], stamp, stamp]
+    sql += " ORDER BY CASE ap.status WHEN 'Pending' THEN 0 ELSE 1 END,ap.id DESC"
+    result = _application.rows(conn.execute(sql, args))
+    for a in result:
+        a['delegated_to_me'] = bool(
+            a['status'] == 'Pending'
+            and _application._delegation_active(conn, a, user['id'])
+        )
+    return result
+
+
+def create_delegation(conn, body, user: dict) -> dict:
+    if body.delegate_user_id == user['id']:
+        raise HTTPException(400, 'You cannot delegate approvals to yourself')
+    try:
+        start = _application._dt(body.start_at)
+        end = _application._dt(body.end_at)
+    except Exception:
+        raise HTTPException(400, 'Invalid delegation date/time')
+    if end <= start:
+        raise HTTPException(400, 'Delegation end must be after start')
+    if (end - start).days > 366:
+        raise HTTPException(400, 'Delegation cannot exceed 366 days')
+    delegate = _application.get_or_404(
+        conn,
+        'SELECT u.id,u.active,u.full_name FROM users u WHERE u.id=?',
+        (body.delegate_user_id,),
+        'Delegate user not found',
+    )
+    if not delegate['active']:
+        raise HTTPException(409, 'Delegate user is inactive')
+    cur = conn.execute(
+        '''INSERT INTO approval_delegations(
+             delegator_user_id,delegate_user_id,module,start_at,end_at,active,
+             created_by,created_at
+           ) VALUES(?,?,?,?,?,1,?,?)''',
+        (
+            user['id'],
+            body.delegate_user_id,
+            body.module or '*',
+            start.isoformat(timespec='seconds'),
+            end.isoformat(timespec='seconds'),
+            user['id'],
+            now(),
+        ),
+    )
+    append_audit(
+        conn,
+        user['id'],
+        'DELEGATE',
+        'Approvals',
+        str(cur.lastrowid),
+        '',
+        {
+            'delegate': delegate['full_name'],
+            'module': body.module or '*',
+            'start_at': body.start_at,
+            'end_at': body.end_at,
+        },
+    )
+    _application.notify(
+        conn,
+        'Approval delegation',
+        f"{user['full_name']} delegated approvals to you through {end.date().isoformat()}",
+        'Info',
+        body.delegate_user_id,
+        None,
+        'approvals',
+        str(cur.lastrowid),
+    )
+    return {'id': cur.lastrowid, 'active': True}
+
+
+def list_delegations_view(conn, user: dict) -> list[dict]:
+    sql = """SELECT d.*,src.full_name delegator_name,src.username delegator_username,dst.full_name delegate_name,dst.username delegate_username,creator.full_name created_by_name
+    FROM approval_delegations d JOIN users src ON src.id=d.delegator_user_id JOIN users dst ON dst.id=d.delegate_user_id JOIN users creator ON creator.id=d.created_by"""
+    args: list[object] = []
+    if user['role'] != 'admin':
+        sql += ' WHERE d.delegator_user_id=? OR d.delegate_user_id=?'
+        args = [user['id'], user['id']]
+    sql += ' ORDER BY d.active DESC,d.end_at DESC,d.id DESC'
+    return _application.rows(conn.execute(sql, args))
+
+
+def deactivate_delegation(conn, delegation_id: int, user: dict) -> dict:
+    delegation = _application.get_or_404(
+        conn,
+        'SELECT * FROM approval_delegations WHERE id=?',
+        (delegation_id,),
+        'Delegation not found',
+    )
+    if (
+        user['role'] != 'admin'
+        and delegation['delegator_user_id'] != user['id']
+    ):
+        raise HTTPException(
+            403, 'Only the delegator or administrator can deactivate this delegation'
+        )
+    conn.execute(
+        'UPDATE approval_delegations SET active=0 WHERE id=?', (delegation_id,)
+    )
+    append_audit(
+        conn,
+        user['id'],
+        'DEACTIVATE DELEGATION',
+        'Approvals',
+        str(delegation_id),
+        1,
+        0,
+    )
+    return {'ok': True}
+
+
+def install_approval_routes() -> None:
+    """Own the approval queue and delegation APIs inside the approval domain.
+
+    The atomic decision route is installed separately; this installer owns the
+    read/delegation surface. Behavior, paths, models and role ceilings are
+    preserved verbatim from the historical application.py definitions.
+    """
+    app = _application.app
+    marker = '_euas_approval_routes'
+    if getattr(app.state, marker, False):
+        return
+
+    removals = [
+        ('/api/approvals', {'GET'}),
+        ('/api/approval-delegations', {'GET'}),
+        ('/api/approval-delegations', {'POST'}),
+        ('/api/approval-delegations/{delegation_id}/deactivate', {'PATCH'}),
+    ]
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not any(
+            getattr(route, 'path', None) == path
+            and methods.intersection(set(getattr(route, 'methods', set()) or set()))
+            for path, methods in removals
+        )
+    ]
+
+    @app.get('/api/approvals')
+    def list_approvals_route(
+        status: str = 'Pending',
+        module: str = '',
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            return list_approvals_view(conn, status, module, user)
+
+    @app.get('/api/approval-delegations')
+    def list_delegations_route(user=Depends(current_user)):
+        with db() as conn:
+            return list_delegations_view(conn, user)
+
+    @app.post('/api/approval-delegations')
+    def create_delegation_route(
+        body: _application.ApprovalDelegationIn,
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            return create_delegation(conn, body, user)
+
+    @app.patch('/api/approval-delegations/{delegation_id}/deactivate')
+    def deactivate_delegation_route(
+        delegation_id: int,
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            return deactivate_delegation(conn, delegation_id, user)
+
+    _application.list_approvals = list_approvals_route
+    _application.list_approval_delegations = list_delegations_route
+    _application.create_approval_delegation = create_delegation_route
+    _application.deactivate_approval_delegation = deactivate_delegation_route
+    app.openapi_schema = None
+    setattr(app.state, marker, True)
 
 
 def install_atomic_approval_route() -> None:

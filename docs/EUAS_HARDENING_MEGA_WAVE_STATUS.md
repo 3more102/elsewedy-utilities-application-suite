@@ -32,13 +32,16 @@ Current focus order:
 | Distributed scheduler | The in-process automation scheduler uses a database-backed cross-replica singleton gate; the PostgreSQL gate is covered by a 12-worker concurrency smoke |
 | Scheduler failover | Duplicate suppression follows the latest scheduler generation. A newer failed run is not hidden by an older recent success, so peer failover remains immediate |
 | Workflow consistency | Dispatch transitions transactionally validate and lock the linked work-order lifecycle; stale dispatch arrival after work completion/closure rolls back cleanly |
+| Outage lifecycle | Outage close claims exactly one terminal generation with a conditional update; concurrent/repeated closes can no longer duplicate close audits or `asset.outage.closed` events, and the asset-status restore runs after the claim in the same transaction |
+| Approval domain ownership | The unified approval queue and delegation APIs are owned by `app/approval_store.py` alongside the atomic decision route; paths, models and role ceilings are unchanged |
+| PM domain ownership | The maintenance-plan API surface (list/create/generate) is owned by `app/pm_store.py`; behavior and the WRITE_ROLES ceiling are unchanged |
 | PostgreSQL validation | Mandatory CI includes inventory, audit, procurement, reservation, workflow, dispatch/work-state, dispatch assignment/redispatch, transfers, PM, alarms, inspections, business numbers, reorder, outbox, scheduler and telemetry concurrency smokes plus live HTTP smoke |
 | Security scanning | Required security workflow includes Python dependency audit, CodeQL, production container smoke and high/critical vulnerability scanning |
 | Release evidence | `scripts/engineering_evidence.py` measures the composed runtime against an isolated fresh SQLite database and `ENGINEERING_EVIDENCE.json` is checked in CI for drift |
 
 ## Current measured engineering snapshot
 
-The release-evidence collector was executed in GitHub Actions on both supported SQLite Python jobs. The measured snapshot for this wave is:
+The release-evidence collector runs in GitHub Actions on both supported SQLite Python jobs. The latest measured snapshot (Ox Alpha next-wave, PR #48 head) is:
 
 - application version: `3.9.0`
 - schema contract: `10`
@@ -46,9 +49,9 @@ The release-evidence collector was executed in GitHub Actions on both supported 
 - `/api/` route-method pairs: `167`
 - relational tables: `61`
 - explicit indexes: `38`
-- source test definitions: `148`
+- source test definitions: `160`
 
-The full SQLite regression suite on the same evidence branch reports `148 passed`.
+The full SQLite regression suite on the same branch reports `160 passed`; all seven required CI checks (SQLite 3.11/3.12, PostgreSQL 16 integration, dependency audit, CodeQL, container smoke + vulnerability scan) pass on the PR #48 head.
 
 ## Integrated milestones
 
@@ -57,6 +60,8 @@ The full SQLite regression suite on the same evidence branch reports `148 passed
 - PR #43 — cross-replica singleton scheduled automation
 - PR #44 — linked work-order state enforcement for dispatch transitions
 - PR #45 — latest-generation scheduler failover semantics
-- PR #46 — deterministic release engineering evidence and drift gate (current wave)
+- PR #46 — deterministic release engineering evidence and drift gate
+- PR #47 — telemetry temporal integrity port (parallel landing; reconciled with the Ox Alpha superset implementation on this branch)
+- PR #48 (open) — telemetry temporal-integrity reconciliation, outage terminality fix, approval/PM domain ownership decomposition, dependency floor maintenance
 
 The historical authorization ceiling remains unchanged: capability overlays are narrowing controls and are not permitted to grant a role access that the historical role did not already have.

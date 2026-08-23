@@ -802,87 +802,9 @@ def revoke_other_sessions(authorization:Optional[str]=Header(None),user=Depends(
 
 
 # ---------- approvals / workflow ----------
-APPROVAL_SELECT="""SELECT ap.*,req.full_name requested_by_name,dec.full_name decided_by_name,ass.full_name assigned_user_name
-FROM approval_requests ap
-JOIN users req ON req.id=ap.requested_by
-LEFT JOIN users dec ON dec.id=ap.decided_by
-LEFT JOIN users ass ON ass.id=ap.assigned_user_id"""
-
-@app.get('/api/approvals')
-def list_approvals(status:str='Pending',module:str='',user=Depends(current_user)):
-    sql=APPROVAL_SELECT+' WHERE 1=1';args=[]
-    if status:sql+=' AND ap.status=?';args.append(status)
-    if module:sql+=' AND ap.module=?';args.append(module)
-    if user['role'] not in ('admin','maintenance_manager','executive'):
-        sql+=""" AND (ap.assigned_user_id=? OR ap.assigned_role=? OR ap.requested_by=? OR EXISTS (
-          SELECT 1 FROM approval_delegations d WHERE d.delegator_user_id=ap.assigned_user_id AND d.delegate_user_id=?
-          AND d.active=1 AND d.start_at<=? AND d.end_at>=? AND (d.module='*' OR d.module=ap.module)
-        ))""";stamp=now();args += [user['id'],user['role'],user['id'],user['id'],stamp,stamp]
-    sql+=" ORDER BY CASE ap.status WHEN 'Pending' THEN 0 ELSE 1 END,ap.id DESC"
-    with db() as conn:
-        result=rows(conn.execute(sql,args))
-        for a in result:a['delegated_to_me']=bool(a['status']=='Pending' and _delegation_active(conn,a,user['id']))
-        return result
-
-@app.post('/api/approvals/{approval_id}/decision')
-def decide_approval(approval_id:int,body:ApprovalDecisionIn,user=Depends(current_user)):
-    decision=body.decision.lower().strip()
-    if decision not in ('approve','reject'):raise HTTPException(400,'Decision must be approve or reject')
-    with db() as conn:
-        ap=get_or_404(conn,'SELECT * FROM approval_requests WHERE id=?',(approval_id,),'Approval request not found')
-        if ap['status']!='Pending':raise HTTPException(409,'Approval request is already decided')
-        allowed=user['role'] in ('admin','maintenance_manager') or ap['assigned_user_id']==user['id'] or (ap['assigned_role'] and ap['assigned_role']==user['role']) or _delegation_active(conn,ap,user['id'])
-        if not allowed:raise HTTPException(403,'This approval is not assigned to your role or user')
-        target='Approved' if decision=='approve' else 'Rejected'
-        if ap['record_type']=='work_order':
-            rec=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(ap['record_id'],),'Work order not found')
-            if rec['status']!='Submitted':raise HTTPException(409,f"Work order is {rec['status']}, not Submitted")
-            conn.execute('UPDATE work_orders SET status=?,updated_at=? WHERE id=?',(target,now(),rec['id']))
-            workflow_event(conn,'Work Management','work_order',rec['id'],rec['wo_no'],decision.upper(),rec['status'],target,user['id'],body.comments)
-            audit(conn,user['id'],decision.upper(),'Work Management',rec['wo_no'],rec['status'],target)
-        elif ap['record_type']=='purchase_requisition':
-            rec=get_or_404(conn,'SELECT * FROM purchase_requisitions WHERE id=?',(ap['record_id'],),'Purchase requisition not found')
-            if rec['status']!='Submitted':raise HTTPException(409,f"Purchase requisition is {rec['status']}, not Submitted")
-            conn.execute('UPDATE purchase_requisitions SET status=?,approved_at=? WHERE id=?',(target,now() if target=='Approved' else None,rec['id']))
-            workflow_event(conn,'Procurement','purchase_requisition',rec['id'],rec['pr_no'],decision.upper(),rec['status'],target,user['id'],body.comments)
-            audit(conn,user['id'],decision.upper(),'Procurement',rec['pr_no'],rec['status'],target)
-        else:
-            raise HTTPException(400,'Unsupported approval record type')
-        resolve_approval(conn,ap['module'],ap['record_type'],ap['record_id'],decision,user['id'],body.comments)
-        notify(conn,'Approval decision',f"{ap['record_code']} was {target.lower()}",'Info',ap['requested_by'],None,'work' if ap['record_type']=='work_order' else 'procurement',ap['record_code'])
-        return {'ok':True,'status':target,'record_code':ap['record_code']}
-
-@app.get('/api/approval-delegations')
-def list_approval_delegations(user=Depends(current_user)):
-    with db() as conn:
-        sql="""SELECT d.*,src.full_name delegator_name,src.username delegator_username,dst.full_name delegate_name,dst.username delegate_username,creator.full_name created_by_name
-        FROM approval_delegations d JOIN users src ON src.id=d.delegator_user_id JOIN users dst ON dst.id=d.delegate_user_id JOIN users creator ON creator.id=d.created_by"""
-        args=[]
-        if user['role']!='admin':sql+=' WHERE d.delegator_user_id=? OR d.delegate_user_id=?';args=[user['id'],user['id']]
-        sql+=' ORDER BY d.active DESC,d.end_at DESC,d.id DESC'
-        return rows(conn.execute(sql,args))
-
-@app.post('/api/approval-delegations')
-def create_approval_delegation(body:ApprovalDelegationIn,user=Depends(current_user)):
-    if body.delegate_user_id==user['id']:raise HTTPException(400,'You cannot delegate approvals to yourself')
-    try:start=_dt(body.start_at);end=_dt(body.end_at)
-    except Exception:raise HTTPException(400,'Invalid delegation date/time')
-    if end<=start:raise HTTPException(400,'Delegation end must be after start')
-    if (end-start).days>366:raise HTTPException(400,'Delegation cannot exceed 366 days')
-    with db() as conn:
-        delegate=get_or_404(conn,'SELECT u.id,u.active,u.full_name FROM users u WHERE u.id=?',(body.delegate_user_id,),'Delegate user not found')
-        if not delegate['active']:raise HTTPException(409,'Delegate user is inactive')
-        cur=conn.execute('INSERT INTO approval_delegations(delegator_user_id,delegate_user_id,module,start_at,end_at,active,created_by,created_at) VALUES(?,?,?,?,?,1,?,?)',(user['id'],body.delegate_user_id,body.module or '*',start.isoformat(timespec='seconds'),end.isoformat(timespec='seconds'),user['id'],now()))
-        audit(conn,user['id'],'DELEGATE','Approvals',str(cur.lastrowid),'',{'delegate':delegate['full_name'],'module':body.module or '*','start_at':body.start_at,'end_at':body.end_at})
-        notify(conn,'Approval delegation',f"{user['full_name']} delegated approvals to you through {end.date().isoformat()}",'Info',body.delegate_user_id,None,'approvals',str(cur.lastrowid))
-        return {'id':cur.lastrowid,'active':True}
-
-@app.patch('/api/approval-delegations/{delegation_id}/deactivate')
-def deactivate_approval_delegation(delegation_id:int,user=Depends(current_user)):
-    with db() as conn:
-        d=get_or_404(conn,'SELECT * FROM approval_delegations WHERE id=?',(delegation_id,),'Delegation not found')
-        if user['role']!='admin' and d['delegator_user_id']!=user['id']:raise HTTPException(403,'Only the delegator or administrator can deactivate this delegation')
-        conn.execute('UPDATE approval_delegations SET active=0 WHERE id=?',(delegation_id,));audit(conn,user['id'],'DEACTIVATE DELEGATION','Approvals',str(delegation_id),1,0);return {'ok':True}
+# Approval queue/delegation API ownership lives in approval_store.py; the
+# shared approval service helpers below (create_approval, resolve_approval,
+# _delegation_active) remain the cross-domain write-side contract.
 
 @app.get('/api/assets/health')
 def asset_health_portfolio(site_id:Optional[int]=None,user=Depends(current_user)):
@@ -1554,19 +1476,9 @@ def work_report(wo_id:int,user=Depends(current_user)):
     html=f'''<html><head><title>{w['wo_no']}</title><style>body{{font-family:Arial;margin:40px;color:#172033}}h1{{color:#c9272c}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;text-align:left}}small{{color:#666}}</style></head><body><h1>ELSEWEDY UTILITIES</h1><h2>{w['wo_no']} — {w['title']}</h2><p><b>Asset:</b> {w.get('asset_no') or '-'} {w.get('asset_name') or ''}<br><b>Status:</b> {w['status']} | <b>Priority:</b> {w['priority']} | <b>Type:</b> {w['work_type']}<br><b>Assigned:</b> {w.get('assigned_to_name') or '-'} | <b>Supervisor:</b> {w.get('supervisor_name') or '-'}</p><h3>Description</h3><p>{w['description']}</p><h3>Instructions / Safety</h3><p>{w['instructions']}<br>{w['safety_requirements']}</p><h3>Labor</h3><table><tr><th>Person</th><th>Hours</th><th>Notes</th></tr>{''.join(f"<tr><td>{x['full_name']}</td><td>{x['hours']}</td><td>{x['notes']}</td></tr>" for x in labor)}</table><h3>Materials</h3><table><tr><th>Item</th><th>Qty</th><th>Unit Cost</th></tr>{''.join(f"<tr><td>{x['item_no']} {x['name']}</td><td>{x['quantity']}</td><td>{x['unit_cost']}</td></tr>" for x in mats)}</table><p><b>Actual Cost:</b> {w['actual_cost']:.2f}</p><small>Generated by EUAS — Developed by Omar & Seif</small></body></html>'''
     return HTMLResponse(html)
 
-# ---------- PM ----------
-@app.get('/api/maintenance-plans')
-def list_pm(user=Depends(current_user)):
-    with db() as conn:return rows(conn.execute('''SELECT p.*,a.asset_no,a.name asset_name,a.meter_reading FROM maintenance_plans p JOIN assets a ON a.id=p.asset_id ORDER BY COALESCE(p.next_due,'9999-12-31'),p.pm_no'''))
-@app.post('/api/maintenance-plans')
-def create_pm(body:PMIn,user=Depends(require_roles(*WRITE_ROLES))):
-    with db() as conn:
-        no=next_no(conn,'maintenance_plans','pm_no','PM-',1000);cur=conn.execute('''INSERT INTO maintenance_plans(pm_no,name,asset_id,trigger_type,interval_days,meter_interval,next_due,priority,job_plan) VALUES(?,?,?,?,?,?,?,?,?)''',(no,body.name,body.asset_id,body.trigger_type,body.interval_days,body.meter_interval,body.next_due,body.priority,body.job_plan));audit(conn,user['id'],'CREATE','Preventive Maintenance',no,'',body.model_dump());return {'id':cur.lastrowid,'pm_no':no}
-@app.post('/api/maintenance-plans/generate')
-def generate_pm(user=Depends(require_roles(*WRITE_ROLES))):
-    with db() as conn:
-        generated=_generate_due_pm(conn,user['id'],date.today())
-        return {'count':len(generated),'generated':generated}
+# Maintenance-plan API ownership lives in pm_store.py (installed with the
+# production composition); the shared due-work generator remains the domain
+# service used by automation and this route family.
 
 # ---------- inventory ----------
 @app.get('/api/inventory')
@@ -1673,6 +1585,8 @@ def receive_po(po_id:int,user=Depends(require_roles('admin','procurement','store
         audit(conn,user['id'],'RECEIVE','Procurement',po['po_no'],po['status'],'Received');return {'ok':True}
 
 # ---------- outages / operational availability ----------
+# Outage close ownership lives in outage_store.py (terminal transition claim);
+# the read model and outage creation remain here.
 @app.get('/api/outages')
 def list_outages(status:str='',site_id:Optional[int]=None,asset_id:Optional[int]=None,user=Depends(current_user)):
     sql="""SELECT o.*,a.asset_no,a.name asset_name,s.site_code,s.name site_name,w.wo_no,u.full_name reported_by_name
@@ -1698,20 +1612,6 @@ def create_outage(body:OutageIn,user=Depends(require_roles('admin','asset_manage
         audit(conn,user['id'],'OPEN OUTAGE','Operations',no,'',body.model_dump());emit_event(conn,'asset.outage.opened','asset',body.asset_id,{'outage_no':no,'asset_no':a['asset_no'],'type':body.outage_type,'start_at':start_at})
         notify(conn,'Asset outage opened',f'{no} — {a["asset_no"]} is unavailable','High' if body.outage_type=='Forced' else 'Warning',None,'maintenance_manager','operations',no)
         return {'id':cur.lastrowid,'outage_no':no,'status':'Open'}
-
-@app.post('/api/outages/{outage_id}/close')
-def close_outage(outage_id:int,body:OutageCloseIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor','technician'))):
-    with db() as conn:
-        o=get_or_404(conn,'SELECT o.*,a.asset_no FROM asset_outages o JOIN assets a ON a.id=o.asset_id WHERE o.id=?',(outage_id,),'Outage not found')
-        if o['status']!='Open':raise HTTPException(409,'Outage is already closed')
-        end_at=body.end_at or now()
-        if _dt(end_at)<=_dt(o['start_at']):raise HTTPException(400,'Outage end must be after start')
-        impact=body.impact if body.impact is not None else o['impact'];conn.execute("UPDATE asset_outages SET status='Closed',end_at=?,impact=?,updated_at=? WHERE id=?",(end_at,impact,now(),outage_id))
-        other=conn.execute("SELECT COUNT(*) FROM asset_outages WHERE asset_id=? AND status='Open' AND id<>?",(o['asset_id'],outage_id)).fetchone()[0]
-        if not other:conn.execute("UPDATE assets SET status='Operating',updated_at=? WHERE id=?",(now(),o['asset_id']))
-        hours=_outage_overlap_hours(o['start_at'],end_at,_dt(o['start_at']),_dt(end_at));audit(conn,user['id'],'CLOSE OUTAGE','Operations',o['outage_no'],'Open',{'status':'Closed','duration_hours':round(hours,2)})
-        emit_event(conn,'asset.outage.closed','asset',o['asset_id'],{'outage_no':o['outage_no'],'asset_no':o['asset_no'],'end_at':end_at,'duration_hours':round(hours,2)})
-        return {'ok':True,'status':'Closed','duration_hours':round(hours,2)}
 
 # ---------- technician dispatch ----------
 @app.get('/api/dispatch')
