@@ -443,12 +443,121 @@ def _stalled_claim_does_not_block_other_workers() -> None:
         raise RuntimeError(f'healthy-event state invalid: {dict(second)!r}')
 
 
+def _automation_single_flight() -> None:
+    """Overlapping automation triggers must not double-run business automation."""
+    _quiesce_existing()
+    user = _admin()
+    suffix = uuid.uuid4().hex[:12]
+    state = {'run': 0}
+    state_lock = threading.Lock()
+
+    def fake_legacy(conn, actor_id, trigger_source='manual', as_of=None):
+        with state_lock:
+            state['run'] += 1
+            n = state['run']
+        run_no = f'JOB-SF-PG-{suffix}-{n}'
+        event_no = f'EVT-SF-PG-{suffix}-{n}'
+        run = conn.execute(
+            '''INSERT INTO job_runs(
+                 run_no,trigger_source,status,actor_id,as_of,started_at,
+                 finished_at,summary_json
+               ) VALUES(?,?,'Succeeded',?,?,?, ?,?)''',
+            (run_no, trigger_source, actor_id, '2026-08-24', now(), now(), json.dumps({})),
+        )
+        conn.execute(
+            '''INSERT INTO event_outbox(
+                 event_no,event_type,aggregate_type,aggregate_id,payload_json,
+                 status,attempts,created_at,last_error
+               ) VALUES(?,?,?,?,?,'Pending',0,?,'')''',
+            (event_no, 'test.single.flight', 'test', suffix, '{"ok":true}', now()),
+        )
+        return {
+            'id': int(run.lastrowid),
+            'run_no': run_no,
+            'status': 'Succeeded',
+            'as_of': '2026-08-24',
+            'summary': {},
+        }
+
+    original_legacy = outbox_store._legacy_execute_automation
+    original_url = _application.EVENT_WEBHOOK_URL
+    original_open = _application.urllib_request.urlopen
+
+    def fake_urlopen(request, timeout=5):
+        return _Response()
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_legacy(conn, actor_id, trigger_source='manual', as_of=None):
+        entered.set()
+        assert release.wait(timeout=30)
+        return fake_legacy(conn, actor_id, trigger_source, as_of)
+
+    def trigger(_index):
+        with db() as conn:
+            return execute_automation_postcommit(conn, user['id'])
+
+    outbox_store._legacy_execute_automation = blocking_legacy
+    _application.EVENT_WEBHOOK_URL = 'https://example.invalid/euas'
+    _application.urllib_request.urlopen = fake_urlopen
+    winner: list[dict] = []
+    errors: list[BaseException] = []
+
+    def winning_worker() -> None:
+        try:
+            with db() as conn:
+                winner.append(execute_automation_postcommit(conn, user['id']))
+        except BaseException as exc:
+            errors.append(exc)
+
+    stall_thread = threading.Thread(target=winning_worker)
+    try:
+        stall_thread.start()
+        assert entered.wait(timeout=15), 'winning automation never started'
+        loser = trigger(0)
+        if loser['status'] != 'Busy':
+            raise RuntimeError(f'overlapping automation was not rejected: {loser!r}')
+    finally:
+        release.set()
+        stall_thread.join(timeout=45)
+        outbox_store._legacy_execute_automation = original_legacy
+        _application.EVENT_WEBHOOK_URL = original_url
+        _application.urllib_request.urlopen = original_open
+
+    if errors:
+        raise RuntimeError(f'single-flight winner failed: {errors!r}')
+    results = [loser] + winner
+    statuses = sorted(result['status'] for result in results)
+    if statuses != ['Busy', 'Succeeded']:
+        raise RuntimeError(f'expected exactly one Busy loser, got {statuses!r}')
+    if state['run'] != 1:
+        raise RuntimeError(f'business automation ran {state["run"]} times')
+    with db() as conn:
+        runs = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM job_runs WHERE run_no LIKE ?",
+                (f'JOB-SF-PG-{suffix}-%',),
+            ).fetchone()[0]
+        )
+        events = int(
+            conn.execute(
+                '''SELECT COUNT(*) FROM event_outbox
+                   WHERE event_type='test.single.flight' AND aggregate_id=?''',
+                (suffix,),
+            ).fetchone()[0]
+        )
+    if runs != 1 or events != 1:
+        raise RuntimeError(f'single-flight state invalid: runs={runs} events={events}')
+
+
 def main() -> None:
     _claim_generation_once()
     _one_external_send()
     _retry_is_idempotent()
     _retry_exhausted_resets_budget_once()
     _postcommit_boundary()
+    _automation_single_flight()
     from app.config import DB_BACKEND
 
     if DB_BACKEND == 'postgresql':
@@ -459,7 +568,7 @@ def main() -> None:
     print(
         'outbox delivery concurrency smoke: PASS '
         'generation_claim=1 send=1 retry_audit=1 exhausted_retry_reset=1 '
-        f'postcommit=visible workers=12 {skipped_note}'
+        f'postcommit=visible single_flight=1 workers=12 {skipped_note}'
     )
 
 

@@ -87,10 +87,13 @@ def test_sla_escalation_and_durable_outbox():
         assert 'euas_sla_breaches_total ' in metrics.text
         assert 'euas_outbox_pending ' in metrics.text
         assert 'euas_outbox_attempt_exhausted ' in metrics.text
+        assert 'euas_outbox_webhook_skipped ' in metrics.text
 
         status=client.get('/api/automation/status',headers=admin)
         assert status.status_code==200
         assert 'outbox_exhausted' in status.json()['queue']
+        assert 'outbox_skipped' in status.json()['queue']
+        assert status.json()['queue']['outbox_skipped']>=1  # no webhook configured in tests
 
         export=client.get('/api/exports/sla.csv',headers=admin)
         assert export.status_code==200 and 'text/csv' in export.headers.get('content-type','')

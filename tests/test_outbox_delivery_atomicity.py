@@ -418,6 +418,122 @@ def test_automation_dispatches_event_only_after_business_commit(monkeypatch):
         assert persisted_summary['outbox_delivered'] >= 1
 
 
+def test_overlapping_automation_dispatch_is_single_flight(monkeypatch):
+    with TestClient(app):
+        suffix = uuid.uuid4().hex[:10]
+        with db() as conn:
+            user = _admin(conn)
+
+        state = {'run': 0}
+        state_lock = threading.Lock()
+
+        def fake_legacy(conn, actor_id, trigger_source='manual', as_of=None):
+            with state_lock:
+                state['run'] += 1
+                n = state['run']
+            run_no = f'JOB-SF-{suffix}-{n}'
+            event_no = f'EVT-SF-{suffix}-{n}'
+            run = conn.execute(
+                '''INSERT INTO job_runs(
+                     run_no,trigger_source,status,actor_id,as_of,started_at,
+                     finished_at,summary_json
+                   ) VALUES(?,?,'Succeeded',?,?,?, ?,?)''',
+                (
+                    run_no,
+                    trigger_source,
+                    actor_id,
+                    '2026-08-24',
+                    now(),
+                    now(),
+                    json.dumps({}),
+                ),
+            )
+            conn.execute(
+                '''INSERT INTO event_outbox(
+                     event_no,event_type,aggregate_type,aggregate_id,payload_json,
+                     status,attempts,created_at,last_error
+                   ) VALUES(?,?,?,?,?,'Pending',0,?,'')''',
+                (event_no, 'test.single.flight', 'test', suffix, '{"ok":true}', now()),
+            )
+            return {
+                'id': int(run.lastrowid),
+                'run_no': run_no,
+                'status': 'Succeeded',
+                'as_of': '2026-08-24',
+                'summary': {},
+            }
+
+        calls: list[str | None] = []
+        calls_lock = threading.Lock()
+
+        def fake_urlopen(request, timeout=5):
+            with calls_lock:
+                calls.append(_event_header(request))
+            return _Response()
+
+        monkeypatch.setattr(outbox_store, '_legacy_execute_automation', fake_legacy)
+        monkeypatch.setattr(_application, 'EVENT_WEBHOOK_URL', 'https://example.invalid/euas')
+        monkeypatch.setattr(_application.urllib_request, 'urlopen', fake_urlopen)
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_legacy(conn, actor_id, trigger_source='manual', as_of=None):
+            entered.set()
+            assert release.wait(timeout=20)
+            return fake_legacy(conn, actor_id, trigger_source, as_of)
+
+        monkeypatch.setattr(outbox_store, '_legacy_execute_automation', blocking_legacy)
+
+        results: list[dict] = []
+        errors: list[BaseException] = []
+
+        def winner() -> None:
+            try:
+                with db() as conn:
+                    results.append(execute_automation_postcommit(conn, user['id']))
+            except BaseException as exc:
+                errors.append(exc)
+
+        winner_thread = threading.Thread(target=winner)
+        try:
+            winner_thread.start()
+            assert entered.wait(timeout=10), 'winning automation never started'
+            # The overlapping trigger arrives while the winner holds the
+            # single-flight lock mid-run.
+            with db() as conn:
+                results.append(execute_automation_postcommit(conn, user['id']))
+        finally:
+            release.set()
+            winner_thread.join(timeout=30)
+        assert not winner_thread.is_alive()
+        assert errors == []
+
+        statuses = sorted(result['status'] for result in results)
+        assert statuses == ['Busy', 'Succeeded']
+
+        # Exactly one business run happened, so exactly one event exists and
+        # exactly one external send occurred.
+        assert state['run'] == 1
+        assert len(calls) == 1
+        with db() as conn:
+            runs = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM job_runs WHERE run_no LIKE ?",
+                    (f'JOB-SF-{suffix}-%',),
+                ).fetchone()[0]
+            )
+            events = conn.execute(
+                '''SELECT status,attempts FROM event_outbox
+                   WHERE event_type='test.single.flight' AND aggregate_id=?''',
+                (suffix,),
+            ).fetchall()
+        assert runs == 1
+        assert len(events) == 1
+        assert events[0]['status'] == 'Delivered'
+        assert int(events[0]['attempts']) == 1
+
+
 def test_processor_and_retry_route_are_installed_without_authorization_widening():
     with TestClient(app):
         assert _application._process_outbox is _defer_outbox

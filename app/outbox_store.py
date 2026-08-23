@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import sys
+import threading
 
 from fastapi import Depends, HTTPException
 
@@ -16,6 +17,39 @@ from .database import db, now
 
 OUTBOX_RETRY_ROLES = ('admin', 'maintenance_manager')
 _legacy_execute_automation = _application._execute_automation
+
+_AUTOMATION_RUN_LOCK_NAME = 'euas-automation-run'
+_sqlite_automation_thread_lock = threading.Lock()
+
+
+def try_acquire_automation_run(conn) -> bool:
+    """Single-flight guard for automation dispatch.
+
+    Overlapping runs (scheduled tick + manual trigger, or two manual triggers)
+    race the same existence-checked scans and duplicate notifications,
+    approvals and outbox events. On PostgreSQL a session-level advisory lock
+    (bound to this run's connection) makes the mutual exclusion real across
+    processes; SQLite deployments are single-process, where a process-wide
+    lock provides the same guarantee.
+    """
+    if DB_BACKEND == 'postgresql':
+        row = conn.execute(
+            'SELECT pg_try_advisory_lock(hashtext(?))',
+            (_AUTOMATION_RUN_LOCK_NAME,),
+        ).fetchone()
+        return bool(row and row[0])
+    return _sqlite_automation_thread_lock.acquire(blocking=False)
+
+
+def release_automation_run(conn) -> None:
+    if DB_BACKEND == 'postgresql':
+        conn.execute(
+            'SELECT pg_advisory_unlock(hashtext(?))',
+            (_AUTOMATION_RUN_LOCK_NAME,),
+        )
+        return
+    if _sqlite_automation_thread_lock.locked():
+        _sqlite_automation_thread_lock.release()
 
 
 def _rowcount_one(cursor) -> bool:
@@ -168,55 +202,76 @@ def execute_automation_postcommit(
     trigger_source: str = 'manual',
     as_of: str | None = None,
 ):
-    """Run business automation first, commit it, then dispatch committed events."""
-    result = _legacy_execute_automation(conn, actor_id, trigger_source, as_of)
-    if result.get('status') != 'Succeeded':
-        return result
+    """Run business automation first, commit it, then dispatch committed events.
 
-    # The historical executor has released its savepoint and recorded the
-    # successful job result, but the outer db() context has not committed yet.
-    # Commit here before any network call so every dispatched event references
-    # durable business state.
-    conn.commit()
+    A single-flight lock rejects overlapping runs (for example a scheduled tick
+    racing a manual trigger) instead of letting them duplicate notifications,
+    approvals, and outbox events through racy existence-checked scans.
+    """
+    if not try_acquire_automation_run(conn):
+        _application.logger.warning(
+            'EUAS automation run already in progress; rejected overlapping %s trigger',
+            trigger_source,
+        )
+        return {
+            'id': None,
+            'run_no': '',
+            'status': 'Busy',
+            'as_of': as_of or '',
+            'summary': {},
+        }
 
-    outbox = {'delivered': 0, 'failed': 0, 'skipped': 0}
     try:
-        outbox = process_outbox_atomic(conn)
-        summary = dict(result.get('summary') or {})
-        summary['outbox_delivered'] = outbox['delivered']
-        summary['outbox_failed'] = outbox['failed']
-        summary['outbox_skipped'] = outbox['skipped']
-        summary['outbox_delivery_phase'] = 'postcommit'
-        conn.execute(
-            'UPDATE job_runs SET summary_json=? WHERE id=?',
-            (json.dumps(summary), result['id']),
-        )
-        # The historical RUN audit belongs to the committed business phase and
-        # therefore records deferred zero counts. Append a second immutable audit
-        # record with the actual post-commit dispatch result so job summary and
-        # audit evidence remain reconcilable without rewriting prior audit rows.
-        append_audit(
-            conn,
-            actor_id,
-            'DISPATCH OUTBOX',
-            'Integration Events',
-            result['run_no'],
-            '',
-            outbox,
-        )
-        # Persist delivery attempts/status independently from the already
-        # committed business payload. The enclosing db() context may commit
-        # again; that is harmless for both adapters.
+        result = _legacy_execute_automation(conn, actor_id, trigger_source, as_of)
+        if result.get('status') != 'Succeeded':
+            return result
+
+        # The historical executor has released its savepoint and recorded the
+        # successful job result, but the outer db() context has not committed yet.
+        # Commit here before any network call so every dispatched event references
+        # durable business state.
         conn.commit()
-        result = dict(result)
-        result['summary'] = summary
-    except Exception:
-        # A processor/database failure must never retroactively mark committed
-        # business automation as failed. Roll back only the post-commit delivery
-        # transaction; eligible events remain queued for a later attempt.
-        conn.rollback()
-        _application.logger.exception('EUAS post-commit outbox delivery failed')
-    return result
+
+        outbox = {'delivered': 0, 'failed': 0, 'skipped': 0}
+        try:
+            outbox = process_outbox_atomic(conn)
+            summary = dict(result.get('summary') or {})
+            summary['outbox_delivered'] = outbox['delivered']
+            summary['outbox_failed'] = outbox['failed']
+            summary['outbox_skipped'] = outbox['skipped']
+            summary['outbox_delivery_phase'] = 'postcommit'
+            conn.execute(
+                'UPDATE job_runs SET summary_json=? WHERE id=?',
+                (json.dumps(summary), result['id']),
+            )
+            # The historical RUN audit belongs to the committed business phase and
+            # therefore records deferred zero counts. Append a second immutable audit
+            # record with the actual post-commit dispatch result so job summary and
+            # audit evidence remain reconcilable without rewriting prior audit rows.
+            append_audit(
+                conn,
+                actor_id,
+                'DISPATCH OUTBOX',
+                'Integration Events',
+                result['run_no'],
+                '',
+                outbox,
+            )
+            # Persist delivery attempts/status independently from the already
+            # committed business payload. The enclosing db() context may commit
+            # again; that is harmless for both adapters.
+            conn.commit()
+            result = dict(result)
+            result['summary'] = summary
+        except Exception:
+            # A processor/database failure must never retroactively mark committed
+            # business automation as failed. Roll back only the post-commit delivery
+            # transaction; eligible events remain queued for a later attempt.
+            conn.rollback()
+            _application.logger.exception('EUAS post-commit outbox delivery failed')
+        return result
+    finally:
+        release_automation_run(conn)
 
 
 def retry_outbox_event_atomic(conn, event_id: int, user: dict) -> dict:
