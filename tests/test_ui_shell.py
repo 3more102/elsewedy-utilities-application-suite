@@ -13,6 +13,8 @@ PRODUCTIVITY_CSS = ROOT / "static" / "productivity-enhancements.css"
 PRODUCTIVITY_JS = ROOT / "static" / "productivity-enhancements.js"
 OPERATIONAL_CSS = ROOT / "static" / "operational-enhancements.css"
 OPERATIONAL_JS = ROOT / "static" / "operational-enhancements.js"
+WORKSPACE_CSS = ROOT / "static" / "workspace-preferences.css"
+WORKSPACE_JS = ROOT / "static" / "workspace-preferences.js"
 
 
 def test_ui_shell_keeps_application_hooks_and_refresh_layer():
@@ -27,16 +29,20 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert PRODUCTIVITY_JS.exists()
     assert OPERATIONAL_CSS.exists()
     assert OPERATIONAL_JS.exists()
+    assert WORKSPACE_CSS.exists()
+    assert WORKSPACE_JS.exists()
     assert 'href="/static/styles.css"' in html
     assert 'href="/static/ui-refresh.css"' in html
     assert 'href="/static/ux-enhancements.css"' in html
     assert 'href="/static/productivity-enhancements.css"' in html
     assert 'href="/static/operational-enhancements.css"' in html
+    assert 'href="/static/workspace-preferences.css"' in html
     assert 'src="/static/app.js"' in html
     assert 'src="/static/ux-enhancements.js"' in html
     assert 'src="/static/dashboard-enhancements.js"' in html
     assert 'src="/static/productivity-enhancements.js"' in html
     assert 'src="/static/operational-enhancements.js"' in html
+    assert 'src="/static/workspace-preferences.js"' in html
 
     required_ids = {
         "login",
@@ -92,6 +98,8 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     productivity_js = PRODUCTIVITY_JS.read_text(encoding="utf-8")
     operational_css = OPERATIONAL_CSS.read_text(encoding="utf-8")
     operational_js = OPERATIONAL_JS.read_text(encoding="utf-8")
+    workspace_css = WORKSPACE_CSS.read_text(encoding="utf-8")
+    workspace_js = WORKSPACE_JS.read_text(encoding="utf-8")
 
     assert ".nav-btn.active" in css
     assert ":focus-visible" in css
@@ -161,3 +169,18 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "operational-retry" in operational_js
     assert "data-euas-submitting" in operational_js
     assert "MutationObserver" in operational_js
+
+    assert ".workspace-sidebar-collapsed" in workspace_css
+    assert "body.density-compact" in workspace_css
+    assert ".sidebar-collapse-btn" in workspace_css
+    assert "@media(min-width:821px)" in workspace_css
+    assert "@media(prefers-reduced-motion:reduce)" in workspace_css
+
+    assert "euas_ui_density" in workspace_js
+    assert "euas_sidebar_collapsed" in workspace_js
+    assert "setDensity" in workspace_js
+    assert "setSidebarCollapsed" in workspace_js
+    assert "localStorage" in workspace_js
+    assert "matchMedia" in workspace_js
+    assert "density-toggle" in workspace_js
+    assert "sidebar-collapse" in workspace_js
