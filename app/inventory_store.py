@@ -79,6 +79,7 @@ from .alarm_lifecycle_store import install_alarm_lifecycle_routes
 from .alarm_store import install_alarm_work_order_route
 from .approval_store import install_approval_routes, install_atomic_approval_route
 from .asset_store import install_asset_routes
+from .automation_read_store import install_automation_read_routes
 from .dispatch_startup import install_dispatch_assignment_startup
 from .dispatch_store import install_dispatch_assignment_route
 from .inspection_authorization import install_inspection_authorization_contract
@@ -111,6 +112,7 @@ install_pm_generation_startup()
 install_pm_routes()
 install_outbox_atomicity()
 install_outbox_observability()
+install_automation_read_routes()
 install_outage_routes()
 install_distributed_scheduler_singleton()
 install_reorder_generation_atomicity()
