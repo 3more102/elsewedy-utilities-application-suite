@@ -1,5 +1,6 @@
 import asyncio
 import re
+from ipaddress import ip_network
 from pathlib import Path
 
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -10,6 +11,7 @@ from app.production import (
     ProductionSecurityHeaders,
     STRICT_CONTENT_SECURITY_POLICY,
     STRICT_TRANSPORT_SECURITY,
+    TrustedProxyScheme,
 )
 
 
@@ -46,6 +48,43 @@ def _run_wrapper(inner_headers, *, scheme='http'):
         )
     )
     return sent[0]
+
+
+def _run_forwarded_scheme(peer: str, forwarded_proto: str, *, scheme='http'):
+    observed_schemes = []
+
+    async def inner(scope, receive, send):
+        observed_schemes.append(scope.get('scheme'))
+        await send({'type': 'http.response.start', 'status': 204, 'headers': []})
+        await send({'type': 'http.response.body', 'body': b''})
+
+    sent = []
+
+    async def receive():
+        return {'type': 'http.disconnect'}
+
+    async def send(message):
+        sent.append(message)
+
+    application = TrustedProxyScheme(
+        ProductionSecurityHeaders(inner),
+        trusted_networks=(ip_network('10.0.0.0/8'),),
+    )
+    asyncio.run(
+        application(
+            {
+                'type': 'http',
+                'method': 'GET',
+                'path': '/',
+                'scheme': scheme,
+                'client': (peer, 43123),
+                'headers': [(b'x-forwarded-proto', forwarded_proto.encode('ascii'))],
+            },
+            receive,
+            send,
+        )
+    )
+    return observed_schemes[0], sent[0]
 
 
 def _run_trusted_host_wrapper(host: str):
@@ -145,6 +184,30 @@ def test_production_wrapper_emits_one_year_hsts_only_for_https_scope():
     assert 'preload' not in hsts_values[0]
 
 
+def test_trusted_proxy_can_supply_forwarded_https_scheme():
+    observed_scheme, start = _run_forwarded_scheme('10.0.0.10', 'HTTPS')
+    headers = {name.lower(): value for name, value in start['headers']}
+    assert observed_scheme == 'https'
+    assert headers[b'strict-transport-security'] == STRICT_TRANSPORT_SECURITY.encode('ascii')
+
+    observed_scheme, start = _run_forwarded_scheme('10.0.0.10', 'http', scheme='https')
+    headers = {name.lower(): value for name, value in start['headers']}
+    assert observed_scheme == 'http'
+    assert b'strict-transport-security' not in headers
+
+
+def test_forwarded_scheme_is_ignored_outside_trusted_proxy_boundary():
+    observed_scheme, start = _run_forwarded_scheme('203.0.113.9', 'https')
+    headers = {name.lower(): value for name, value in start['headers']}
+    assert observed_scheme == 'http'
+    assert b'strict-transport-security' not in headers
+
+    observed_scheme, start = _run_forwarded_scheme('10.0.0.10', 'https,http')
+    headers = {name.lower(): value for name, value in start['headers']}
+    assert observed_scheme == 'http'
+    assert b'strict-transport-security' not in headers
+
+
 def test_production_wrapper_replaces_browser_and_isolation_headers():
     start = _run_wrapper([
         (b'x-content-type-options', b'legacy'),
@@ -190,8 +253,12 @@ def test_production_entrypoint_matches_external_script_shell_contract():
 
     assert '"app.production:app"' in dockerfile
     assert '"app.main:app"' not in dockerfile
+    assert '"--no-proxy-headers"' in dockerfile
+    assert '"--proxy-headers"' not in dockerfile
     assert "'app.production:app'" in postgres_smoke
     assert "'app.main:app'" not in postgres_smoke
+    assert 'TrustedProxyScheme' in production_source
+    assert 'TRUSTED_PROXY_NETWORKS' in production_source
     assert 'TrustedHostMiddleware' in production_source
     assert 'www_redirect=False' in production_source
     assert "must not contain the unrestricted '*' wildcard" in production_source
