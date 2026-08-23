@@ -216,6 +216,17 @@ def main() -> int:
         status, _, metrics = request('/api/metrics', token=token)
         assert status == 200 and 'euas_requests_total' in metrics
         assert 'euas_active_sessions ' in metrics
+        assert 'euas_outbox_attempt_exhausted ' in metrics
+
+        # Prove the tamper-evident chain validates on the live PostgreSQL store
+        # and the replay endpoint serves verified history only.
+        status, _, integrity = request('/api/audit/integrity', token=token)
+        assert status == 200 and integrity['valid'] is True
+        assert int(integrity['checked']) >= 1
+        status, _, replay = request('/api/audit/replay?limit=5', token=token)
+        assert status == 200 and replay['valid'] is True
+        assert len(replay['events']) == min(5, int(replay['total']))
+        assert replay['events'][-1]['audit_hash'] == replay['head_hash']
 
         print(
             f"PASS EUAS PostgreSQL smoke: version={health['version']} "
