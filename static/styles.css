@@ -17,3 +17,11 @@
 .task-list{display:grid;gap:7px;margin:12px 0}.task-row{width:100%;display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;text-align:left;border:1px solid var(--line);background:var(--surface-2,#f8fafc);border-radius:9px;padding:9px 10px;color:inherit}.task-row:hover{border-color:var(--accent,#b6242a);background:#fff}.task-row span{overflow:hidden;text-overflow:ellipsis}.task-row b{font-size:12px}.task-row small{color:var(--muted);font-size:11px}.form-actions{flex-wrap:wrap}
 
 .drawer-tools{display:flex;justify-content:flex-end;padding:10px 14px;border-bottom:1px solid var(--line)}
+
+
+/* CSP fixed inline-style migration */
+[data-csp-style="mt14"]{margin-top:14px}
+[data-csp-style="mt12"]{margin-top:12px}
+[data-csp-style="mt15"]{margin-top:15px}
+[data-csp-style="grid2"]{grid-template-columns:1fr 1fr}
+[data-csp-style="inline-check"]{display:flex;gap:8px;align-items:center;font-size:11px;margin-top:10px}
