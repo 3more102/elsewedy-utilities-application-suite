@@ -15,6 +15,7 @@ from app.database import db, now
 from app.main import app
 from app.outbox_store import (
     OUTBOX_RETRY_ROLES,
+    _claim_delivery,
     _defer_outbox,
     execute_automation_postcommit,
     process_outbox_atomic,
@@ -129,6 +130,43 @@ def test_concurrent_processors_send_target_webhook_once(monkeypatch):
         assert int(event['attempts']) == 1
         assert event['processed_at']
         assert event['last_error'] == ''
+
+
+def test_claim_delivery_enforces_exact_generation_and_budget():
+    with TestClient(app):
+        suffix = uuid.uuid4().hex[:10]
+        with db() as conn:
+            event_id, _ = _seed_event(conn, suffix)
+
+        with db() as conn:
+            snapshot = dict(
+                conn.execute(
+                    'SELECT * FROM event_outbox WHERE id=?', (event_id,)
+                ).fetchone()
+            )
+            claimed = _claim_delivery(conn, snapshot)
+            assert claimed is not None
+            assert int(claimed['attempts']) == 1
+            # The same stale generation must never be claimed twice.
+            assert _claim_delivery(conn, snapshot) is None
+
+        with db() as conn:
+            exhausted_id, _ = _seed_event(
+                conn, suffix + 'x', status='Failed', attempts=_application.OUTBOX_MAX_ATTEMPTS
+            )
+            exhausted_snapshot = dict(
+                conn.execute(
+                    'SELECT * FROM event_outbox WHERE id=?', (exhausted_id,)
+                ).fetchone()
+            )
+            # Attempt-exhausted generations are never claimable by workers.
+            assert _claim_delivery(conn, exhausted_snapshot) is None
+
+        with db() as conn:
+            stale = dict(snapshot)
+            stale['status'] = 'Delivered'
+            # A snapshot whose status no longer matches the committed row is stale.
+            assert _claim_delivery(conn, stale) is None
 
 
 def test_retry_waiting_on_inflight_delivery_does_not_requeue_it(monkeypatch):

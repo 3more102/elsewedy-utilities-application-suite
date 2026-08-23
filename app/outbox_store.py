@@ -10,6 +10,7 @@ from fastapi import Depends, HTTPException
 from . import application as _application
 from .audit_store import append_audit
 from .auth import require_roles
+from .config import DB_BACKEND
 from .database import db, now
 
 
@@ -25,14 +26,30 @@ def _claim_delivery(conn, snapshot: dict) -> dict | None:
     """Claim one exact outbox generation before any external side effect.
 
     The selected status+attempt pair is part of the claim. A concurrent worker
-    that selected the same stale row blocks on PostgreSQL and then fails the
-    predicate after the first worker commits, including when that first attempt
-    failed and advanced the attempt generation.
+    that selected the same stale row fails the predicate after the first worker
+    commits, including when that first attempt failed and advanced the attempt
+    generation.
+
+    On PostgreSQL the row lock is taken with FOR UPDATE SKIP LOCKED so a worker
+    whose peer is mid-webhook on the same event skips it immediately instead of
+    queueing behind the peer's row lock (which is held until the whole delivery
+    transaction commits). Skipped events stay eligible and are picked up on a
+    later pass; exactly-one-claimer semantics are unchanged because only the
+    lock holder can satisfy the UPDATE predicate.
     """
+    claim_sql = '''UPDATE event_outbox
+                   SET attempts=attempts+1
+                   WHERE id=? AND status=? AND attempts=? AND attempts<?'''
+    if DB_BACKEND == 'postgresql':
+        claim_sql = '''UPDATE event_outbox
+                       SET attempts=attempts+1
+                       WHERE id IN (
+                           SELECT id FROM event_outbox
+                           WHERE id=? AND status=? AND attempts=? AND attempts<?
+                           FOR UPDATE SKIP LOCKED
+                       )'''
     claimed = conn.execute(
-        '''UPDATE event_outbox
-           SET attempts=attempts+1
-           WHERE id=? AND status=? AND attempts=? AND attempts<?''',
+        claim_sql,
         (
             snapshot['id'],
             snapshot['status'],

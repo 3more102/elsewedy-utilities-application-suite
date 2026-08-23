@@ -347,15 +347,119 @@ def _postcommit_boundary() -> None:
         raise RuntimeError(f'post-commit event state invalid: {dict(event)!r}')
 
 
+def _stalled_claim_does_not_block_other_workers() -> None:
+    """A peer stuck mid-webhook must not head-of-line block other workers.
+
+    Worker A claims the first event and stalls inside its webhook. Worker B
+    must still claim and deliver the second event without waiting on A's row
+    lock (PostgreSQL FOR UPDATE SKIP LOCKED claiming), and each event must be
+    sent externally exactly once.
+    """
+    _quiesce_existing()
+    first_id, first_no = _seed_event()
+    second_id, second_no = _seed_event()
+    entered = threading.Event()
+    release = threading.Event()
+    calls_lock = threading.Lock()
+    calls: list[str | None] = []
+
+    def slow_urlopen(request, timeout=5):
+        header = _event_header(request)
+        with calls_lock:
+            calls.append(header)
+        if header == first_no:
+            entered.set()
+            assert release.wait(timeout=30)
+        return _Response()
+
+    def record_only(request, timeout=5):
+        header = _event_header(request)
+        with calls_lock:
+            calls.append(header)
+        return _Response()
+
+    original_url = _application.EVENT_WEBHOOK_URL
+    original_open = _application.urllib_request.urlopen
+    stall_result: list[dict] = []
+    errors: list[BaseException] = []
+
+    def deliver(index):
+        with db() as conn:
+            return process_outbox_atomic(conn)
+
+    stall_thread = threading.Thread(target=lambda: None)
+    try:
+        _application.EVENT_WEBHOOK_URL = 'https://example.invalid/euas'
+        _application.urllib_request.urlopen = slow_urlopen
+
+        def stalled_worker() -> None:
+            try:
+                with db() as conn:
+                    stall_result.append(process_outbox_atomic(conn))
+            except BaseException as exc:
+                errors.append(exc)
+
+        stall_thread = threading.Thread(target=stalled_worker)
+        stall_thread.start()
+        assert entered.wait(timeout=15), 'stalled worker never reached its webhook'
+
+        _application.urllib_request.urlopen = record_only
+        started = time.perf_counter()
+        free_result = _parallel(1, deliver)[0]
+        elapsed = time.perf_counter() - started
+        # The stalled peer holds its claim for as long as we choose; worker B
+        # finishing here proves the claim path did not queue behind that lock.
+        assert release.is_set() is False
+        if free_result['delivered'] != 1:
+            raise RuntimeError(
+                f'healthy worker did not deliver around the stalled claim: {free_result!r}'
+            )
+        if elapsed > 10:
+            raise RuntimeError(f'healthy worker appears blocked on stalled claim: {elapsed:.2f}s')
+    finally:
+        release.set()
+        stall_thread.join(timeout=45)
+        _application.EVENT_WEBHOOK_URL = original_url
+        _application.urllib_request.urlopen = original_open
+
+    if errors:
+        raise RuntimeError(f'stalled outbox worker failed: {errors!r}')
+    if any(thread.is_alive() for thread in [stall_thread]):
+        raise RuntimeError('stalled outbox worker did not finish')
+    if not stall_result or stall_result[0]['delivered'] != 1:
+        raise RuntimeError(f'stalled worker final result invalid: {stall_result!r}')
+    with db() as conn:
+        first = conn.execute(
+            'SELECT status,attempts FROM event_outbox WHERE id=?', (first_id,)
+        ).fetchone()
+        second = conn.execute(
+            'SELECT status,attempts FROM event_outbox WHERE id=?', (second_id,)
+        ).fetchone()
+    if calls.count(first_no) != 1 or calls.count(second_no) != 1:
+        raise RuntimeError(f'expected one external send per event, got {calls!r}')
+    if first['status'] != 'Delivered' or int(first['attempts']) != 1:
+        raise RuntimeError(f'stalled-event state invalid: {dict(first)!r}')
+    if second['status'] != 'Delivered' or int(second['attempts']) != 1:
+        raise RuntimeError(f'healthy-event state invalid: {dict(second)!r}')
+
+
 def main() -> None:
     _claim_generation_once()
     _one_external_send()
     _retry_is_idempotent()
     _retry_exhausted_resets_budget_once()
     _postcommit_boundary()
+    from app.config import DB_BACKEND
+
+    if DB_BACKEND == 'postgresql':
+        _stalled_claim_does_not_block_other_workers()
+        skipped_note = 'skip_locked_claim=1'
+    else:
+        skipped_note = 'skip_locked_claim=n/a(sqlite)'
     print(
         'outbox delivery concurrency smoke: PASS '
-        'generation_claim=1 send=1 retry_audit=1 exhausted_retry_reset=1 postcommit=visible workers=12'
+        'generation_claim=1 send=1 retry_audit=1 exhausted_retry_reset=1 '
+        f'postcommit=visible workers=12 {skipped_note}'
     )
 
 
