@@ -501,10 +501,51 @@ def init_db(hash_password):
           prev_hash TEXT DEFAULT '', audit_hash TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_audit_chain ON audit_logs(id,audit_hash);
+        CREATE TABLE IF NOT EXISTS kpi_definitions(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+          description TEXT DEFAULT '', category TEXT DEFAULT 'general', domain TEXT DEFAULT 'maintenance',
+          unit TEXT DEFAULT '', value_type TEXT NOT NULL DEFAULT 'rate', aggregation TEXT NOT NULL DEFAULT 'ratio',
+          source_key TEXT NOT NULL, formula TEXT DEFAULT '', filters_json TEXT NOT NULL DEFAULT '{}',
+          scope_json TEXT NOT NULL DEFAULT '{}', time_window_days INTEGER NOT NULL DEFAULT 30,
+          refresh_minutes INTEGER NOT NULL DEFAULT 60, owner_user_id INTEGER REFERENCES users(id),
+          visibility_roles TEXT DEFAULT '', target_value REAL, caution_value REAL, alert_value REAL,
+          direction TEXT NOT NULL DEFAULT 'higher_is_better', active INTEGER NOT NULL DEFAULT 1,
+          version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kpi_definitions_active ON kpi_definitions(active,category);
+        CREATE TABLE IF NOT EXISTS kpi_snapshots(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, kpi_id INTEGER NOT NULL REFERENCES kpi_definitions(id) ON DELETE CASCADE,
+          period_start TEXT NOT NULL, period_end TEXT NOT NULL, value REAL, previous_value REAL,
+          trend TEXT, change_pct REAL, status TEXT NOT NULL DEFAULT 'UNKNOWN',
+          target_value REAL, caution_value REAL, alert_value REAL,
+          numerator REAL, denominator REAL, contributors_json TEXT DEFAULT '[]', data_freshness_at TEXT,
+          provenance_json TEXT DEFAULT '{}', calculated_at TEXT NOT NULL, calculated_by INTEGER REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_kpi_snapshots_kpi ON kpi_snapshots(kpi_id,id);
         ''')
         _ensure_schema_columns(conn)
         _backfill_audit_chain(conn)
         conn.execute('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)',(SCHEMA_VERSION,now()))
+
+        if conn.execute('SELECT COUNT(*) FROM kpi_definitions').fetchone()[0] == 0:
+            seed_kpis=[
+              ('KPI-PM-COMP','PM Compliance','Preventive maintenance work orders completed on or before their target finish date.','maintenance','Preventive maintenance work orders completed on/before target finish ÷ PM work orders due in window × 100','pm_compliance','%','rate','ratio',30,'higher_is_better',90,85,75),
+              ('KPI-OVERDUE-WO','Overdue Work Orders','Open work orders past their target finish date.','work','Open work orders with target finish before window end','overdue_work_orders','count','count','count',30,'lower_is_better',None,5,10),
+              ('KPI-BACKLOG-OPEN','Open Maintenance Backlog','All open work orders regardless of due state.','work','Open work orders at window end','backlog_open','count','count','count',30,'lower_is_better',None,None,None),
+              ('KPI-BACKLOG-CRIT','Critical Backlog','Open emergency/critical priority work or work on critical assets.','work','Open work orders with Emergency/Critical priority or on Critical assets','critical_backlog','count','count','count',30,'lower_is_better',None,3,6),
+              ('KPI-SCHED-COMP','Schedule Compliance','Work completed on or before target finish within the window.','work','Work orders finished on/before target ÷ completions in window × 100','schedule_compliance','%','rate','ratio',30,'higher_is_better',90,80,65),
+              ('KPI-EMERG-PCT','Emergency Work %','Share of newly created work that is emergency priority.','work','Emergency-priority work orders created ÷ all work orders created in window × 100','emergency_work_pct','%','rate','ratio',30,'lower_is_better',None,5,10),
+              ('KPI-REACTIVE-PCT','Reactive Work %','Share of newly created corrective/breakdown work.','work','Corrective/breakdown work created ÷ all work created in window × 100','reactive_work_pct','%','rate','ratio',30,'lower_is_better',None,40,60),
+              ('KPI-MTTR','MTTR (Repair Hours)','Mean repair hours of completed corrective work.','reliability','Mean(actual finish − actual start) hours for corrective completions','mttr_hours','h','duration','avg',90,'lower_is_better',None,24,48),
+              ('KPI-MTBF','MTBF (Exposure Hours)','Scoped asset exposure hours per recorded failure.','reliability','Exposure hours ÷ recorded failures in window','mtbf_hours','h','duration','ratio',90,'higher_is_better',720,240,120),
+              ('KPI-AVAIL','Asset Availability','Availability across scoped assets from recorded outages.','reliability','(Exposure − outage hours) ÷ exposure × 100 over scoped assets','availability_pct','%','rate','ratio',30,'higher_is_better',99,95,90),
+              ('KPI-DOWN-FORCED','Forced Downtime Hours','Unplanned (forced) outage hours inside the window.','reliability','Sum of forced-outage overlap hours in window','unplanned_downtime_hours','h','duration','sum',30,'lower_is_better',None,8,24),
+              ('KPI-ALARM-CRIT','Active Critical Alarms','Critical operational alarms currently open or acknowledged.','operations','Open/acknowledged critical operational alarms at window end','active_critical_alarms','count','count','count',7,'lower_is_better',0,2,5)]
+            for code,name,desc,cat,formula,key,unit,vtype,agg,window,direction,target,caution,alert in seed_kpis:
+                conn.execute('''INSERT OR IGNORE INTO kpi_definitions(code,name,description,category,domain,unit,value_type,aggregation,
+                    source_key,formula,time_window_days,direction,target_value,caution_value,alert_value,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (code,name,desc,cat,('Maintenance' if cat=='maintenance' else 'Work Management' if cat=='work' else 'Reliability' if cat=='reliability' else 'Operations'),unit,vtype,agg,key,formula,window,direction,target,caution,alert,now(),now()))
 
         if conn.execute('SELECT COUNT(*) FROM roles').fetchone()[0] == 0:
             roles=[

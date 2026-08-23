@@ -14,6 +14,7 @@ from .config import APP_NAME, APP_VERSION, STATIC_DIR, UPLOAD_DIR, SESSION_HOURS
 from .database import db, init_db, now, audit_digest
 from .audit_verification import AuditIntegrityError, replay_audit_history, verify_audit_chain_report
 from .auth import hash_password, verify_password, current_user, require_roles
+from .kpi_engine import KPI_PROVIDERS, DIRECTIONS, evaluate_status, evaluate_kpi, compute_kpi
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -717,6 +718,24 @@ class DispatchIn(BaseModel):
     technician_user_id:int; eta_minutes:Optional[int]=Field(default=None,ge=0,le=1440); notes:str=''
 class DispatchTransitionIn(BaseModel):
     action:str; notes:str=''
+class KPIIn(BaseModel):
+    code:str=Field(min_length=2,max_length=60); name:str=Field(min_length=2,max_length=160); description:str=''
+    category:str='general'; domain:str='maintenance'; unit:str=''; value_type:str='rate'; aggregation:str='ratio'
+    source_key:str; formula:str=''; filters:dict={}; scope:dict={}
+    time_window_days:int=Field(default=30,ge=1,le=3650); refresh_minutes:int=Field(default=60,ge=5,le=525600)
+    owner_user_id:Optional[int]=None; visibility_roles:str=''
+    target_value:Optional[float]=None; caution_value:Optional[float]=None; alert_value:Optional[float]=None
+    direction:str='higher_is_better'
+class KPIPatch(BaseModel):
+    name:Optional[str]=Field(default=None,min_length=2,max_length=160); description:Optional[str]=None
+    category:Optional[str]=None; domain:Optional[str]=None; unit:Optional[str]=None
+    value_type:Optional[str]=None; aggregation:Optional[str]=None; formula:Optional[str]=None
+    filters:Optional[dict]=None; scope:Optional[dict]=None
+    time_window_days:Optional[int]=Field(default=None,ge=1,le=3650); refresh_minutes:Optional[int]=Field(default=None,ge=5,le=525600)
+    owner_user_id:Optional[int]=None; visibility_roles:Optional[str]=None
+    target_value:Optional[float]=None; caution_value:Optional[float]=None; alert_value:Optional[float]=None
+    direction:Optional[str]=None; active:Optional[bool]=None
+class KPIRecalcIn(BaseModel): as_of:Optional[str]=None
 
 @app.get('/api/health')
 def health():
@@ -995,6 +1014,159 @@ def reliability_assets(period_days:int=Query(365,ge=30,le=3650),site_id:Optional
 @app.get('/api/reliability/sites')
 def reliability_sites(period_days:int=Query(365,ge=30,le=3650),user=Depends(current_user)):
     with db() as conn:return {'period_days':period_days,'sites':_site_reliability_rows(conn,period_days)}
+
+# ---------- configurable KPI engine ----------
+KPI_READ_ROLES=('admin','asset_manager','maintenance_manager','planner','supervisor','executive')
+KPI_MANAGE_ROLES=('admin','maintenance_manager','planner')
+KPI_RECALC_ROLES=('admin','maintenance_manager','planner','supervisor')
+
+def _kpi_or_404(conn,kpi_id:int):
+    d=one(conn.execute('SELECT * FROM kpi_definitions WHERE id=?',(kpi_id,)))
+    if not d: raise HTTPException(404,'KPI definition not found')
+    return d
+
+def _kpi_visible(d,role_code:str)->bool:
+    vis=(d.get('visibility_roles') or '').strip()
+    if not vis: return True
+    return role_code in [x.strip() for x in vis.split(',') if x.strip()]
+
+def _kpi_latest_snapshot(conn,kpi_id:int):
+    return one(conn.execute('SELECT * FROM kpi_snapshots WHERE kpi_id=? ORDER BY id DESC LIMIT 1',(kpi_id,)))
+
+def _kpi_payload(conn,d):
+    out=dict(d)
+    out['active']=bool(out.get('active'))
+    snap=_kpi_latest_snapshot(conn,d['id'])
+    out['latest']=snap
+    out['source_supported']=d['source_key'] in KPI_PROVIDERS
+    return out
+
+def _validate_kpi_scope(scope:dict):
+    allowed={'site_id','location_id','asset_id'}
+    for k,v in (scope or {}).items():
+        if k not in allowed: raise HTTPException(422,f'Unsupported scope key {k}')
+        if v is not None and not isinstance(v,int): raise HTTPException(422,f'Scope {k} must be an integer id')
+
+@app.get('/api/kpis')
+def kpi_list(category:str='',domain:str='',include_inactive:bool=False,user=Depends(require_roles(*KPI_READ_ROLES))):
+    with db() as conn:
+        sql='SELECT * FROM kpi_definitions WHERE 1=1';args=[]
+        if category:sql+=' AND category=?';args.append(category)
+        if domain:sql+=' AND domain=?';args.append(domain)
+        if not include_inactive:sql+=' AND active=1'
+        sql+=' ORDER BY code'
+        defs=[d for d in rows(conn.execute(sql,args)) if _kpi_visible(d,user['role'])]
+        return {'kpis':[_kpi_payload(conn,d) for d in defs]}
+
+@app.get('/api/kpis/sources')
+def kpi_sources(user=Depends(require_roles(*KPI_READ_ROLES))):
+    return {'sources':[{'source_key':k} for k in sorted(KPI_PROVIDERS)],'directions':list(DIRECTIONS)}
+
+@app.post('/api/kpis',status_code=201)
+def kpi_create(body:KPIIn,user=Depends(require_roles(*KPI_MANAGE_ROLES))):
+    if body.source_key not in KPI_PROVIDERS: raise HTTPException(422,f"Unsupported source_key '{body.source_key}'")
+    if body.direction not in DIRECTIONS: raise HTTPException(422,f"direction must be one of {DIRECTIONS}")
+    _validate_kpi_scope(body.scope)
+    with db() as conn:
+        if conn.execute('SELECT id FROM kpi_definitions WHERE code=?',(body.code,)).fetchone():
+            raise HTTPException(409,f"KPI code '{body.code}' already exists")
+        cur=conn.execute('''INSERT INTO kpi_definitions(code,name,description,category,domain,unit,value_type,aggregation,
+            source_key,formula,filters_json,scope_json,time_window_days,refresh_minutes,owner_user_id,visibility_roles,
+            target_value,caution_value,alert_value,direction,active,version,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (body.code,body.name,body.description,body.category,body.domain,body.unit,body.value_type,body.aggregation,
+             body.source_key,body.formula,json.dumps(body.filters or {},sort_keys=True),json.dumps(body.scope or {},sort_keys=True),
+             body.time_window_days,body.refresh_minutes,body.owner_user_id,body.visibility_roles.strip(),
+             body.target_value,body.caution_value,body.alert_value,body.direction,1,1,now(),now()))
+        kpi_id=cur.lastrowid
+        audit(conn,user['id'],'create','kpi',body.code,'',json.dumps({'name':body.name,'source_key':body.source_key}))
+        return _kpi_payload(conn,_kpi_or_404(conn,kpi_id))
+
+@app.get('/api/kpis/{kpi_id}')
+def kpi_get(kpi_id:int,user=Depends(require_roles(*KPI_READ_ROLES))):
+    with db() as conn:
+        d=_kpi_or_404(conn,kpi_id)
+        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
+        return _kpi_payload(conn,d)
+
+@app.patch('/api/kpis/{kpi_id}')
+def kpi_update(kpi_id:int,body:KPIPatch,user=Depends(require_roles(*KPI_MANAGE_ROLES))):
+    with db() as conn:
+        d=_kpi_or_404(conn,kpi_id)
+        old=json.dumps({k:d[k] for k in ('name','time_window_days','direction','target_value','caution_value','alert_value','active')},sort_keys=True,default=str)
+        updates={k:v for k,v in body.model_dump(exclude_unset=True).items() if v is not None}
+        if 'direction' in updates and updates['direction'] not in DIRECTIONS:
+            raise HTTPException(422,f"direction must be one of {DIRECTIONS}")
+        if 'scope' in updates:
+            _validate_kpi_scope(updates['scope']);updates['scope_json']=json.dumps(updates.pop('scope'),sort_keys=True)
+        if 'filters' in updates:
+            updates['filters_json']=json.dumps(updates.pop('filters'),sort_keys=True)
+        if 'visibility_roles' in updates:updates['visibility_roles']=str(updates['visibility_roles']).strip()
+        if not updates: raise HTTPException(422,'No changes supplied')
+        sets=', '.join(f'{k}=?' for k in updates)
+        args=list(updates.values())+[int(d['version'])+1,now(),kpi_id]
+        conn.execute(f"UPDATE kpi_definitions SET {sets}, version=?, updated_at=? WHERE id=?",args)
+        audit(conn,user['id'],'update','kpi',d['code'],old,json.dumps(updates,sort_keys=True,default=str))
+        return _kpi_payload(conn,_kpi_or_404(conn,kpi_id))
+
+@app.get('/api/kpis/{kpi_id}/history')
+def kpi_history(kpi_id:int,limit:int=Query(60,ge=1,le=500),user=Depends(require_roles(*KPI_READ_ROLES))):
+    with db() as conn:
+        d=_kpi_or_404(conn,kpi_id)
+        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
+        snaps=rows(conn.execute('SELECT * FROM kpi_snapshots WHERE kpi_id=? ORDER BY id DESC LIMIT ?',(kpi_id,limit)))
+        return {'kpi':d['code'],'history':snaps}
+
+@app.post('/api/kpis/{kpi_id}/recalculate')
+def kpi_recalculate(kpi_id:int,body:Optional[KPIRecalcIn]=None,user=Depends(require_roles(*KPI_RECALC_ROLES))):
+    body=body or KPIRecalcIn()
+    with db() as conn:
+        d=_kpi_or_404(conn,kpi_id)
+        if not d['active']: raise HTTPException(409,'KPI is inactive; activate it before recalculating')
+        try:
+            result,snapshot=evaluate_kpi(conn,d,actor_id=user['id'],as_of=body.as_of)
+        except ValueError as exc:
+            raise HTTPException(422,str(exc))
+        audit(conn,user['id'],'recalculate','kpi',d['code'],'',json.dumps({'value':result['value'],'status':snapshot['status'] if snapshot else None}))
+        drill=_kpi_drilldown_payload(conn,d,result)
+        return {'kpi':_kpi_payload(conn,_kpi_or_404(conn,kpi_id)),'snapshot':snapshot,'drilldown':drill}
+
+@app.post('/api/kpis/recalculate-all')
+def kpi_recalculate_all(user=Depends(require_roles(*KPI_RECALC_ROLES)),as_of:Optional[str]=None):
+    with db() as conn:
+        recalculated=[];skipped=[]
+        for d in rows(conn.execute('SELECT * FROM kpi_definitions WHERE active=1 ORDER BY code')):
+            try:
+                result,snapshot=evaluate_kpi(conn,d,actor_id=user['id'],as_of=as_of)
+            except ValueError:
+                skipped.append({'code':d['code'],'reason':'unsupported_source'})
+                continue
+            recalculated.append({'code':d['code'],'value':result['value'],'status':snapshot['status']})
+        audit(conn,user['id'],'recalculate-all','kpi','',json.dumps({'count':len(recalculated)}))
+        return {'recalculated':recalculated,'skipped':skipped}
+
+def _kpi_drilldown_payload(conn,d,result):
+    """Fresh contributor records so a dashboard number never dead-ends."""
+    contributors=result.get('contributors') or []
+    by_type={}
+    for c in contributors:
+        by_type.setdefault(c['record_type'],[]).append(c)
+    return {'kpi':d['code'],'window':{'start':result['window_start'],'end':result['window_end']},
+            'formula':result.get('formula'),'numerator':result.get('numerator'),'denominator':result.get('denominator'),
+            'breakdown':result.get('breakdown') or [],
+            'contributors':contributors[:100],
+            'record_types':{k:[c.get('record_code') or c.get('record_id') for c in v] for k,v in by_type.items()}}
+
+@app.get('/api/kpis/{kpi_id}/drilldown')
+def kpi_drilldown(kpi_id:int,as_of:Optional[str]=None,user=Depends(require_roles(*KPI_READ_ROLES))):
+    with db() as conn:
+        d=_kpi_or_404(conn,kpi_id)
+        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
+        result=compute_kpi(conn,d,as_of=as_of)
+        persisted=_kpi_latest_snapshot(conn,kpi_id)
+        return {'kpi':d['code'],'live':{'value':result['value'],'status':evaluate_status(result['value'],d['caution_value'],d['alert_value'],d['direction'])},
+                'last_snapshot':persisted,'drilldown':_kpi_drilldown_payload(conn,d,result)}
+
 
 @app.get('/api/workflow-events')
 def list_workflow_events(module:str='',record_type:str='',record_id:Optional[int]=None,user=Depends(current_user)):
