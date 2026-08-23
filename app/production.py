@@ -13,6 +13,12 @@ an immediate socket peer covered by ``EUAS_TRUSTED_PROXY_CIDRS`` may supply one
 ``X-Forwarded-Proto: http|https`` value. This keeps forwarded-scheme trust aligned
 with the spoof-resistant client-identity boundary and preserves the raw socket
 peer for application-level X-Forwarded-For processing.
+
+All ``/api`` responses are marked private and non-cacheable at the outer
+production boundary. That prevents browsers and intermediary caches from
+retaining authenticated JSON, reports, metrics or other API payloads even if an
+inner route accidentally emits a weaker cache directive. Static/PWA responses
+are intentionally left alone so their existing cache strategy remains usable.
 """
 from __future__ import annotations
 
@@ -57,10 +63,15 @@ PRODUCTION_ISOLATION_HEADERS = {
     b'cross-origin-resource-policy': b'same-origin',
     b'x-permitted-cross-domain-policies': b'none',
 }
+PRODUCTION_API_CACHE_HEADERS = {
+    b'cache-control': b'no-store, private, max-age=0',
+    b'pragma': b'no-cache',
+    b'expires': b'0',
+}
 
 
 class ProductionSecurityHeaders:
-    """Apply deployment-only browser and transport policy to HTTP responses."""
+    """Apply deployment-only browser, transport and API cache policy."""
 
     def __init__(self, application):
         self.application = application
@@ -73,6 +84,8 @@ class ProductionSecurityHeaders:
             return
 
         is_https = str(scope.get('scheme', '')).casefold() == 'https'
+        path = str(scope.get('path') or '')
+        is_api = path == '/api' or path.startswith('/api/')
 
         async def send_with_policy(message):
             if message.get('type') == 'http.response.start':
@@ -82,6 +95,8 @@ class ProductionSecurityHeaders:
                     *PRODUCTION_BROWSER_HEADERS.keys(),
                     *PRODUCTION_ISOLATION_HEADERS.keys(),
                 }
+                if is_api:
+                    managed_headers.update(PRODUCTION_API_CACHE_HEADERS.keys())
                 headers = [
                     (name, value)
                     for name, value in message.get('headers', [])
@@ -90,6 +105,8 @@ class ProductionSecurityHeaders:
                 headers.append((b'content-security-policy', self._csp))
                 headers.extend(PRODUCTION_BROWSER_HEADERS.items())
                 headers.extend(PRODUCTION_ISOLATION_HEADERS.items())
+                if is_api:
+                    headers.extend(PRODUCTION_API_CACHE_HEADERS.items())
                 if is_https:
                     headers.append((b'strict-transport-security', self._hsts))
                 message = {**message, 'headers': headers}

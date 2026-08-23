@@ -6,6 +6,7 @@ from pathlib import Path
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.production import (
+    PRODUCTION_API_CACHE_HEADERS,
     PRODUCTION_BROWSER_HEADERS,
     PRODUCTION_ISOLATION_HEADERS,
     ProductionSecurityHeaders,
@@ -18,7 +19,7 @@ from app.production import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _run_wrapper(inner_headers, *, scheme='http'):
+def _run_wrapper(inner_headers, *, scheme='http', path='/'):
     async def legacy_app(scope, receive, send):
         await send({
             'type': 'http.response.start',
@@ -40,7 +41,7 @@ def _run_wrapper(inner_headers, *, scheme='http'):
             {
                 'type': 'http',
                 'method': 'GET',
-                'path': '/',
+                'path': path,
                 'scheme': scheme,
             },
             receive,
@@ -269,6 +270,35 @@ def test_production_wrapper_replaces_browser_and_isolation_headers():
     assert headers[b'cross-origin-resource-policy'] == b'same-origin'
     assert headers[b'x-permitted-cross-domain-policies'] == b'none'
 
+    api_start = _run_wrapper(
+        [
+            (b'cache-control', b'public, max-age=3600'),
+            (b'pragma', b'cache'),
+            (b'expires', b'Wed, 31 Dec 2036 23:59:59 GMT'),
+        ],
+        path='/api/auth/me',
+    )
+    api_headers = {name.lower(): value for name, value in api_start['headers']}
+    for name, expected in PRODUCTION_API_CACHE_HEADERS.items():
+        assert api_headers[name] == expected
+    assert api_headers[b'cache-control'] == b'no-store, private, max-age=0'
+    assert api_headers[b'pragma'] == b'no-cache'
+    assert api_headers[b'expires'] == b'0'
+
+    api_root = _run_wrapper([], path='/api')
+    api_root_headers = {name.lower(): value for name, value in api_root['headers']}
+    for name, expected in PRODUCTION_API_CACHE_HEADERS.items():
+        assert api_root_headers[name] == expected
+
+    static_start = _run_wrapper(
+        [(b'cache-control', b'public, max-age=31536000')],
+        path='/static/app.js',
+    )
+    static_headers = {name.lower(): value for name, value in static_start['headers']}
+    assert static_headers[b'cache-control'] == b'public, max-age=31536000'
+    assert b'pragma' not in static_headers
+    assert b'expires' not in static_headers
+
     assert _run_trusted_host_wrapper('euas.example.com')['status'] == 204
     assert _run_trusted_host_wrapper('north.ops.example.com')['status'] == 204
     rejected = _run_trusted_host_wrapper('attacker.invalid')
@@ -299,6 +329,8 @@ def test_production_entrypoint_matches_external_script_shell_contract():
     assert 'TrustedHostMiddleware' in production_source
     assert 'www_redirect=False' in production_source
     assert "must not contain the unrestricted '*' wildcard" in production_source
+    assert 'PRODUCTION_API_CACHE_HEADERS' in production_source
+    assert "path == '/api' or path.startswith('/api/')" in production_source
 
     script_tags = re.findall(r'<script\b[^>]*>.*?</script>', html, flags=re.I | re.S)
     assert script_tags

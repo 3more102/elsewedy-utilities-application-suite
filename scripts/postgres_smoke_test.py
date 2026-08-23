@@ -45,6 +45,12 @@ def request(path: str, method: str = 'GET', data=None, token: str | None = None)
         raise RuntimeError(f'{method} {path} returned HTTP {exc.code}: {body}') from exc
 
 
+def assert_api_no_store(headers) -> None:
+    assert headers.get('Cache-Control') == 'no-store, private, max-age=0'
+    assert headers.get('Pragma') == 'no-cache'
+    assert headers.get('Expires') == '0'
+
+
 def main() -> int:
     url = os.getenv('EUAS_DATABASE_URL', '').strip()
     if not url.startswith(('postgresql://', 'postgres://')):
@@ -85,6 +91,7 @@ def main() -> int:
         assert health['schema_version'] >= 10
         assert headers.get('X-Request-ID')
         assert headers.get('X-Content-Type-Options') == 'nosniff'
+        assert_api_no_store(headers)
         csp = headers.get('Content-Security-Policy', '')
         assert "script-src 'self'" in csp
         assert "script-src 'self' 'unsafe-inline'" not in csp
@@ -92,11 +99,13 @@ def main() -> int:
         assert "form-action 'self'" in csp
         assert headers.get('Strict-Transport-Security') is None
 
-        status, _, ready = request('/api/health/ready')
+        status, ready_headers, ready = request('/api/health/ready')
         assert status == 200 and ready['status'] == 'ready'
+        assert_api_no_store(ready_headers)
 
-        status, _, login = request('/api/auth/login', method='POST', data={'username': 'omar', 'password': admin_password})
+        status, login_headers, login = request('/api/auth/login', method='POST', data={'username': 'omar', 'password': admin_password})
         assert status == 200 and login['user']['role'] == 'admin'
+        assert_api_no_store(login_headers)
         token = login['token']
         digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
 
@@ -136,8 +145,9 @@ def main() -> int:
         assert any(int(item['session_id']) == int(session_id) and item['current'] for item in sessions)
         assert all('token' not in item and 'token_digest' not in item for item in sessions)
 
-        status, _, dashboard = request('/api/dashboard', token=token)
+        status, dashboard_headers, dashboard = request('/api/dashboard', token=token)
         assert status == 200 and dashboard['kpis']['total_assets'] >= 1
+        assert_api_no_store(dashboard_headers)
 
         status, _, assets = request('/api/assets', token=token)
         assert status == 200 and len(assets) >= 2
@@ -215,7 +225,7 @@ def main() -> int:
             f"PASS EUAS PostgreSQL production-entrypoint smoke: version={health['version']} "
             f"assets={dashboard['kpis']['total_assets']} work_id={work_id} "
             f"session_id={session_id} channel_id={channel_id} alarm_id={alarm_id} "
-            f"backend={health['database_backend']}"
+            f"backend={health['database_backend']} api_cache=no-store"
         )
         return 0
     finally:
