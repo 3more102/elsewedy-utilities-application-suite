@@ -19,6 +19,11 @@ production boundary. That prevents browsers and intermediary caches from
 retaining authenticated JSON, reports, metrics or other API payloads even if an
 inner route accidentally emits a weaker cache directive. Static/PWA responses
 are intentionally left alone so their existing cache strategy remains usable.
+
+The legacy application still mounts ``UPLOAD_DIR`` at ``/uploads`` for reference
+compatibility. Production blocks that mount before routing so randomized stored
+attachment names can never become an alternate unauthenticated download path;
+documents remain available only through the authenticated API download route.
 """
 from __future__ import annotations
 
@@ -115,6 +120,31 @@ class ProductionSecurityHeaders:
         await self.application(scope, receive, send_with_policy)
 
 
+class ProductionPrivateUploadBoundary:
+    """Deny the legacy unauthenticated ``/uploads`` static mount in production."""
+
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') == 'http':
+            path = str(scope.get('path') or '')
+            if path == '/uploads' or path.startswith('/uploads/'):
+                body = b'Not Found'
+                await send({
+                    'type': 'http.response.start',
+                    'status': 404,
+                    'headers': [
+                        (b'content-type', b'text/plain; charset=utf-8'),
+                        (b'content-length', str(len(body)).encode('ascii')),
+                        (b'cache-control', b'no-store, private, max-age=0'),
+                    ],
+                })
+                await send({'type': 'http.response.body', 'body': body})
+                return
+        await self.application(scope, receive, send)
+
+
 class TrustedProxyScheme:
     """Resolve forwarded HTTP scheme only across the configured proxy boundary."""
 
@@ -181,7 +211,10 @@ def _trusted_host_application(application):
 
 # TrustedProxyScheme only normalizes the request scope. Security headers remain
 # outside TrustedHostMiddleware so even a rejected Host response receives the
-# production browser-security header set.
+# production browser-security header set. The private-upload boundary sits
+# behind host validation but in front of the legacy application router.
 app = TrustedProxyScheme(
-    ProductionSecurityHeaders(_trusted_host_application(_application))
+    ProductionSecurityHeaders(
+        _trusted_host_application(ProductionPrivateUploadBoundary(_application))
+    )
 )
