@@ -1434,12 +1434,19 @@ def reorder_scan(user=Depends(require_roles('admin','storekeeper','maintenance_m
 
 # ---------- procurement ----------
 @app.get('/api/procurement')
-def procurement(user=Depends(current_user)):
+def procurement(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
     with db() as conn:
-        prs=rows(conn.execute('''SELECT pr.*,u.full_name requester,s.name site_name FROM purchase_requisitions pr LEFT JOIN users u ON u.id=pr.requester_id LEFT JOIN sites s ON s.id=pr.site_id ORDER BY pr.id DESC'''))
-        for pr in prs:pr['items']=rows(conn.execute('SELECT x.*,i.item_no FROM purchase_requisition_items x LEFT JOIN inventory_items i ON i.id=x.inventory_item_id WHERE x.pr_id=?',(pr['id'],)))
-        pos=rows(conn.execute('''SELECT po.*,v.name vendor_name,pr.pr_no FROM purchase_orders po JOIN vendors v ON v.id=po.vendor_id LEFT JOIN purchase_requisitions pr ON pr.id=po.pr_id ORDER BY po.id DESC'''))
-        quotes=rows(conn.execute('''SELECT q.*,v.name vendor_name,pr.pr_no FROM quotations q JOIN vendors v ON v.id=q.vendor_id JOIN purchase_requisitions pr ON pr.id=q.pr_id ORDER BY q.id DESC'''))
+        prs=rows(conn.execute('''SELECT pr.*,u.full_name requester,s.name site_name FROM purchase_requisitions pr LEFT JOIN users u ON u.id=pr.requester_id LEFT JOIN sites s ON s.id=pr.site_id ORDER BY pr.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
+        # One batched items query replaces the per-requisition fan-out; the
+        # requisition page bounds it, so the IN-list stays small.
+        if prs:
+            marks=','.join('?'*len(prs))
+            item_rows=rows(conn.execute(f'SELECT x.*,i.item_no FROM purchase_requisition_items x LEFT JOIN inventory_items i ON i.id=x.inventory_item_id WHERE x.pr_id IN ({marks}) ORDER BY x.pr_id,x.id',tuple(pr['id'] for pr in prs)))
+            items_by_pr={};[items_by_pr.setdefault(x['pr_id'],[]).append(x) for x in item_rows]
+        else:items_by_pr={}
+        for pr in prs:pr['items']=items_by_pr.get(pr['id'],[])
+        pos=rows(conn.execute('''SELECT po.*,v.name vendor_name,pr.pr_no FROM purchase_orders po JOIN vendors v ON v.id=po.vendor_id LEFT JOIN purchase_requisitions pr ON pr.id=po.pr_id ORDER BY po.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
+        quotes=rows(conn.execute('''SELECT q.*,v.name vendor_name,pr.pr_no FROM quotations q JOIN vendors v ON v.id=q.vendor_id JOIN purchase_requisitions pr ON pr.id=q.pr_id ORDER BY q.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
         return {'requisitions':prs,'purchase_orders':pos,'quotations':quotes}
 @app.post('/api/procurement/requisitions')
 def create_pr(body:PRIn,user=Depends(require_roles('admin','storekeeper','maintenance_manager','procurement','planner'))):
