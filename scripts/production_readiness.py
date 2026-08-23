@@ -115,6 +115,7 @@ def evaluate_configuration(
 def run_database_checks() -> list[Check]:
     # Import after CLI/environment handling so app.config sees deployment values.
     from app.auth import hash_password
+    from app.audit_verification import verify_audit_chain_report
     from app.config import DB_BACKEND, SCHEMA_VERSION
     from app.database import db, init_db
 
@@ -159,6 +160,26 @@ def run_database_checks() -> list[Check]:
             asset_count = int(conn.execute("SELECT COUNT(*) AS n FROM assets").fetchone()[0])
             checks.append(Check("seed_integrity", "PASS" if user_count and asset_count else "FAIL", f"users={user_count}, assets={asset_count}"))
             checks.append(Check("schema_contract", "PASS", f"Application schema contract version={SCHEMA_VERSION}."))
+            # A deployment must never go live on a database whose tamper-evident
+            # audit chain is already broken; this is part of the security gate.
+            report = verify_audit_chain_report(conn)
+            if report["valid"]:
+                checks.append(
+                    Check(
+                        "audit_chain_integrity",
+                        "PASS",
+                        f"checked={report['checked']}, head_hash={report['head_hash'] or '-'}.",
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        "audit_chain_integrity",
+                        "FAIL",
+                        f"Chain invalid at record {report['first_invalid_id']} "
+                        f"(checked={report['checked']}, last_good_head={report['head_hash'] or '-'}).",
+                    )
+                )
             checks.append(Check("database_connectivity", "PASS", f"Connected through EUAS {DB_BACKEND} adapter."))
     except Exception as exc:  # pragma: no cover - exercised by deployment/CI failures
         checks.append(Check("database_connectivity", "FAIL", str(exc)))
