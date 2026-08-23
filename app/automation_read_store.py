@@ -21,7 +21,7 @@ def _rows(cursor):
     return [dict(row) for row in cursor.fetchall()]
 
 
-def automation_status_read(
+def automation_status(
     user=Depends(require_roles(*AUTOMATION_READ_ROLES)),
 ):
     """Return the established automation status read model unchanged."""
@@ -85,7 +85,7 @@ def automation_status_read(
     }
 
 
-def automation_runs_read(
+def automation_runs(
     limit: int = Query(50, ge=1, le=200),
     user=Depends(require_roles(*AUTOMATION_READ_ROLES)),
 ):
@@ -122,9 +122,9 @@ def install_automation_read_routes() -> None:
         )
     ]
 
-    app.get('/api/automation/status')(automation_status_read)
-    app.get('/api/automation/runs')(automation_runs_read)
+    app.get('/api/automation/status')(automation_status)
+    app.get('/api/automation/runs')(automation_runs)
 
-    _application.automation_status = automation_status_read
-    _application.automation_runs = automation_runs_read
+    _application.automation_status = automation_status
+    _application.automation_runs = automation_runs
     setattr(app.state, marker, True)
