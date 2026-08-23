@@ -16,18 +16,25 @@ def _rowcount_one(cursor) -> bool:
 
 
 def _recent_scheduler_success(conn, actor_id: int, interval_minutes: int) -> dict | None:
-    """Return the latest successful scheduler run still inside its quiet period."""
+    """Return the latest scheduler run only when it is a recent success.
+
+    Generation matters here: an older success must never hide a newer failed
+    scheduler attempt, otherwise a peer replica can be incorrectly suppressed
+    precisely when failover is needed.
+    """
     interval = max(1, int(interval_minutes))
     row = conn.execute(
         '''SELECT id,run_no,status,actor_id,as_of,started_at,finished_at
            FROM job_runs
-           WHERE trigger_source=? AND actor_id=? AND status='Succeeded'
+           WHERE trigger_source=? AND actor_id=?
            ORDER BY id DESC LIMIT 1''',
         (SCHEDULER_TRIGGER, actor_id),
     ).fetchone()
     if not row:
         return None
     result = dict(row)
+    if result.get('status') != 'Succeeded':
+        return None
     stamp = result.get('finished_at') or result.get('started_at')
     try:
         completed = datetime.fromisoformat(str(stamp))
@@ -47,11 +54,11 @@ def run_scheduled_automation_once(
     The system actor row is used only as a portable transactional mutex. On
     PostgreSQL the no-op update takes a row lock; on SQLite it participates in
     the database write transaction. A second replica therefore waits until the
-    first cycle commits, then observes the recent successful scheduler run and
-    returns an idempotent skip instead of executing the business payload again.
+    first cycle commits, then observes the latest scheduler generation. Only a
+    recent successful generation suppresses duplicate execution.
 
     Failed cycles are deliberately not suppression markers so another replica
-    can provide immediate failover after the first transaction has rolled back.
+    can provide immediate failover after the failed transaction is committed.
     """
     interval = max(
         1,

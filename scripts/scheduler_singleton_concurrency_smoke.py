@@ -120,8 +120,25 @@ def _singleton_race() -> None:
 
 def _failed_run_allows_failover() -> None:
     actor_id = _new_actor('failover')
+    successful_run = f'JOB-SCHED-PG-SUCCESS-{uuid.uuid4().hex[:10]}'
     failed_run = f'JOB-SCHED-PG-FAILED-{uuid.uuid4().hex[:10]}'
     with db() as conn:
+        # Reproduce the generation bug: an older recent success must not mask a
+        # newer failed attempt. The latest generation controls failover.
+        conn.execute(
+            '''INSERT INTO job_runs(
+                 run_no,trigger_source,status,actor_id,as_of,started_at,finished_at,summary_json
+               ) VALUES(?,?,'Succeeded',?,?,?,?,?)''',
+            (
+                successful_run,
+                SCHEDULER_TRIGGER,
+                actor_id,
+                '2026-08-23',
+                now(),
+                now(),
+                '{}',
+            ),
+        )
         conn.execute(
             '''INSERT INTO job_runs(
                  run_no,trigger_source,status,actor_id,as_of,started_at,finished_at,summary_json,error_message
@@ -154,7 +171,10 @@ def _failed_run_allows_failover() -> None:
         _application._execute_automation = original_execute
 
     if calls != 1 or result.get('status') != 'Succeeded':
-        raise RuntimeError(f'failed scheduler run blocked failover: calls={calls} result={result!r}')
+        raise RuntimeError(
+            'newer failed scheduler generation was hidden by older success: '
+            f'calls={calls} result={result!r}'
+        )
 
 
 def main() -> None:
@@ -162,7 +182,7 @@ def main() -> None:
     _failed_run_allows_failover()
     print(
         'scheduler singleton concurrency smoke: PASS '
-        'payload_executions=1 duplicate_suppressions=11 failed_run_failover=allowed workers=12'
+        'payload_executions=1 duplicate_suppressions=11 latest_failed_generation_failover=allowed workers=12'
     )
 
 
