@@ -119,10 +119,10 @@ def run_database_checks() -> list[Check]:
                 checks.append(Check(
                     "default_credentials",
                     "FAIL" if ENVIRONMENT == "production" else "WARN",
-                    "Packaged demo credentials remain active for: " + ", ".join(insecure_demo_users) + ("." if ENVIRONMENT == "production" else "; permitted only in reference/demo mode."),
+                    "Packaged demo credentials remain for: " + ", ".join(insecure_demo_users) + ("." if ENVIRONMENT == "production" else "; permitted only in reference/demo mode."),
                 ))
             else:
-                checks.append(Check("default_credentials", "PASS", "No active user retains a packaged demo password."))
+                checks.append(Check("default_credentials", "PASS", "No seeded account retains a packaged demo password."))
 
             report = verify_audit_chain_report(conn)
             if report["valid"]:
