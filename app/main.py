@@ -22,6 +22,7 @@ from apps.inspections import corrective_required, inspection_result
 from apps.hse import is_high_risk, risk_score, validate_hse_status
 from apps.projects import InvalidProjectTask, normalize_task_changes, recalculate_project_progress
 from apps.observability import record_request, request_metrics_snapshot
+from apps.integrations import IntegrationKeyNotFound, create_integration_api_key as create_integration_key_record, list_integration_api_keys, revoke_integration_api_key as revoke_integration_key_record, telemetry_ingest_principal
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
 from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
@@ -74,21 +75,6 @@ DOC_WRITE_ROLES = ('admin','asset_manager','maintenance_manager','planner','supe
 PROC_ROLES = ('admin','maintenance_manager','procurement')
 HSE_ROLES = ('admin','hse','maintenance_manager')
 PROJECT_ROLES = ('admin','project_manager','maintenance_manager')
-TELEMETRY_WRITE_ROLES = ('admin','asset_manager','maintenance_manager','planner','supervisor','technician')
-
-def telemetry_ingest_principal(authorization:Optional[str]=Header(default=None),x_euas_integration_key:Optional[str]=Header(default=None,alias='X-EUAS-Integration-Key')):
-    if x_euas_integration_key:
-        digest=hashlib.sha256(x_euas_integration_key.encode()).hexdigest();stamp=now()
-        with db() as conn:
-            key=conn.execute("SELECT * FROM integration_api_keys WHERE key_hash=? AND active=1 AND scope='telemetry:write'",(digest,)).fetchone()
-            if not key or (key['expires_at'] and key['expires_at']<=stamp):raise HTTPException(401,'Invalid or expired integration API key')
-            system=conn.execute("SELECT id,username,full_name FROM users WHERE username='system'").fetchone()
-            if not system:raise HTTPException(503,'Automation principal is unavailable')
-            conn.execute('UPDATE integration_api_keys SET last_used_at=? WHERE id=?',(stamp,key['id']))
-            return {'id':system['id'],'username':system['username'],'full_name':f"Integration: {key['name']}",'role':'integration','role_name':'Integration Service','integration_key_no':key['key_no']}
-    user=current_user(authorization)
-    if user['role'] not in TELEMETRY_WRITE_ROLES:raise HTTPException(403,'Insufficient permissions')
-    return user
 
 
 def rows(cur): return [dict(r) for r in cur.fetchall()]
@@ -1657,8 +1643,7 @@ def map_data(user=Depends(current_user)):
 @app.get('/api/integrations/api-keys')
 def integration_api_keys(user=Depends(require_permission('integration.keys.manage','admin'))):
     with db() as conn:
-        return rows(conn.execute("""SELECT k.id,k.key_no,k.name,k.scope,k.active,k.created_at,k.last_used_at,k.expires_at,u.full_name created_by_name
-          FROM integration_api_keys k JOIN users u ON u.id=k.created_by ORDER BY k.id DESC"""))
+        return list_integration_api_keys(conn)
 
 @app.post('/api/integrations/api-keys')
 def create_integration_api_key(body:IntegrationKeyIn,user=Depends(require_permission('integration.keys.manage','admin'))):
@@ -1667,19 +1652,16 @@ def create_integration_api_key(body:IntegrationKeyIn,user=Depends(require_permis
             if _dt(body.expires_at)<=datetime.now():raise HTTPException(422,'API key expiry must be in the future')
         except HTTPException:raise
         except Exception:raise HTTPException(422,'Invalid API key expiry')
-    raw='euas_'+secrets.token_urlsafe(32);digest=hashlib.sha256(raw.encode()).hexdigest()
     with db() as conn:
-        no=next_no(conn,'integration_api_keys','key_no','KEY-',7001)
-        cur=conn.execute("INSERT INTO integration_api_keys(key_no,name,key_hash,scope,active,created_by,created_at,expires_at) VALUES(?,?,?,'telemetry:write',1,?,?,?)",(no,body.name,digest,user['id'],now(),body.expires_at))
-        audit(conn,user['id'],'CREATE API KEY','Integrations',no,'',{'name':body.name,'scope':'telemetry:write','expires_at':body.expires_at})
-        return {'id':cur.lastrowid,'key_no':no,'name':body.name,'scope':'telemetry:write','api_key':raw,'warning':'This plaintext key is shown once. Store it securely.'}
+        return create_integration_key_record(conn,name=body.name,created_by=user['id'],expires_at=body.expires_at)
 
 @app.post('/api/integrations/api-keys/{key_id}/revoke')
 def revoke_integration_api_key(key_id:int,user=Depends(require_permission('integration.keys.manage','admin'))):
     with db() as conn:
-        key=get_or_404(conn,'SELECT * FROM integration_api_keys WHERE id=?',(key_id,),'Integration API key not found')
-        if not key['active']:return {'ok':True,'active':False}
-        conn.execute('UPDATE integration_api_keys SET active=0 WHERE id=?',(key_id,));audit(conn,user['id'],'REVOKE API KEY','Integrations',key['key_no'],'Active','Revoked');return {'ok':True,'active':False}
+        try:
+            return revoke_integration_key_record(conn,key_id=key_id,actor_id=user['id'])
+        except IntegrationKeyNotFound as exc:
+            raise HTTPException(404,str(exc))
 
 @app.get('/api/telemetry/channels')
 def telemetry_channels(asset_id:Optional[int]=None,site_id:Optional[int]=None,q:str='',user=Depends(current_user)):
