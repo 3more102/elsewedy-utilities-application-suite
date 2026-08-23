@@ -64,14 +64,13 @@ def _assert_security_headers(headers: dict[str, str]) -> None:
     assert headers.get('x-permitted-cross-domain-policies', '').casefold() == 'none', headers
     csp = headers.get('content-security-policy', '')
     assert "default-src 'self'" in csp, csp
-    assert "style-src 'self' 'unsafe-inline'" in csp, csp
+    assert "style-src 'self'" in csp, csp
+    assert "style-src-attr 'none'" in csp, csp
     assert "script-src 'self'" in csp, csp
     assert "script-src 'self' 'unsafe-inline'" not in csp, csp
     assert "script-src-attr 'none'" in csp, csp
     assert "form-action 'self'" in csp, csp
     assert "frame-ancestors 'none'" in csp, csp
-    assert "style-src 'self'" in csp, csp
-    assert "style-src-attr 'none'" in csp, csp
     assert "'unsafe-inline'" not in csp, csp
 
 
@@ -99,10 +98,12 @@ def run(base_url: str) -> dict:
     assert '/static/manifest.webmanifest' in assets, 'web manifest is not referenced by root shell'
     assert '/static/help-security.js' in assets, 'credential-safe shell layer is not referenced by root shell'
 
-    # The service worker is registered at runtime and therefore is not a direct
-    # HTML dependency; include it explicitly in the production image smoke.
-    if '/static/sw.js' not in assets:
-        assets.append('/static/sw.js')
+    # The service worker and report stylesheet are not direct root-shell
+    # dependencies. Include them explicitly so the production image gate verifies
+    # every deployment-critical static resource needed by the shell and reports.
+    for required_asset in ('/static/sw.js', '/static/report.css'):
+        if required_asset not in assets:
+            assets.append(required_asset)
 
     checked: list[dict[str, object]] = []
     for path in assets:
@@ -126,6 +127,10 @@ def run(base_url: str) -> dict:
             assert 'NodeFilter.SHOW_TEXT' in help_script
             assert 'EUAS@2026' not in help_script
             assert 'Tech@2026' not in help_script
+        elif path == '/static/report.css':
+            report_css = asset_body.decode('utf-8')
+            assert '.report{' in report_css
+            assert '.snapshot-report table{' in report_css
 
         checked.append({'path': path, 'bytes': len(asset_body), 'content_type': asset_type})
 
