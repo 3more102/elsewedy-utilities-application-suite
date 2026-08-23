@@ -9,7 +9,11 @@ INDEX = STATIC / 'index.html'
 
 STYLE_ATTRIBUTE = re.compile(r'\bstyle\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
 DIRECT_STYLE_API = re.compile(
-    r'(?:\.style(?:\.|\[)|\.cssText\b|setAttribute\s*\(\s*["\']style["\'])',
+    r'(?:'
+    r'(?:\.\s*style\b|\[\s*["\']style["\']\s*\])\s*(?:=|\.|\[)'
+    r'|(?:\.\s*cssText\b|\[\s*["\']cssText["\']\s*\])\s*='
+    r'|setAttribute\s*\(\s*["\']style["\']\s*,'
+    r')',
     re.IGNORECASE,
 )
 
@@ -58,6 +62,21 @@ def test_inline_style_debt_is_confined_to_known_app_renderer_patterns():
 
 
 def test_frontend_does_not_add_direct_dom_style_mutation_apis():
+    # Keep the detector itself pinned to the common bypass forms so whitespace,
+    # assignment and bracket-property variants cannot silently grow CSP debt.
+    forbidden_examples = (
+        'element.style = css',
+        "element.style ['display'] = value",
+        "element['style'].display = value",
+        "element['style']['display'] = value",
+        "element['style'] = css",
+        'element.cssText = css',
+        "element['cssText'] = css",
+        "element.setAttribute('style', css)",
+    )
+    for snippet in forbidden_examples:
+        assert DIRECT_STYLE_API.search(snippet), snippet
+
     offenders: list[str] = []
     for path in sorted(STATIC.glob('*.js')):
         if DIRECT_STYLE_API.search(path.read_text(encoding='utf-8')):
