@@ -14,7 +14,8 @@ from .config import APP_NAME, APP_VERSION, STATIC_DIR, UPLOAD_DIR, SESSION_HOURS
 from .database import db, init_db, now
 from apps.audit import audit, verify_audit_chain
 from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
-from .auth import hash_password, verify_password, current_user, require_roles, require_permission, effective_permissions, has_permission
+from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
+from .auth import require_roles, require_permission, effective_permissions, has_permission
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -39,10 +40,6 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url='/api/docs', redoc_u
 
 # Lightweight hardening suitable for the self-contained EUAS reference deployment.
 # Production deployments should place EUAS behind a reverse proxy/WAF as well.
-_LOGIN_FAILURES: dict[str, list[float]] = {}
-LOGIN_WINDOW_SECONDS = 5 * 60
-LOGIN_MAX_FAILURES = 5
-
 _REQUEST_METRICS = {'started_at': time.time(), 'requests_total': 0, 'errors_total': 0, 'latency_ms_total': 0.0, 'status': {}}
 logger = logging.getLogger('euas')
 
@@ -66,22 +63,6 @@ async def security_headers(request: Request, call_next):
     response.headers['Cache-Control'] = 'no-store' if request.url.path.startswith('/api/') else response.headers.get('Cache-Control','no-cache')
     response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     return response
-
-def _login_key(request: Request, username: str) -> str:
-    host = request.client.host if request.client else 'unknown'
-    return f'{host}:{username.lower()}'
-
-def _login_is_blocked(key: str) -> bool:
-    now_ts = time.time()
-    recent = [t for t in _LOGIN_FAILURES.get(key, []) if now_ts - t < LOGIN_WINDOW_SECONDS]
-    _LOGIN_FAILURES[key] = recent
-    return len(recent) >= LOGIN_MAX_FAILURES
-
-def _login_failure(key: str):
-    _LOGIN_FAILURES.setdefault(key, []).append(time.time())
-
-def _login_success(key: str):
-    _LOGIN_FAILURES.pop(key, None)
 
 WRITE_ROLES = ('admin','asset_manager','maintenance_manager','planner','supervisor')
 WORK_ROLES = ('admin','maintenance_manager','planner','supervisor','technician')
