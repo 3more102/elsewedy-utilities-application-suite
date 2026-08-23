@@ -1144,14 +1144,14 @@ def add_meter_reading(meter_id:int,body:MeterReadingIn,user=Depends(require_role
 # ---------- work management ----------
 WO_SELECT='''SELECT w.*,a.asset_no,a.name asset_name,l.name location_name,s.name site_name,req.full_name requested_by_name,tech.full_name assigned_to_name,sup.full_name supervisor_name,sl.response_due sla_response_due,sl.resolution_due sla_resolution_due,sl.response_status sla_response_status,sl.resolution_status sla_resolution_status,sl.escalated_level sla_escalated_level FROM work_orders w LEFT JOIN assets a ON a.id=w.asset_id LEFT JOIN locations l ON l.id=w.location_id LEFT JOIN sites s ON s.id=l.site_id LEFT JOIN users req ON req.id=w.requested_by LEFT JOIN users tech ON tech.id=w.assigned_to LEFT JOIN users sup ON sup.id=w.supervisor_id LEFT JOIN work_order_sla sl ON sl.work_order_id=w.id'''
 @app.get('/api/work-orders')
-def list_work(status:str='',priority:str='',q:str='',assigned_to:Optional[int]=None,site_id:Optional[int]=None,user=Depends(current_user)):
+def list_work(status:str='',priority:str='',q:str='',assigned_to:Optional[int]=None,site_id:Optional[int]=None,limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
     sql=WO_SELECT+' WHERE 1=1';args=[]
     if status:sql+=' AND w.status=?';args.append(status)
     if priority:sql+=' AND w.priority=?';args.append(priority)
     if assigned_to:sql+=' AND w.assigned_to=?';args.append(assigned_to)
     if site_id:sql+=' AND s.id=?';args.append(site_id)
     if q:sql+=' AND (w.wo_no LIKE ? OR w.title LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ?)';like=f'%{q}%';args += [like]*4
-    sql+=' ORDER BY CASE w.priority WHEN \'Emergency\' THEN 5 WHEN \'Critical\' THEN 4 WHEN \'High\' THEN 3 WHEN \'Medium\' THEN 2 ELSE 1 END DESC,w.id DESC'
+    sql+=' ORDER BY CASE w.priority WHEN \'Emergency\' THEN 5 WHEN \'Critical\' THEN 4 WHEN \'High\' THEN 3 WHEN \'Medium\' THEN 2 ELSE 1 END DESC,w.id DESC LIMIT ? OFFSET ?';args+=[limit,offset]
     with db() as conn:return rows(conn.execute(sql,args))
 @app.get('/api/work-orders/{wo_id}')
 def get_work(wo_id:int,user=Depends(current_user)):
@@ -1520,14 +1520,14 @@ def create_outage(body:OutageIn,user=Depends(require_roles('admin','asset_manage
 
 # ---------- technician dispatch ----------
 @app.get('/api/dispatch')
-def list_dispatch(status:str='',technician_user_id:Optional[int]=None,user=Depends(current_user)):
+def list_dispatch(status:str='',technician_user_id:Optional[int]=None,limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
     sql="""SELECT d.*,w.wo_no,w.title,w.priority,w.status work_status,a.asset_no,l.name location_name,s.name site_name,u.full_name technician_name,u.username technician_username,byu.full_name dispatched_by_name
       FROM dispatch_assignments d JOIN work_orders w ON w.id=d.work_order_id LEFT JOIN assets a ON a.id=w.asset_id LEFT JOIN locations l ON l.id=w.location_id LEFT JOIN sites s ON s.id=l.site_id
       JOIN users u ON u.id=d.technician_user_id JOIN users byu ON byu.id=d.dispatched_by WHERE 1=1""";args=[]
     if status:sql+=' AND d.status=?';args.append(status)
     if technician_user_id:sql+=' AND d.technician_user_id=?';args.append(technician_user_id)
     if user['role']=='technician':sql+=' AND d.technician_user_id=?';args.append(user['id'])
-    sql+=' ORDER BY CASE d.status WHEN \'On Site\' THEN 0 WHEN \'En Route\' THEN 1 WHEN \'Accepted\' THEN 2 WHEN \'Dispatched\' THEN 3 ELSE 4 END,d.id DESC'
+    sql+=' ORDER BY CASE d.status WHEN \'On Site\' THEN 0 WHEN \'En Route\' THEN 1 WHEN \'Accepted\' THEN 2 WHEN \'Dispatched\' THEN 3 ELSE 4 END,d.id DESC LIMIT ? OFFSET ?';args+=[limit,offset]
     with db() as conn:return rows(conn.execute(sql,args))
 
 @app.get('/api/dispatch/board')
@@ -1589,8 +1589,8 @@ def my_work(user=Depends(current_user)):
 
 # ---------- inspections ----------
 @app.get('/api/inspections')
-def list_inspections(user=Depends(current_user)):
-    with db() as conn:return rows(conn.execute('''SELECT i.*,a.asset_no,a.name asset_name,u.full_name inspector_name,w.wo_no corrective_wo_no FROM inspections i LEFT JOIN assets a ON a.id=i.asset_id LEFT JOIN users u ON u.id=i.inspector_id LEFT JOIN work_orders w ON w.id=i.corrective_wo_id ORDER BY i.id DESC'''))
+def list_inspections(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
+    with db() as conn:return rows(conn.execute('''SELECT i.*,a.asset_no,a.name asset_name,u.full_name inspector_name,w.wo_no corrective_wo_no FROM inspections i LEFT JOIN assets a ON a.id=i.asset_id LEFT JOIN users u ON u.id=i.inspector_id LEFT JOIN work_orders w ON w.id=i.corrective_wo_id ORDER BY i.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
 @app.get('/api/inspections/{inspection_id}')
 def get_inspection(inspection_id:int,user=Depends(current_user)):
     with db() as conn:
