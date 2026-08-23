@@ -204,7 +204,12 @@ def test_production_entrypoint_matches_external_script_shell_contract():
     assert all(re.search(r'\bsrc="/static/[^"]+"', tag, flags=re.I) for tag in script_tags)
     assert not re.search(r'\son[a-z]+\s*=', html, flags=re.I)
     application_source = (ROOT / 'app' / 'application.py').read_text(encoding='utf-8')
+    report_renderer_source = (ROOT / 'app' / 'report_html.py').read_text(encoding='utf-8')
     report_css = (ROOT / 'static' / 'report.css').read_text(encoding='utf-8')
-    assert application_source.count('/static/report.css') == 2
+    assert '/static/report.css' not in application_source
+    assert "REPORT_STYLESHEET = '/static/report.css'" in report_renderer_source
+    assert 'render_snapshot_report_html(r,d)' in application_source
+    assert 'render_work_order_report_html(w,labor,mats)' in application_source
     assert '<style' not in application_source.casefold()
+    assert '<style' not in report_renderer_source.casefold()
     assert '.report{' in report_css
