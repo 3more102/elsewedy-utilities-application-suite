@@ -60,14 +60,16 @@ def _auth_v10_valid(conn, backend: str) -> bool:
 
 
 def registered_migrations() -> tuple[Migration, ...]:
-    # Import lazily to keep auth_store free to call the runner during startup.
+    # Import lazily so legacy startup code can import this module without an
+    # auth_store import cycle. Existing v10 DDL remains the authoritative body
+    # of that migration while the registry owns ordering and validation.
     from . import auth_store
 
     return (
         Migration(
             10,
             'auth_session_hardening',
-            auth_store.apply_auth_schema_migration,
+            auth_store.ensure_auth_schema,
             _auth_v10_valid,
             repairable=True,
         ),
@@ -97,7 +99,7 @@ def _acquire_migration_lock(conn, backend: str) -> None:
             conn.execute('BEGIN IMMEDIATE')
         except Exception as exc:
             # A caller may already have opened the transaction. In that case the
-            # enclosing transaction is the serialization boundary for this run.
+            # enclosing transaction remains the serialization boundary.
             if 'within a transaction' not in str(exc).lower():
                 raise
         return
@@ -167,8 +169,8 @@ def run_pending_migrations(
     PostgreSQL uses a transaction-scoped advisory lock. SQLite upgrades take an
     immediate write transaction before the migration ledger is inspected. A
     persisted migration marker is not trusted blindly: each registered version
-    can validate its structural contract, and explicitly repairable migrations
-    may heal historical pre-claimed markers before deployment continues.
+    validates its structural contract, and explicitly repairable migrations can
+    heal historical pre-claimed markers before deployment continues.
     """
     _acquire_migration_lock(conn, backend)
     before = migration_status(conn, backend=backend, target_version=target_version)
@@ -215,13 +217,18 @@ def run_pending_migrations(
             )
         details[migration.version] = dict(result)
 
+        # Legacy migration bodies may still write their own marker. During this
+        # transition the runner adopts that marker instead of duplicating it;
+        # future migrations should leave ledger ownership entirely to this runner.
+        persisted = set(_applied_versions(conn))
         if already_recorded:
             repaired_now.append(migration.version)
         else:
-            conn.execute(
-                'INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',
-                (migration.version, now()),
-            )
+            if migration.version not in persisted:
+                conn.execute(
+                    'INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)',
+                    (migration.version, now()),
+                )
             applied_set.add(migration.version)
             applied_now.append(migration.version)
 
@@ -236,3 +243,27 @@ def run_pending_migrations(
         'details': details,
         'status': after,
     }
+
+
+def initialize_database(hash_password) -> dict:
+    """Bootstrap the historical v9 base, then migrate to the app contract.
+
+    This is the controlled replacement for callers that previously invoked
+    ``database.init_db`` directly. The base initializer is intentionally pinned
+    to v9 so it can never pre-claim a later migration marker.
+    """
+    from . import database as database_module
+
+    target_version = int(database_module.SCHEMA_VERSION)
+    database_module.SCHEMA_VERSION = BASELINE_VERSION
+    try:
+        database_module.init_db(hash_password)
+    finally:
+        database_module.SCHEMA_VERSION = target_version
+
+    with database_module.db() as conn:
+        return run_pending_migrations(
+            conn,
+            backend=database_module.DB_BACKEND,
+            target_version=target_version,
+        )
