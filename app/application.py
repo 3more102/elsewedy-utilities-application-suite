@@ -1624,8 +1624,8 @@ def submit_inspection(inspection_id:int,body:InspectionSubmit,user=Depends(requi
 
 # ---------- HSE ----------
 @app.get('/api/hse')
-def list_hse(user=Depends(current_user)):
-    with db() as conn:return rows(conn.execute('''SELECT h.*,s.name site_name,l.name location_name,a.asset_no,u.full_name reported_by_name FROM safety_incidents h LEFT JOIN sites s ON s.id=h.site_id LEFT JOIN locations l ON l.id=h.location_id LEFT JOIN assets a ON a.id=h.asset_id LEFT JOIN users u ON u.id=h.reported_by ORDER BY h.id DESC'''))
+def list_hse(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
+    with db() as conn:return rows(conn.execute('''SELECT h.*,s.name site_name,l.name location_name,a.asset_no,u.full_name reported_by_name FROM safety_incidents h LEFT JOIN sites s ON s.id=h.site_id LEFT JOIN locations l ON l.id=h.location_id LEFT JOIN assets a ON a.id=h.asset_id LEFT JOIN users u ON u.id=h.reported_by ORDER BY h.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
 @app.post('/api/hse')
 def create_hse(body:HSEIn,user=Depends(require_roles(*HSE_ROLES))):
     with db() as conn:
@@ -1707,8 +1707,8 @@ def create_contract(body:ContractIn,user=Depends(require_roles('admin','procurem
 
 # ---------- documents ----------
 @app.get('/api/documents')
-def documents(user=Depends(current_user)):
-    with db() as conn:return rows(conn.execute('''SELECT d.*,a.asset_no,w.wo_no,l.location_code,p.project_no,v.vendor_code,u.full_name uploaded_by_name FROM documents d LEFT JOIN assets a ON a.id=d.asset_id LEFT JOIN work_orders w ON w.id=d.work_order_id LEFT JOIN locations l ON l.id=d.location_id LEFT JOIN projects p ON p.id=d.project_id LEFT JOIN vendors v ON v.id=d.vendor_id JOIN users u ON u.id=d.uploaded_by ORDER BY d.id DESC'''))
+def documents(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
+    with db() as conn:return rows(conn.execute('''SELECT d.*,a.asset_no,w.wo_no,l.location_code,p.project_no,v.vendor_code,u.full_name uploaded_by_name FROM documents d LEFT JOIN assets a ON a.id=d.asset_id LEFT JOIN work_orders w ON w.id=d.work_order_id LEFT JOIN locations l ON l.id=d.location_id LEFT JOIN projects p ON p.id=d.project_id LEFT JOIN vendors v ON v.id=d.vendor_id JOIN users u ON u.id=d.uploaded_by ORDER BY d.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
 @app.post('/api/documents/upload')
 def upload_document(title:str=Form(...),category:str=Form(...),asset_id:Optional[int]=Form(None),work_order_id:Optional[int]=Form(None),location_id:Optional[int]=Form(None),project_id:Optional[int]=Form(None),vendor_id:Optional[int]=Form(None),file:UploadFile=File(...),user=Depends(require_roles(*DOC_WRITE_ROLES))):
     original=Path(file.filename or 'document').name
