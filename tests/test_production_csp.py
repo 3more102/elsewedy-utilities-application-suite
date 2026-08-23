@@ -94,9 +94,12 @@ def test_production_wrapper_emits_one_year_hsts_only_for_https_scope():
 def test_production_entrypoint_matches_external_script_shell_contract():
     dockerfile = (ROOT / 'Dockerfile').read_text(encoding='utf-8')
     html = (ROOT / 'static' / 'index.html').read_text(encoding='utf-8')
+    postgres_smoke = (ROOT / 'scripts' / 'postgres_smoke_test.py').read_text(encoding='utf-8')
 
     assert '"app.production:app"' in dockerfile
     assert '"app.main:app"' not in dockerfile
+    assert "'app.production:app'" in postgres_smoke
+    assert "'app.main:app'" not in postgres_smoke
 
     script_tags = re.findall(r'<script\b[^>]*>.*?</script>', html, flags=re.I | re.S)
     assert script_tags

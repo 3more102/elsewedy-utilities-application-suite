@@ -1,9 +1,10 @@
 """Live PostgreSQL HTTP smoke test for EUAS.
 
 Requires EUAS_DATABASE_URL to point at an already-running PostgreSQL instance.
-The script starts EUAS in a child Uvicorn process and validates startup,
-authentication, digest-backed session storage/migration, representative reads,
-generated-ID writes, telemetry/alarm persistence, automation and metrics.
+The script starts the production EUAS ASGI entrypoint in a child Uvicorn process
+and validates startup, production security headers, authentication, digest-backed
+session storage/migration, representative reads, generated-ID writes,
+telemetry/alarm persistence, automation and metrics.
 """
 from __future__ import annotations
 
@@ -58,7 +59,7 @@ def main() -> int:
     env.setdefault('EUAS_ENV', 'test')
     env['EUAS_AUTOMATION_INTERVAL_MINUTES'] = '0'
     process = subprocess.Popen(
-        [sys.executable, '-m', 'uvicorn', 'app.main:app', '--host', HOST, '--port', str(PORT)],
+        [sys.executable, '-m', 'uvicorn', 'app.production:app', '--host', HOST, '--port', str(PORT)],
         cwd=ROOT,
         env=env,
     )
@@ -84,6 +85,12 @@ def main() -> int:
         assert health['schema_version'] >= 10
         assert headers.get('X-Request-ID')
         assert headers.get('X-Content-Type-Options') == 'nosniff'
+        csp = headers.get('Content-Security-Policy', '')
+        assert "script-src 'self'" in csp
+        assert "script-src 'self' 'unsafe-inline'" not in csp
+        assert "script-src-attr 'none'" in csp
+        assert "form-action 'self'" in csp
+        assert headers.get('Strict-Transport-Security') is None
 
         status, _, ready = request('/api/health/ready')
         assert status == 200 and ready['status'] == 'ready'
@@ -205,7 +212,7 @@ def main() -> int:
         assert replay['events'][-1]['audit_hash'] == replay['head_hash']
 
         print(
-            f"PASS EUAS PostgreSQL smoke: version={health['version']} "
+            f"PASS EUAS PostgreSQL production-entrypoint smoke: version={health['version']} "
             f"assets={dashboard['kpis']['total_assets']} work_id={work_id} "
             f"session_id={session_id} channel_id={channel_id} alarm_id={alarm_id} "
             f"backend={health['database_backend']}"
