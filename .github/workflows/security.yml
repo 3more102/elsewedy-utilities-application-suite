@@ -103,6 +103,7 @@ jobs:
           assert payload['database_backend'] == 'sqlite', payload
           print(json.dumps(payload, sort_keys=True))
           PY
+          python scripts/http_ui_smoke.py http://127.0.0.1:8879
 
       - name: Scan image for high and critical vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
