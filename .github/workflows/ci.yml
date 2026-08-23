@@ -58,6 +58,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Require warning-free FastAPI TestClient import
+        run: python -W error -c "from fastapi.testclient import TestClient; print(TestClient.__module__)"
+
       - name: Compile backend
         run: python -m compileall -q app scripts
 
