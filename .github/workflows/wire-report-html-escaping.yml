@@ -1,0 +1,85 @@
+name: Wire escaped report renderers
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    if: github.head_ref == 'oxalpha/euas-report-html-escaping'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: oxalpha/euas-report-html-escaping
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Wire safe report renderers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('app/application.py')
+          source = path.read_text(encoding='utf-8')
+
+          import_anchor = 'from .auth import hash_password, verify_password, current_user, require_roles\n'
+          import_line = 'from .report_html import render_snapshot_report_html, render_work_order_report_html\n'
+          if import_line not in source:
+              if source.count(import_anchor) != 1:
+                  raise SystemExit('report renderer import anchor not found exactly once')
+              source = source.replace(import_anchor, import_anchor + import_line, 1)
+
+          def replace_html_assignment(text: str, function_name: str, call: str) -> str:
+              start = text.index(f'def {function_name}(')
+              return_marker = '\n    return HTMLResponse(html)'
+              end = text.index(return_marker, start)
+              block = text[start:end]
+              assignment_start = block.index("\n    html=f'''")
+              assignment_end = block.index("'''", assignment_start + len("\n    html=f'''")) + 3
+              replacement = f'\n    html={call}'
+              block = block[:assignment_start] + replacement + block[assignment_end:]
+              return text[:start] + block + text[end:]
+
+          source = replace_html_assignment(source, 'report_snapshot_html', 'render_snapshot_report_html(r,d)')
+          source = replace_html_assignment(source, 'work_report', 'render_work_order_report_html(w,labor,mats)')
+
+          if source.count('render_snapshot_report_html(r,d)') != 1:
+              raise SystemExit('snapshot renderer was not wired exactly once')
+          if source.count('render_work_order_report_html(w,labor,mats)') != 1:
+              raise SystemExit('work-order renderer was not wired exactly once')
+          if "html=f'''<html><head><title>{r['report_no']}" in source:
+              raise SystemExit('legacy snapshot HTML interpolation remains')
+          if "html=f'''<html><head><title>{w['wo_no']}" in source:
+              raise SystemExit('legacy work-order HTML interpolation remains')
+
+          path.write_text(source, encoding='utf-8')
+          PY
+          python -m compileall -q app tests
+          python -m pytest -q tests/test_report_html_security.py tests/test_production_csp.py
+
+      - name: Commit safe report wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/application.py
+          git diff --cached --quiet && { echo 'report renderer wiring produced no changes' >&2; exit 1; }
+          git commit -m 'fix(security): escape protected report HTML fields'
+          git push origin HEAD:oxalpha/euas-report-html-escaping
