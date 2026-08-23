@@ -14,6 +14,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  frontend-static:
+    name: Frontend static validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate browser JavaScript syntax
+        run: |
+          node --check static/app.js
+          node --check static/ux-enhancements.js
+          node --check static/dashboard-enhancements.js
+          node --check static/sw.js
+
+      - name: Validate web manifest JSON
+        run: node -e "JSON.parse(require('fs').readFileSync('static/manifest.webmanifest', 'utf8'))"
+
   sqlite-regression:
     name: SQLite / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
