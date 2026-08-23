@@ -14,8 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.auth import hash_password
-from app.database import db, init_db
+from app.database import db
 from app.main import _execute_automation
+from app.migrations import initialize_database
 
 
 def main() -> int:
@@ -23,7 +24,7 @@ def main() -> int:
     parser.add_argument('--as-of', help='Optional YYYY-MM-DD business date')
     args = parser.parse_args()
 
-    init_db(hash_password)
+    initialize_database(hash_password)
     with db() as conn:
         actor = conn.execute("SELECT id FROM users WHERE username='system'").fetchone()
         if not actor:
