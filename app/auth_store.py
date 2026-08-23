@@ -14,6 +14,10 @@ SESSION_TOUCH_INTERVAL_SECONDS = 300
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_FAILURES = 5
 CLIENT_LOGIN_MAX_FAILURES = 50
+# Host-independent ceiling per account. Per-(account,host) and per-host scopes
+# alone let a distributed attacker rotate source addresses indefinitely and
+# keep guessing one account's password without ever tripping a lockout.
+ACCOUNT_LOGIN_MAX_FAILURES = 30
 LOGIN_LOCK_BASE_SECONDS = 30
 LOGIN_LOCK_MAX_SECONDS = 5 * 60
 
@@ -37,6 +41,12 @@ def login_scope_digest(username: str, client_host: str) -> str:
 def client_login_scope_digest(client_host: str) -> str:
     host = (client_host or 'unknown').strip().casefold()
     return hashlib.sha256(f'client\0{host}'.encode('utf-8')).hexdigest()
+
+
+def account_global_scope_digest(username: str) -> str:
+    """Host-independent throttle scope covering every source address at once."""
+    normalized = (username or '').strip().casefold()
+    return hashlib.sha256(f'account-global\0{normalized}'.encode('utf-8')).hexdigest()
 
 
 def client_label(user_agent: str) -> str:

@@ -32,8 +32,10 @@ from .authorization import (
     replace_role_permissions,
 )
 from .auth_store import (
+    ACCOUNT_LOGIN_MAX_FAILURES,
     CLIENT_LOGIN_MAX_FAILURES,
     active_session_count,
+    account_global_scope_digest,
     clear_login_failures,
     client_login_scope_digest,
     create_session,
@@ -139,14 +141,23 @@ def login(body: _application.LoginIn, request: Request):
     host = _client_host(request)
     scope = login_scope_digest(username, host)
     client_scope = client_login_scope_digest(host)
+    # Host-independent ceiling: a distributed attacker rotating source
+    # addresses must still trip this per-account counter.
+    global_scope = account_global_scope_digest(username)
 
     with db() as conn:
         account_throttle = throttle_status(conn, scope)
         client_throttle = throttle_status(conn, client_scope)
-    if account_throttle['blocked'] or client_throttle['blocked']:
+        global_throttle = throttle_status(conn, global_scope)
+    if (
+        account_throttle['blocked']
+        or client_throttle['blocked']
+        or global_throttle['blocked']
+    ):
         retry_after = max(
             int(account_throttle['retry_after']),
             int(client_throttle['retry_after']),
+            int(global_throttle['retry_after']),
         )
         raise HTTPException(
             429,
@@ -182,6 +193,11 @@ def login(body: _application.LoginIn, request: Request):
                 client_scope,
                 max_failures=CLIENT_LOGIN_MAX_FAILURES,
             )
+            record_login_failure(
+                conn,
+                global_scope,
+                max_failures=ACCOUNT_LOGIN_MAX_FAILURES,
+            )
             # Audit failures for known accounts without logging the password,
             # bearer material, client IP, or throttle scope digest.
             if row:
@@ -198,7 +214,9 @@ def login(body: _application.LoginIn, request: Request):
             failed = True
         else:
             # A successful authentication clears the account/client pair only;
-            # it deliberately does not erase the wider client abuse history.
+            # it deliberately does not erase the wider client abuse history or
+            # the host-independent account-global counter, so an attacker
+            # cannot reset spray progress by forcing one victim login.
             clear_login_failures(conn, scope)
             if replacement_hash:
                 conn.execute(
