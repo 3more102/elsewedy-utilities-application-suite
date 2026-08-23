@@ -22,6 +22,11 @@ ALLOWED_DOC_SUFFIXES = {
         '.pdf,.png,.jpg,.jpeg,.webp,.txt,.csv,.doc,.docx,.xls,.xlsx,.dwg,.dxf,.zip'
     ).split(',') if x.strip()
 }
+TRUSTED_PROXY_CIDRS = tuple(
+    x.strip()
+    for x in os.getenv('EUAS_TRUSTED_PROXY_CIDRS', '').split(',')
+    if x.strip()
+)
 
 EVENT_WEBHOOK_URL = os.getenv('EUAS_EVENT_WEBHOOK_URL', '').strip()
 EVENT_WEBHOOK_SECRET = os.getenv('EUAS_EVENT_WEBHOOK_SECRET', '').strip()
