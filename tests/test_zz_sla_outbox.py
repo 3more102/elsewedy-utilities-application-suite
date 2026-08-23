@@ -86,6 +86,11 @@ def test_sla_escalation_and_durable_outbox():
         assert metrics.status_code==200
         assert 'euas_sla_breaches_total ' in metrics.text
         assert 'euas_outbox_pending ' in metrics.text
+        assert 'euas_outbox_attempt_exhausted ' in metrics.text
+
+        status=client.get('/api/automation/status',headers=admin)
+        assert status.status_code==200
+        assert 'outbox_exhausted' in status.json()['queue']
 
         export=client.get('/api/exports/sla.csv',headers=admin)
         assert export.status_code==200 and 'text/csv' in export.headers.get('content-type','')

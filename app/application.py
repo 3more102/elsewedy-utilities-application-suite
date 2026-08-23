@@ -1995,7 +1995,8 @@ def automation_status(user=Depends(require_roles('admin','maintenance_manager','
         overdue=conn.execute("SELECT COUNT(*) FROM work_orders WHERE target_finish IS NOT NULL AND target_finish<? AND status NOT IN ('Completed','Closed','Cancelled')",(date.today().isoformat(),)).fetchone()[0]
         sla_breaches=conn.execute("SELECT COUNT(*) FROM work_order_sla s JOIN work_orders w ON w.id=s.work_order_id WHERE w.status NOT IN ('Completed','Closed','Cancelled') AND (s.response_status='Breached' OR s.resolution_status='Breached')").fetchone()[0]
         outbox_pending=conn.execute("SELECT COUNT(*) FROM event_outbox WHERE status IN ('Pending','Failed')").fetchone()[0]
-        return {'version':APP_VERSION,'scheduler_enabled':AUTOMATION_INTERVAL_MINUTES>0,'interval_minutes':AUTOMATION_INTERVAL_MINUTES,'webhook_configured':bool(EVENT_WEBHOOK_URL),'last_run':last,'queue':{'due_pm':due_pm,'low_stock':low,'overdue_work':overdue,'pending_approvals':pending,'sla_breaches':sla_breaches,'outbox_pending':outbox_pending}}
+        outbox_exhausted=conn.execute("SELECT COUNT(*) FROM event_outbox WHERE status IN ('Pending','Failed') AND attempts>=?",(OUTBOX_MAX_ATTEMPTS,)).fetchone()[0]
+        return {'version':APP_VERSION,'scheduler_enabled':AUTOMATION_INTERVAL_MINUTES>0,'interval_minutes':AUTOMATION_INTERVAL_MINUTES,'webhook_configured':bool(EVENT_WEBHOOK_URL),'last_run':last,'queue':{'due_pm':due_pm,'low_stock':low,'overdue_work':overdue,'pending_approvals':pending,'sla_breaches':sla_breaches,'outbox_pending':outbox_pending,'outbox_exhausted':outbox_exhausted}}
 
 @app.get('/api/automation/runs')
 def automation_runs(limit:int=Query(50,ge=1,le=200),user=Depends(require_roles('admin','maintenance_manager','executive'))):
@@ -2016,6 +2017,7 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
         jobs=conn.execute("SELECT COUNT(*) FROM job_runs WHERE status='Succeeded'").fetchone()[0]
         sla_breaches=conn.execute("SELECT COUNT(*) FROM work_order_sla WHERE response_status='Breached' OR resolution_status='Breached'").fetchone()[0]
         outbox_pending=conn.execute("SELECT COUNT(*) FROM event_outbox WHERE status IN ('Pending','Failed')").fetchone()[0]
+        outbox_exhausted=conn.execute("SELECT COUNT(*) FROM event_outbox WHERE status IN ('Pending','Failed') AND attempts>=?",(OUTBOX_MAX_ATTEMPTS,)).fetchone()[0]
         hs=[_asset_health(conn,x['id'])['score'] for x in rows(conn.execute('SELECT id FROM assets'))];health_avg=sum(hs)/max(len(hs),1)
         plan=_maintenance_forecast(conn,90,None);peak=plan['summary']['peak_utilization_pct'];parts_short=plan['summary']['parts_shortage_jobs'];workforce=plan['technicians']
         open_outages=conn.execute("SELECT COUNT(*) FROM asset_outages WHERE status='Open'").fetchone()[0]
@@ -2024,7 +2026,7 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
         active_alarms=conn.execute("SELECT COUNT(*) FROM operational_alarms WHERE status IN ('Open','Acknowledged')").fetchone()[0]
         critical_alarms=conn.execute("SELECT COUNT(*) FROM operational_alarms WHERE status IN ('Open','Acknowledged') AND severity='Critical'").fetchone()[0]
         telemetry_channels=conn.execute("SELECT COUNT(*) FROM telemetry_channels WHERE active=1").fetchone()[0]
-    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {_REQUEST_METRICS["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}']
+    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {_REQUEST_METRICS["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_outbox_attempt_exhausted {outbox_exhausted}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}']
     for code,count in sorted(_REQUEST_METRICS['status'].items()):lines.append(f'euas_http_responses_total{{status="{code}"}} {count}')
     return '\n'.join(lines)+'\n'
 
