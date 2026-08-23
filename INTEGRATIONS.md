@@ -8,7 +8,9 @@ EUAS includes a durable transactional event outbox for external integration with
 2. EUAS writes `workflow_events` for internal history and an `event_outbox` record in the same database transaction.
 3. The automation runner processes `Pending` / retryable `Failed` events.
 4. If no webhook is configured, the event is retained and marked `Skipped`.
-5. If a webhook is configured, EUAS POSTs the event and records `Delivered` or `Failed` with attempt count/error.
+5. If a webhook is configured, EUAS POSTs the event and records `Delivered` on success.
+6. Delivery failures remain `Failed` while retries are available; the final configured failure transitions to terminal `DeadLetter`.
+7. Administrators can explicitly retry a dead-lettered event; manual retry resets its attempt budget and returns it to `Pending`.
 
 This design keeps maintenance and procurement transactions independent from external network availability.
 
@@ -20,7 +22,7 @@ EUAS_EVENT_WEBHOOK_SECRET=<strong-shared-secret>
 EUAS_OUTBOX_MAX_ATTEMPTS=5
 ```
 
-Outbound delivery is disabled when `EUAS_EVENT_WEBHOOK_URL` is blank.
+Outbound delivery is disabled when `EUAS_EVENT_WEBHOOK_URL` is blank. Exhausted events remain queryable in `DeadLetter` with their final attempt count and error for operator review.
 
 ## HTTP delivery
 

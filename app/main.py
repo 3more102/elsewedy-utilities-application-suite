@@ -987,6 +987,14 @@ def _run_sla_scan(conn,actor_id:int,target:date):
     return {'response_breaches':response_breaches,'resolution_breaches':resolution_breaches}
 
 def _process_outbox(conn):
+    # Normalize legacy exhausted rows first. Earlier builds left them permanently
+    # in Failed because the retry query excludes attempts >= max attempts.
+    terminal_at=now()
+    dead_lettered=conn.execute(
+        "UPDATE event_outbox SET status='DeadLetter',processed_at=COALESCE(processed_at,?) "
+        "WHERE status='Failed' AND attempts>=?",
+        (terminal_at,OUTBOX_MAX_ATTEMPTS),
+    ).rowcount
     items=rows(conn.execute("SELECT * FROM event_outbox WHERE status IN ('Pending','Failed') AND attempts<? ORDER BY id LIMIT 100",(OUTBOX_MAX_ATTEMPTS,)))
     delivered=failed=skipped=0
     for item in items:
@@ -1002,8 +1010,12 @@ def _process_outbox(conn):
                 if not 200<=resp.status<300: raise RuntimeError(f'Webhook HTTP {resp.status}')
             conn.execute("UPDATE event_outbox SET status='Delivered',attempts=?,processed_at=?,last_error='' WHERE id=?",(attempts,now(),item['id']));delivered+=1
         except Exception as exc:
-            conn.execute("UPDATE event_outbox SET status='Failed',attempts=?,last_error=? WHERE id=?",(attempts,str(exc)[:500],item['id']));failed+=1
-    return {'delivered':delivered,'failed':failed,'skipped':skipped,'processed':delivered+failed+skipped}
+            error=str(exc)[:500]
+            if attempts>=OUTBOX_MAX_ATTEMPTS:
+                conn.execute("UPDATE event_outbox SET status='DeadLetter',attempts=?,processed_at=?,last_error=? WHERE id=?",(attempts,now(),error,item['id']));dead_lettered+=1
+            else:
+                conn.execute("UPDATE event_outbox SET status='Failed',attempts=?,processed_at=NULL,last_error=? WHERE id=?",(attempts,error,item['id']));failed+=1
+    return {'delivered':delivered,'failed':failed,'dead_lettered':dead_lettered,'skipped':skipped,'processed':delivered+failed+dead_lettered+skipped}
 
 def notify_once(conn,title,message,severity='Info',user_id=None,role_code=None,module='',record_id=''):
     existing=conn.execute('''SELECT id FROM notifications WHERE title=? AND link_module=? AND link_id=? AND is_read=0
@@ -1094,7 +1106,7 @@ def _execute_automation(conn, actor_id:int, trigger_source='manual', as_of:Optio
             _correlate_alarm(conn,alarm_row['id'],actor_id);correlated+=1
         outbox=_process_outbox(conn)
         health_avg=round(sum(x['score'] for x in health_results)/max(len(health_results),1),1)
-        summary={'pm_work_orders':len(pm),'reorder_requisitions':len(reorders),'overdue_alerts':overdue_alerts,'warranty_alerts':warranty_alerts,'contract_alerts':contract_alerts,'approval_alerts':approval_alerts,'sla_response_breaches':sla['response_breaches'],'sla_resolution_breaches':sla['resolution_breaches'],'asset_health_average':health_avg,'critical_health_assets':critical_health,'delegations_expired':expired,'alarm_suppressions_expired':expired_suppressions,'alarm_shelves_expired':expired_shelves,'stale_telemetry_alerts':stale_telemetry_alerts,'alarms_correlated':correlated,'outbox_delivered':outbox['delivered'],'outbox_failed':outbox['failed'],'outbox_skipped':outbox['skipped']}
+        summary={'pm_work_orders':len(pm),'reorder_requisitions':len(reorders),'overdue_alerts':overdue_alerts,'warranty_alerts':warranty_alerts,'contract_alerts':contract_alerts,'approval_alerts':approval_alerts,'sla_response_breaches':sla['response_breaches'],'sla_resolution_breaches':sla['resolution_breaches'],'asset_health_average':health_avg,'critical_health_assets':critical_health,'delegations_expired':expired,'alarm_suppressions_expired':expired_suppressions,'alarm_shelves_expired':expired_shelves,'stale_telemetry_alerts':stale_telemetry_alerts,'alarms_correlated':correlated,'outbox_delivered':outbox['delivered'],'outbox_failed':outbox['failed'],'outbox_dead_lettered':outbox['dead_lettered'],'outbox_skipped':outbox['skipped']}
         conn.execute('RELEASE SAVEPOINT automation_payload')
         conn.execute("UPDATE job_runs SET status='Succeeded',finished_at=?,summary_json=? WHERE id=?",(now(),json.dumps(summary),run_id));audit(conn,actor_id,'RUN','Automation',run_no,'',summary)
         return {'id':run_id,'run_no':run_no,'status':'Succeeded','as_of':target.isoformat(),'summary':summary}
@@ -3450,7 +3462,7 @@ def outbox_list(status:str='',limit:int=Query(100,ge=1,le=500),user=Depends(requ
 def retry_outbox_event(event_id:int,user=Depends(require_permission('automation.run','admin','maintenance_manager'))):
     with db() as conn:
         event=get_or_404(conn,'SELECT * FROM event_outbox WHERE id=?',(event_id,),'Outbox event not found')
-        conn.execute("UPDATE event_outbox SET status='Pending',processed_at=NULL,last_error='' WHERE id=?",(event_id,))
+        conn.execute("UPDATE event_outbox SET status='Pending',attempts=0,processed_at=NULL,last_error='' WHERE id=?",(event_id,))
         audit(conn,user['id'],'RETRY','Integration Events',event['event_no'],event['status'],'Pending')
         return {'ok':True,'event_no':event['event_no']}
 
@@ -3465,7 +3477,8 @@ def automation_status(user=Depends(require_roles('admin','maintenance_manager','
         overdue=conn.execute("SELECT COUNT(*) FROM work_orders WHERE target_finish IS NOT NULL AND target_finish<? AND status NOT IN ('Completed','Closed','Cancelled')",(date.today().isoformat(),)).fetchone()[0]
         sla_breaches=conn.execute("SELECT COUNT(*) FROM work_order_sla s JOIN work_orders w ON w.id=s.work_order_id WHERE w.status NOT IN ('Completed','Closed','Cancelled') AND (s.response_status='Breached' OR s.resolution_status='Breached')").fetchone()[0]
         outbox_pending=conn.execute("SELECT COUNT(*) FROM event_outbox WHERE status IN ('Pending','Failed')").fetchone()[0]
-        return {'version':APP_VERSION,'scheduler_enabled':AUTOMATION_INTERVAL_MINUTES>0,'interval_minutes':AUTOMATION_INTERVAL_MINUTES,'webhook_configured':bool(EVENT_WEBHOOK_URL),'last_run':last,'queue':{'due_pm':due_pm,'low_stock':low,'overdue_work':overdue,'pending_approvals':pending,'sla_breaches':sla_breaches,'outbox_pending':outbox_pending}}
+        outbox_dead_lettered=conn.execute("SELECT COUNT(*) FROM event_outbox WHERE status='DeadLetter'").fetchone()[0]
+        return {'version':APP_VERSION,'scheduler_enabled':AUTOMATION_INTERVAL_MINUTES>0,'interval_minutes':AUTOMATION_INTERVAL_MINUTES,'webhook_configured':bool(EVENT_WEBHOOK_URL),'last_run':last,'queue':{'due_pm':due_pm,'low_stock':low,'overdue_work':overdue,'pending_approvals':pending,'sla_breaches':sla_breaches,'outbox_pending':outbox_pending,'outbox_dead_lettered':outbox_dead_lettered}}
 
 @app.get('/api/automation/runs')
 def automation_runs(limit:int=Query(50,ge=1,le=200),user=Depends(require_roles('admin','maintenance_manager','executive'))):
@@ -3486,6 +3499,7 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
         jobs=conn.execute("SELECT COUNT(*) FROM job_runs WHERE status='Succeeded'").fetchone()[0]
         sla_breaches=conn.execute("SELECT COUNT(*) FROM work_order_sla WHERE response_status='Breached' OR resolution_status='Breached'").fetchone()[0]
         outbox_pending=conn.execute("SELECT COUNT(*) FROM event_outbox WHERE status IN ('Pending','Failed')").fetchone()[0]
+        outbox_dead_lettered=conn.execute("SELECT COUNT(*) FROM event_outbox WHERE status='DeadLetter'").fetchone()[0]
         hs=[_asset_health(conn,x['id'])['score'] for x in rows(conn.execute('SELECT id FROM assets'))];health_avg=sum(hs)/max(len(hs),1)
         plan=_maintenance_forecast(conn,90,None);peak=plan['summary']['peak_utilization_pct'];parts_short=plan['summary']['parts_shortage_jobs'];workforce=plan['technicians']
         open_outages=conn.execute("SELECT COUNT(*) FROM asset_outages WHERE status='Open'").fetchone()[0]
@@ -3524,7 +3538,7 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
         critical_fmea_without_rcm=conn.execute("""SELECT COUNT(*) FROM asset_fmea f WHERE f.status<>'Retired' AND f.risk_band='Critical' AND NOT EXISTS(SELECT 1 FROM rcm_strategies r WHERE r.asset_fmea_id=f.id AND r.status IN ('Approved','Active'))""").fetchone()[0]
         rcm_coverage_pct=100*float(rcm_covered)/max(int(rcm_eligible),1)
         q24=_telemetry_quality_summary(conn,24,None);bad_quality_24h=q24['bad'];duplicates_24h=conn.execute("SELECT COALESCE(SUM(duplicate_count),0) FROM telemetry_ingest_batches WHERE started_at>=?",((datetime.now()-timedelta(hours=24)).isoformat(timespec='seconds'),)).fetchone()[0] or 0
-    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {_REQUEST_METRICS["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}',f'euas_open_alarm_incidents {open_incidents}',f'euas_active_alarm_suppressions {active_suppressions}',f'euas_active_alarm_shelves {active_shelves}',f'euas_active_topology_links {active_topology_links}',f'euas_topology_correlated_incidents {topology_incidents}',f'euas_field_sync_pending {field_sync_pending}',f'euas_field_sync_conflicts {field_sync_conflicts}',f'euas_field_sync_applied_24h {field_sync_applied_24h}',f'euas_signed_approvals_total {signed_approvals}',f'euas_approval_signature_chain_valid {1 if signature_integrity['valid'] else 0}',f'euas_retention_runs_total {retention_runs_total}',f'euas_retention_purged_records_total {retention_purged_total}',f'euas_active_retention_holds {active_retention_holds}',f'euas_retention_run_chain_valid {1 if retention_integrity['valid'] else 0}',f'euas_permission_role_grants {permission_role_grants}',f'euas_active_permission_overrides {active_permission_overrides}',f'euas_active_permission_denies {active_permission_denies}',f'euas_active_cbm_rules {active_cbm_rules}',f'euas_open_cbm_events {open_cbm_events}',f'euas_cbm_work_orders_total {cbm_work_orders}',f'euas_active_fmea_records {active_fmea_records}',f'euas_critical_fmea_records {critical_fmea_records}',f'euas_overdue_fmea_reviews {overdue_fmea_reviews}',f'euas_active_rcm_strategies {active_rcm_strategies}',f'euas_overdue_rcm_reviews {overdue_rcm_reviews}',f'euas_rcm_strategy_coverage_pct {rcm_coverage_pct:.2f}',f'euas_critical_fmea_without_rcm {critical_fmea_without_rcm}',f'euas_bad_quality_readings_24h {bad_quality_24h}',f'euas_duplicate_telemetry_readings_24h {duplicates_24h}']
+    lines=['# HELP euas_requests_total Total HTTP requests','# TYPE euas_requests_total counter',f'euas_requests_total {total}',f'euas_request_errors_total {_REQUEST_METRICS["errors_total"]}',f'euas_request_latency_ms_avg {avg:.3f}',f'euas_uptime_seconds {uptime:.0f}',f'euas_active_sessions {active_sessions}',f'euas_automation_runs_succeeded {jobs}',f'euas_sla_breaches_total {sla_breaches}',f'euas_outbox_pending {outbox_pending}',f'euas_outbox_dead_lettered {outbox_dead_lettered}',f'euas_asset_health_score_avg {health_avg:.2f}',f'euas_maintenance_forecast_peak_utilization_pct {peak:.2f}',f'euas_workforce_technicians {workforce}',f'euas_parts_shortage_jobs_90d {parts_short}',f'euas_open_outages {open_outages}',f'euas_active_dispatches {active_dispatches}',f'euas_reserved_inventory_units {reserved_units}',f'euas_active_operational_alarms {active_alarms}',f'euas_critical_operational_alarms {critical_alarms}',f'euas_telemetry_channels {telemetry_channels}',f'euas_open_alarm_incidents {open_incidents}',f'euas_active_alarm_suppressions {active_suppressions}',f'euas_active_alarm_shelves {active_shelves}',f'euas_active_topology_links {active_topology_links}',f'euas_topology_correlated_incidents {topology_incidents}',f'euas_field_sync_pending {field_sync_pending}',f'euas_field_sync_conflicts {field_sync_conflicts}',f'euas_field_sync_applied_24h {field_sync_applied_24h}',f'euas_signed_approvals_total {signed_approvals}',f'euas_approval_signature_chain_valid {1 if signature_integrity['valid'] else 0}',f'euas_retention_runs_total {retention_runs_total}',f'euas_retention_purged_records_total {retention_purged_total}',f'euas_active_retention_holds {active_retention_holds}',f'euas_retention_run_chain_valid {1 if retention_integrity['valid'] else 0}',f'euas_permission_role_grants {permission_role_grants}',f'euas_active_permission_overrides {active_permission_overrides}',f'euas_active_permission_denies {active_permission_denies}',f'euas_active_cbm_rules {active_cbm_rules}',f'euas_open_cbm_events {open_cbm_events}',f'euas_cbm_work_orders_total {cbm_work_orders}',f'euas_active_fmea_records {active_fmea_records}',f'euas_critical_fmea_records {critical_fmea_records}',f'euas_overdue_fmea_reviews {overdue_fmea_reviews}',f'euas_active_rcm_strategies {active_rcm_strategies}',f'euas_overdue_rcm_reviews {overdue_rcm_reviews}',f'euas_rcm_strategy_coverage_pct {rcm_coverage_pct:.2f}',f'euas_critical_fmea_without_rcm {critical_fmea_without_rcm}',f'euas_bad_quality_readings_24h {bad_quality_24h}',f'euas_duplicate_telemetry_readings_24h {duplicates_24h}']
     for code,count in sorted(_REQUEST_METRICS['status'].items()):lines.append(f'euas_http_responses_total{{status="{code}"}} {count}')
     return '\n'.join(lines)+'\n'
 
