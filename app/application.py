@@ -1585,6 +1585,8 @@ def receive_po(po_id:int,user=Depends(require_roles('admin','procurement','store
         audit(conn,user['id'],'RECEIVE','Procurement',po['po_no'],po['status'],'Received');return {'ok':True}
 
 # ---------- outages / operational availability ----------
+# Outage close ownership lives in outage_store.py (terminal transition claim);
+# the read model and outage creation remain here.
 @app.get('/api/outages')
 def list_outages(status:str='',site_id:Optional[int]=None,asset_id:Optional[int]=None,user=Depends(current_user)):
     sql="""SELECT o.*,a.asset_no,a.name asset_name,s.site_code,s.name site_name,w.wo_no,u.full_name reported_by_name
@@ -1610,20 +1612,6 @@ def create_outage(body:OutageIn,user=Depends(require_roles('admin','asset_manage
         audit(conn,user['id'],'OPEN OUTAGE','Operations',no,'',body.model_dump());emit_event(conn,'asset.outage.opened','asset',body.asset_id,{'outage_no':no,'asset_no':a['asset_no'],'type':body.outage_type,'start_at':start_at})
         notify(conn,'Asset outage opened',f'{no} — {a["asset_no"]} is unavailable','High' if body.outage_type=='Forced' else 'Warning',None,'maintenance_manager','operations',no)
         return {'id':cur.lastrowid,'outage_no':no,'status':'Open'}
-
-@app.post('/api/outages/{outage_id}/close')
-def close_outage(outage_id:int,body:OutageCloseIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor','technician'))):
-    with db() as conn:
-        o=get_or_404(conn,'SELECT o.*,a.asset_no FROM asset_outages o JOIN assets a ON a.id=o.asset_id WHERE o.id=?',(outage_id,),'Outage not found')
-        if o['status']!='Open':raise HTTPException(409,'Outage is already closed')
-        end_at=body.end_at or now()
-        if _dt(end_at)<=_dt(o['start_at']):raise HTTPException(400,'Outage end must be after start')
-        impact=body.impact if body.impact is not None else o['impact'];conn.execute("UPDATE asset_outages SET status='Closed',end_at=?,impact=?,updated_at=? WHERE id=?",(end_at,impact,now(),outage_id))
-        other=conn.execute("SELECT COUNT(*) FROM asset_outages WHERE asset_id=? AND status='Open' AND id<>?",(o['asset_id'],outage_id)).fetchone()[0]
-        if not other:conn.execute("UPDATE assets SET status='Operating',updated_at=? WHERE id=?",(now(),o['asset_id']))
-        hours=_outage_overlap_hours(o['start_at'],end_at,_dt(o['start_at']),_dt(end_at));audit(conn,user['id'],'CLOSE OUTAGE','Operations',o['outage_no'],'Open',{'status':'Closed','duration_hours':round(hours,2)})
-        emit_event(conn,'asset.outage.closed','asset',o['asset_id'],{'outage_no':o['outage_no'],'asset_no':o['asset_no'],'end_at':end_at,'duration_hours':round(hours,2)})
-        return {'ok':True,'status':'Closed','duration_hours':round(hours,2)}
 
 # ---------- technician dispatch ----------
 @app.get('/api/dispatch')

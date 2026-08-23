@@ -83,6 +83,7 @@ from .dispatch_store import install_dispatch_assignment_route
 from .inspection_authorization import install_inspection_authorization_contract
 from .inspection_store import install_inspection_submission_route
 from .outbox_store import install_outbox_atomicity
+from .outage_store import install_outage_routes
 from .pm_startup import install_pm_generation_startup
 from .pm_store import install_pm_routes
 from .procurement_store import install_procurement_routes
@@ -107,6 +108,7 @@ install_work_order_number_startup()
 install_pm_generation_startup()
 install_pm_routes()
 install_outbox_atomicity()
+install_outage_routes()
 install_distributed_scheduler_singleton()
 install_reorder_generation_atomicity()
 install_telemetry_temporal_integrity()
