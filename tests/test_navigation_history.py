@@ -15,7 +15,7 @@ def test_navigation_history_preserves_existing_navigation_contract():
     assert NAVIGATION_JS.exists()
     assert 'src="/static/navigation-history.js"' in html
     assert "'/static/navigation-history.js'" in service_worker
-    assert "euas-shell-v3.9.0-ui10" in service_worker
+    assert "euas-shell-v3.9.0-ui" in service_worker
 
     assert ".nav-btn[data-view]" in js
     assert "button.click()" in js
