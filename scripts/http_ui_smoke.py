@@ -85,7 +85,7 @@ def run(base_url: str) -> dict:
     assert '/static/app.js' in assets, 'core app.js is not referenced by root shell'
     assert '/static/styles.css' in assets, 'core styles.css is not referenced by root shell'
     assert '/static/manifest.webmanifest' in assets, 'web manifest is not referenced by root shell'
-    assert '/static/help-security.js' in assets, 'credential-safe Help layer is not referenced by root shell'
+    assert '/static/help-security.js' in assets, 'credential-safe shell layer is not referenced by root shell'
 
     # The service worker is registered at runtime and therefore is not a direct
     # HTML dependency; include it explicitly in the production image smoke.
@@ -109,6 +109,9 @@ def run(base_url: str) -> dict:
         if path == '/static/help-security.js':
             help_script = asset_body.decode('utf-8')
             assert 'helpButton.onclick=openCredentialSafeHelp' in help_script
+            assert 'scrubCredentialText' in help_script
+            assert 'new MutationObserver' in help_script
+            assert 'NodeFilter.SHOW_TEXT' in help_script
             assert 'EUAS@2026' not in help_script
             assert 'Tech@2026' not in help_script
 
