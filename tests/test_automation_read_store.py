@@ -37,6 +37,8 @@ def test_automation_read_routes_are_owned_by_focused_store_once():
         runs = _route('GET', '/api/automation/runs')
         assert status.endpoint.__module__ == 'app.automation_read_store'
         assert runs.endpoint.__module__ == 'app.automation_read_store'
+        assert status.name == 'automation_status'
+        assert runs.name == 'automation_runs'
         assert _application.automation_status is status.endpoint
         assert _application.automation_runs is runs.endpoint
 
