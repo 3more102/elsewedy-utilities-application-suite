@@ -46,7 +46,7 @@ jobs:
           python /tmp/euas_zero_inline_refactor.py
           node --check static/app.js
           python -m compileall -q app scripts tests
-          pytest -q tests/test_inline_style_debt.py tests/test_production_csp.py
+          python -m pytest -q tests/test_inline_style_debt.py tests/test_production_csp.py
 
       - name: Commit transformed implementation
         shell: bash
