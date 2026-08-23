@@ -36,6 +36,15 @@ jobs:
       - name: Validate web manifest JSON
         run: node -e "JSON.parse(require('fs').readFileSync('static/manifest.webmanifest', 'utf8'))"
 
+      - name: Reject packaged credentials in login shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -Eq 'EUAS@2026|Planner@2026|Supervisor@2026|Tech@2026|Store@2026|Proc@2026|HSE@2026|Viewer@2026|value="omar"' static/index.html; then
+            echo "Packaged demo credentials must not be rendered by the login shell" >&2
+            exit 1
+          fi
+
   sqlite-regression:
     name: SQLite / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
