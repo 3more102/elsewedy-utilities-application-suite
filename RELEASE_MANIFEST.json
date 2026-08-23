@@ -1,0 +1,35 @@
+{
+  "application": "Elsewedy Utilities Application Suite (EUAS)",
+  "version": "4.9.0",
+  "release_focus": "Governed Reliability-Centered Maintenance strategy models linked to FMEA, CBM, preventive maintenance and electronic approvals",
+  "schema_version": 19,
+  "api_endpoints": 242,
+  "api_routes_under_api": 241,
+  "relational_tables": 83,
+  "explicit_indexes": 76,
+  "automated_tests": 32,
+  "verification": {
+    "pytest": "PASS \u2014 32 tests",
+    "fresh_uvicorn_http_smoke": "PASS \u2014 version=4.9.0 with RCM read surface",
+    "fresh_sqlite_schema": "PASS \u2014 schema 19, 83 tables, 76 indexes",
+    "python_compile": "PASS",
+    "frontend_js_syntax": "PASS",
+    "service_worker_js_syntax": "PASS",
+    "sqlite_v48_to_v49_upgrade": "PASS \u2014 schema 18 \u2192 19",
+    "sqlite_integrity_after_upgrade": "PASS \u2014 ok",
+    "rcm_strategy_guards": "PASS",
+    "rcm_four_eyes_signed_approval": "PASS",
+    "rcm_revision_and_reapproval": "PASS",
+    "rcm_cbm_pm_linkage": "PASS",
+    "release_metadata_consistency": "PASS"
+  },
+  "features": [
+    "one governed RCM strategy per asset FMEA",
+    "five explicit maintenance strategy types with consequence and readiness guards",
+    "four-eyes electronically evidenced RCM approval and explicit activation",
+    "risk-based review cadence with Continue, Revise and Retire history",
+    "validated linkage to existing CBM rules and preventive-maintenance plans",
+    "RCM coverage, overdue review and critical-gap metrics, CSV export and Reliability UI"
+  ],
+  "security_boundary": "RCM decisions and review cadence are deterministic reference-application governance and do not claim SAE JA1011/JA1012, IEC/ISO, OEM or regulated safety-case certification."
+}

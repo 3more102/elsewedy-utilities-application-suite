@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose an EUAS capability or improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Product area
+      options:
+        - Asset Management
+        - Work / Maintenance
+        - Workforce / Field Service
+        - Inventory / Procurement
+        - Utility Operations / SCADA Integration
+        - GIS
+        - HSE
+        - Analytics / Reliability
+        - Governance / Security
+        - Platform / DevOps
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or operational need
+      description: Describe the utility/maintenance problem before proposing the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed capability
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What must be true for this to be considered complete?
