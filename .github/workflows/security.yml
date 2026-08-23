@@ -134,6 +134,23 @@ jobs:
           grep -qi '^x-content-type-options: nosniff' /tmp/euas-untrusted-host.headers
           grep -qi '^x-frame-options: DENY' /tmp/euas-untrusted-host.headers
           grep -qi '^content-security-policy:' /tmp/euas-untrusted-host.headers
+
+          # Prove a file that physically exists in UPLOAD_DIR cannot bypass the
+          # authenticated document-download API through the legacy static mount.
+          docker exec euas-security-smoke sh -c "printf 'EUAS_PRIVATE_UPLOAD_PROBE' > /app/uploads/security-boundary-probe.txt"
+          upload_status=$(curl --silent --output /tmp/euas-upload-probe.txt --dump-header /tmp/euas-upload-probe.headers --write-out '%{http_code}' http://127.0.0.1:8879/uploads/security-boundary-probe.txt)
+          if [ "$upload_status" != "404" ]; then
+            echo "Private upload was exposed through /uploads: HTTP $upload_status" >&2
+            cat /tmp/euas-upload-probe.txt >&2 || true
+            exit 1
+          fi
+          if grep -q 'EUAS_PRIVATE_UPLOAD_PROBE' /tmp/euas-upload-probe.txt; then
+            echo "Private upload contents leaked through /uploads" >&2
+            exit 1
+          fi
+          grep -qi '^cache-control: no-store, private, max-age=0' /tmp/euas-upload-probe.headers
+          grep -qi '^content-security-policy:' /tmp/euas-upload-probe.headers
+
           python scripts/http_ui_smoke.py http://127.0.0.1:8879
 
       - name: Scan image for high and critical vulnerabilities
