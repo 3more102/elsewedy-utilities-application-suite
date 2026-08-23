@@ -15,9 +15,9 @@ from core.database import db, init_db, now
 from apps.audit import audit, verify_audit_chain
 from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
 from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record
-from apps.maintenance import ACTION_ROLES, TRANSITIONS, DispatchError, InvalidWorkTransition, MaintenanceCommandError, WorkTransitionForbidden, backfill_work_order_slas as _backfill_work_order_slas, create_dispatch as create_dispatch_record, create_work_order as create_work_order_record, ensure_work_sla as _ensure_work_sla, mark_sla_resolution as _mark_sla_resolution, mark_sla_response as _mark_sla_response, transition_dispatch as transition_dispatch_record, transition_target, transition_work_order as transition_work_order_record, update_work_order as update_work_order_record, validate_transition_actor
+from apps.maintenance import ACTION_ROLES, TRANSITIONS, DispatchError, InvalidWorkTransition, MaintenanceCommandError, WorkTransitionForbidden, backfill_work_order_slas as _backfill_work_order_slas, create_dispatch as create_dispatch_record, create_work_order as create_work_order_record, ensure_work_sla as _ensure_work_sla, mark_sla_resolution as _mark_sla_resolution, mark_sla_response as _mark_sla_response, post_cost, transition_dispatch as transition_dispatch_record, transition_target, transition_work_order as transition_work_order_record, update_work_order as update_work_order_record, validate_transition_actor
 from apps.procurement import ProcurementCommandError, approve_requisition as approve_requisition_record, create_purchase_order as create_purchase_order_record, create_requisition as create_requisition_record, receive_purchase_order as receive_purchase_order_record, submit_requisition as submit_requisition_record
-from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction, reconcile_reserved_stock as _reconcile_reserved_stock, reservation_rows as _reservation_rows, sync_reserved_stock as _sync_reserved_stock, work_order_parts_readiness as _work_order_parts_readiness
+from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, ReservationCommandError, apply_inventory_transaction, issue_material_reservation, reconcile_reserved_stock as _reconcile_reserved_stock, release_material_reservation, reservation_rows as _reservation_rows, reserve_all_materials, reserve_material, sync_reserved_stock as _sync_reserved_stock, work_order_parts_readiness as _work_order_parts_readiness
 from apps.inspections import corrective_required, inspection_result
 from apps.hse import is_high_risk, risk_score, validate_hse_status
 from apps.projects import InvalidProjectTask, normalize_task_changes, recalculate_project_progress
@@ -87,13 +87,6 @@ PROJECT_ROLES = ('admin','project_manager','maintenance_manager')
 def rows(cur): return [dict(r) for r in cur.fetchall()]
 def one(cur):
     r=cur.fetchone(); return dict(r) if r else None
-
-def post_cost(conn, work_order, cost_type, amount, quantity, reference, user_id):
-    if amount<=0:return None
-    no=next_no(conn,'maintenance_cost_ledger','entry_no','COST-',1)
-    cur=conn.execute('INSERT INTO maintenance_cost_ledger(entry_no,work_order_id,asset_id,cost_type,amount,quantity,reference,posted_by,posted_at) VALUES(?,?,?,?,?,?,?,?,?)',(no,work_order['id'],work_order.get('asset_id'),cost_type,amount,quantity,reference or work_order['wo_no'],user_id,now()))
-    return {'id':cur.lastrowid,'entry_no':no,'amount':amount}
-
 
 def _asset_health(conn, asset_id:int):
     a=get_or_404(conn,"SELECT a.*,l.name location_name,s.name site_name FROM assets a LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE a.id=?",(asset_id,),"Asset not found")
@@ -366,7 +359,7 @@ class LaborIn(BaseModel): user_id:Optional[int]=None; hours:float=Field(gt=0); l
 class MaterialIn(BaseModel): item_id:int; quantity:float=Field(gt=0)
 class PMIn(BaseModel): name:str; asset_id:int; trigger_type:str='Calendar'; interval_days:Optional[int]=None; meter_interval:Optional[float]=None; next_due:Optional[str]=None; priority:str='Medium'; job_plan:str=''
 class InventoryIn(BaseModel): name:str; description:str=''; category:str; warehouse_id:int; current_stock:float=0; reserved_stock:float=0; min_level:float=0; max_level:float=0; reorder_point:float=0; unit_price:float=0; unit:str='ea'; vendor_id:Optional[int]=None; bin:str=''
-class InventoryTxIn(BaseModel): tx_type:str; quantity:float; reference:str=''; to_warehouse_id:Optional[int]=None; work_order_id:Optional[int]=None
+class InventoryTxIn(BaseModel): tx_type:str; quantity:float; reference:str=''; to_warehouse_id:Optional[int]=None; work_order_id:Optional[int]=None; idempotency_key:Optional[str]=Field(default=None,min_length=1,max_length=120)
 class PRIn(BaseModel): title:str; site_id:Optional[int]=None; work_order_id:Optional[int]=None; project_id:Optional[int]=None; justification:str=''; items:list[dict]=[]
 class POIn(BaseModel): pr_id:int; vendor_id:int; expected_delivery:Optional[str]=None
 class QuoteIn(BaseModel): pr_id:int; vendor_id:int; amount:float=Field(gt=0); valid_until:Optional[str]=None
@@ -1893,69 +1886,26 @@ def list_work_reservations(wo_id:int,user=Depends(current_user)):
 @app.post('/api/work-orders/{wo_id}/reservations')
 def reserve_work_material(wo_id:int,body:ReservationIn,user=Depends(require_permission('inventory.transact','admin','maintenance_manager','planner','supervisor','storekeeper'))):
     with db() as conn:
-        w=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(wo_id,),'Work order not found');i=get_or_404(conn,'SELECT * FROM inventory_items WHERE id=?',(body.item_id,),'Inventory item not found')
-        available=float(i['current_stock'])-float(i['reserved_stock'])
-        if available<body.quantity:raise HTTPException(409,f'Insufficient unreserved stock ({available:g} {i["unit"]})')
-        no=next_no(conn,'inventory_reservations','reservation_no','RSV-',20001)
-        cur=conn.execute("INSERT INTO inventory_reservations(reservation_no,work_order_id,inventory_item_id,quantity,issued_quantity,status,reserved_by,reserved_at,notes) VALUES(?,?,?,?,0,'Reserved',?,?,?)",(no,wo_id,body.item_id,body.quantity,user['id'],now(),body.notes))
-        _sync_reserved_stock(conn,body.item_id)
-        req=conn.execute('SELECT id,quantity FROM work_order_requirements WHERE work_order_id=? AND inventory_item_id=?',(wo_id,body.item_id)).fetchone()
-        if req:
-            reserved=conn.execute("SELECT COALESCE(SUM(quantity-issued_quantity),0) FROM inventory_reservations WHERE work_order_id=? AND inventory_item_id=? AND status IN ('Reserved','Partially Issued')",(wo_id,body.item_id)).fetchone()[0] or 0
-            if float(reserved)>=float(req['quantity']):conn.execute("UPDATE work_order_requirements SET status='Reserved' WHERE id=?",(req['id'],))
-        audit(conn,user['id'],'RESERVE MATERIAL','Work Management',w['wo_no'],'',{'reservation':no,'item':i['item_no'],'quantity':body.quantity})
-        notify(conn,'Material reserved',f'{no} reserved {body.quantity:g} {i["unit"]} of {i["item_no"]} for {w["wo_no"]}','Info',w.get('assigned_to'),None,'work',w['wo_no'])
-        return {'id':cur.lastrowid,'reservation_no':no,'readiness':_work_order_parts_readiness(conn,wo_id)}
+        try:return reserve_material(conn,wo_id,body.item_id,body.quantity,user['id'],body.notes)
+        except ReservationCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 
 @app.post('/api/work-orders/{wo_id}/reserve-all')
 def reserve_all_work_materials(wo_id:int,user=Depends(require_permission('inventory.transact','admin','maintenance_manager','planner','supervisor','storekeeper'))):
     with db() as conn:
-        w=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(wo_id,),'Work order not found');created=[];shortages=[]
-        reqs=rows(conn.execute('SELECT * FROM work_order_requirements WHERE work_order_id=? AND status<>\'Cancelled\'',(wo_id,)))
-        for req in reqs:
-            item=get_or_404(conn,'SELECT * FROM inventory_items WHERE id=?',(req['inventory_item_id'],),'Inventory item not found')
-            issued=float(conn.execute('SELECT COALESCE(SUM(quantity),0) FROM work_order_materials WHERE work_order_id=? AND inventory_item_id=?',(wo_id,item['id'])).fetchone()[0] or 0)
-            already=float(conn.execute("SELECT COALESCE(SUM(quantity-issued_quantity),0) FROM inventory_reservations WHERE work_order_id=? AND inventory_item_id=? AND status IN ('Reserved','Partially Issued')",(wo_id,item['id'])).fetchone()[0] or 0)
-            need=max(0.0,float(req['quantity'])-issued-already);available=max(0.0,float(item['current_stock'])-float(item['reserved_stock']))
-            if need<=0:continue
-            if available+1e-9<need:shortages.append({'item_no':item['item_no'],'required':round(need,3),'available':round(available,3)});continue
-            no=next_no(conn,'inventory_reservations','reservation_no','RSV-',20001)
-            conn.execute("INSERT INTO inventory_reservations(reservation_no,work_order_id,inventory_item_id,quantity,issued_quantity,status,reserved_by,reserved_at,notes) VALUES(?,?,?,?,0,'Reserved',?,?,?)",(no,wo_id,item['id'],need,user['id'],now(),'Reserve all planned materials'))
-            _sync_reserved_stock(conn,item['id']);created.append(no)
-        audit(conn,user['id'],'RESERVE ALL','Work Management',w['wo_no'],'',{'reservations':created,'shortages':shortages})
-        return {'created':created,'shortages':shortages,'readiness':_work_order_parts_readiness(conn,wo_id)}
+        try:return reserve_all_materials(conn,wo_id,user['id'])
+        except ReservationCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 
 @app.post('/api/reservations/{reservation_id}/release')
 def release_reservation(reservation_id:int,user=Depends(require_permission('inventory.transact','admin','maintenance_manager','planner','supervisor','storekeeper'))):
     with db() as conn:
-        r=get_or_404(conn,'SELECT r.*,w.wo_no,i.item_no FROM inventory_reservations r JOIN work_orders w ON w.id=r.work_order_id JOIN inventory_items i ON i.id=r.inventory_item_id WHERE r.id=?',(reservation_id,),'Reservation not found')
-        if r['status'] not in ('Reserved','Partially Issued'):raise HTTPException(409,f"Reservation is {r['status']}")
-        conn.execute("UPDATE inventory_reservations SET status='Released',released_at=? WHERE id=?",(now(),reservation_id));_sync_reserved_stock(conn,r['inventory_item_id'])
-        req=conn.execute('SELECT id FROM work_order_requirements WHERE work_order_id=? AND inventory_item_id=?',(r['work_order_id'],r['inventory_item_id'])).fetchone()
-        if req:conn.execute("UPDATE work_order_requirements SET status='Required' WHERE id=?",(req['id'],))
-        audit(conn,user['id'],'RELEASE RESERVATION','Inventory',r['reservation_no'],r['status'],'Released');return {'ok':True,'readiness':_work_order_parts_readiness(conn,r['work_order_id'])}
+        try:return release_material_reservation(conn,reservation_id,user['id'])
+        except ReservationCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 
 @app.post('/api/reservations/{reservation_id}/issue')
 def issue_reservation(reservation_id:int,body:ReservationIssueIn,user=Depends(require_permission('inventory.transact',*INV_ROLES))):
     with db() as conn:
-        r=get_or_404(conn,'SELECT r.*,w.wo_no,w.asset_id,w.assigned_to,i.item_no,i.name,i.unit,i.unit_price,i.current_stock FROM inventory_reservations r JOIN work_orders w ON w.id=r.work_order_id JOIN inventory_items i ON i.id=r.inventory_item_id WHERE r.id=?',(reservation_id,),'Reservation not found')
-        if user['role']=='technician' and r.get('assigned_to')!=user['id']:raise HTTPException(403,'Technicians can only issue materials for work assigned to them')
-        if r['status'] not in ('Reserved','Partially Issued'):raise HTTPException(409,f"Reservation is {r['status']}")
-        remaining=max(0.0,float(r['quantity'])-float(r['issued_quantity']));qty=remaining if body.quantity is None else float(body.quantity)
-        if qty>remaining+1e-9:raise HTTPException(409,f'Reservation only has {remaining:g} remaining')
-        if float(r['current_stock'])<qty:raise HTTPException(409,'Physical stock is below reserved quantity')
-        new_issued=float(r['issued_quantity'])+qty;new_status='Issued' if new_issued+1e-9>=float(r['quantity']) else 'Partially Issued';cost=qty*float(r['unit_price'])
-        conn.execute('UPDATE inventory_items SET current_stock=current_stock-? WHERE id=?',(qty,r['inventory_item_id']))
-        conn.execute('UPDATE inventory_reservations SET issued_quantity=?,status=? WHERE id=?',(new_issued,new_status,reservation_id));_sync_reserved_stock(conn,r['inventory_item_id'])
-        conn.execute('INSERT INTO inventory_transactions(item_id,tx_type,quantity,work_order_id,reference,user_id,created_at) VALUES(?,?,?,?,?,?,?)',(r['inventory_item_id'],'ISSUE',-qty,r['work_order_id'],r['reservation_no'],user['id'],now()))
-        conn.execute('INSERT INTO work_order_materials(work_order_id,inventory_item_id,quantity,unit_cost,issued_at,issued_by) VALUES(?,?,?,?,?,?)',(r['work_order_id'],r['inventory_item_id'],qty,r['unit_price'],now(),user['id']))
-        conn.execute('UPDATE work_orders SET actual_cost=actual_cost+?,updated_at=? WHERE id=?',(cost,now(),r['work_order_id']))
-        post_cost(conn,{'id':r['work_order_id'],'asset_id':r.get('asset_id'),'wo_no':r['wo_no']},'Material',cost,qty,r['item_no'],user['id'])
-        req=conn.execute('SELECT id,quantity FROM work_order_requirements WHERE work_order_id=? AND inventory_item_id=?',(r['work_order_id'],r['inventory_item_id'])).fetchone()
-        if req:
-            issued=conn.execute('SELECT COALESCE(SUM(quantity),0) FROM work_order_materials WHERE work_order_id=? AND inventory_item_id=?',(r['work_order_id'],r['inventory_item_id'])).fetchone()[0] or 0
-            conn.execute('UPDATE work_order_requirements SET status=? WHERE id=?',('Fulfilled' if float(issued)>=float(req['quantity']) else 'Required',req['id']))
-        audit(conn,user['id'],'ISSUE RESERVATION','Inventory',r['reservation_no'],r['status'],{'status':new_status,'issued':qty});return {'ok':True,'status':new_status,'issued_quantity':qty,'readiness':_work_order_parts_readiness(conn,r['work_order_id'])}
+        try:return issue_material_reservation(conn,reservation_id,body.quantity,user)
+        except ReservationCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 
 @app.post('/api/work-orders/{wo_id}/craft-requirements')
 def add_work_craft_requirement(wo_id:int,body:CraftRequirementIn,user=Depends(require_permission('work.write','admin','maintenance_manager','planner','supervisor'))):

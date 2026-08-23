@@ -193,6 +193,10 @@ def _ensure_schema_columns(conn):
     if cbm_rule_cols and 'asset_fmea_id' not in cbm_rule_cols: conn.execute('ALTER TABLE cbm_rules ADD COLUMN asset_fmea_id INTEGER REFERENCES asset_fmea(id) ON DELETE SET NULL')
     job_cols=_table_columns(conn,'jobs')
     if job_cols and 'current_attempt_no' not in job_cols: conn.execute('ALTER TABLE jobs ADD COLUMN current_attempt_no INTEGER NOT NULL DEFAULT 0')
+    inventory_tx_cols=_table_columns(conn,'inventory_transactions')
+    if inventory_tx_cols:
+        if 'idempotency_key' not in inventory_tx_cols: conn.execute('ALTER TABLE inventory_transactions ADD COLUMN idempotency_key TEXT')
+        if 'operation_fingerprint' not in inventory_tx_cols: conn.execute("ALTER TABLE inventory_transactions ADD COLUMN operation_fingerprint TEXT NOT NULL DEFAULT ''")
     outbox_cols=_table_columns(conn,'event_outbox')
     if outbox_cols:
         if 'current_attempt_no' not in outbox_cols: conn.execute('ALTER TABLE event_outbox ADD COLUMN current_attempt_no INTEGER NOT NULL DEFAULT 0')
@@ -383,7 +387,8 @@ def init_db(hash_password):
         CREATE TABLE IF NOT EXISTS inventory_transactions(
           id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL REFERENCES inventory_items(id), tx_type TEXT NOT NULL,
           quantity REAL NOT NULL, from_warehouse_id INTEGER REFERENCES warehouses(id), to_warehouse_id INTEGER REFERENCES warehouses(id),
-          work_order_id INTEGER REFERENCES work_orders(id), reference TEXT DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
+          work_order_id INTEGER REFERENCES work_orders(id), reference TEXT DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+          idempotency_key TEXT, operation_fingerprint TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS purchase_requisitions(
           id INTEGER PRIMARY KEY AUTOINCREMENT, pr_no TEXT UNIQUE NOT NULL, title TEXT NOT NULL, requester_id INTEGER REFERENCES users(id),
@@ -784,6 +789,7 @@ def init_db(hash_password):
         ''')
         _ensure_schema_columns(conn)
         conn.execute('CREATE INDEX IF NOT EXISTS idx_outbox_dispatch ON event_outbox(status,available_at,id)')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_transactions_idempotency ON inventory_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_approval_delegations_scope ON approval_delegations(delegator_user_id,delegate_user_id,module,record_type,resource_id,active)')
         conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_readings_external ON telemetry_readings(channel_id,external_id) WHERE external_id IS NOT NULL')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_wo_fmea ON work_orders(asset_fmea_id,status)')
