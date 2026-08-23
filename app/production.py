@@ -2,8 +2,10 @@
 
 The historical FastAPI application still emits a compatibility CSP that permits
 inline scripts. The browser shell no longer needs inline JavaScript, so the
-production entrypoint replaces only that response header after the inner
-application/middleware stack has run. Development entrypoints remain unchanged.
+production entrypoint replaces that response header after the inner application
+stack has run. HTTPS responses also receive HSTS; plain HTTP responses do not,
+so local/reference deployments are not incorrectly marked as transport-secure.
+Development entrypoints remain unchanged.
 """
 from __future__ import annotations
 
@@ -22,28 +24,37 @@ STRICT_CONTENT_SECURITY_POLICY = (
     "form-action 'self'; "
     "frame-ancestors 'none'"
 )
+STRICT_TRANSPORT_SECURITY = 'max-age=31536000'
 
 
 class ProductionSecurityHeaders:
-    """Replace the legacy CSP on HTTP responses while preserving ASGI semantics."""
+    """Apply deployment-only CSP and HTTPS transport policy to HTTP responses."""
 
     def __init__(self, application):
         self.application = application
         self._csp = STRICT_CONTENT_SECURITY_POLICY.encode('ascii')
+        self._hsts = STRICT_TRANSPORT_SECURITY.encode('ascii')
 
     async def __call__(self, scope, receive, send):
         if scope.get('type') != 'http':
             await self.application(scope, receive, send)
             return
 
+        is_https = str(scope.get('scheme', '')).casefold() == 'https'
+
         async def send_with_policy(message):
             if message.get('type') == 'http.response.start':
                 headers = [
                     (name, value)
                     for name, value in message.get('headers', [])
-                    if name.lower() != b'content-security-policy'
+                    if name.lower() not in {
+                        b'content-security-policy',
+                        b'strict-transport-security',
+                    }
                 ]
                 headers.append((b'content-security-policy', self._csp))
+                if is_https:
+                    headers.append((b'strict-transport-security', self._hsts))
                 message = {**message, 'headers': headers}
             await send(message)
 
