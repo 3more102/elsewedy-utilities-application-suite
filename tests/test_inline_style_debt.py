@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / 'static'
 APP_JS = STATIC / 'app.js'
 INDEX = STATIC / 'index.html'
+STYLES_CSS = STATIC / 'styles.css'
 
 STYLE_ATTRIBUTE = re.compile(r'\bstyle\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
 DIRECT_STYLE_API = re.compile(
@@ -17,16 +18,11 @@ DIRECT_STYLE_API = re.compile(
     re.IGNORECASE,
 )
 
-# Transitional debt inherited from the monolithic renderer. Static values should
-# move to CSS classes; the dynamic values require dedicated render refactors
-# before production can safely drop style-src 'unsafe-inline'.
-ALLOWED_STATIC_STYLES = {
-    'margin-top:14px',
-    'margin-top:12px',
-    'margin-top:15px',
-    'grid-template-columns:1fr 1fr',
-    'display:flex;gap:8px;align-items:center;font-size:11px;margin-top:10px',
-}
+# Fixed legacy values have been migrated to stylesheet-backed data hooks. The
+# remaining CSP debt is dynamic rendering only: charts, GIS coordinates and
+# progress widths that require dedicated renderer refactors before production can
+# safely drop style-src 'unsafe-inline'.
+ALLOWED_STATIC_STYLES: set[str] = set()
 
 
 def _allowed_app_style(value: str) -> bool:
@@ -44,6 +40,19 @@ def _allowed_app_style(value: str) -> bool:
 def test_inline_style_debt_is_confined_to_known_app_renderer_patterns():
     assert not STYLE_ATTRIBUTE.findall(INDEX.read_text(encoding='utf-8'))
 
+    app_source = APP_JS.read_text(encoding='utf-8')
+    styles_css = STYLES_CSS.read_text(encoding='utf-8')
+    fixed_style_hooks = {
+        'mt14': 'margin-top:14px',
+        'mt12': 'margin-top:12px',
+        'mt15': 'margin-top:15px',
+        'grid2': 'grid-template-columns:1fr 1fr',
+        'inline-check': 'display:flex;gap:8px;align-items:center;font-size:11px;margin-top:10px',
+    }
+    for hook, declaration in fixed_style_hooks.items():
+        assert f'data-csp-style="{hook}"' in app_source
+        assert f'[data-csp-style="{hook}"]{{{declaration}}}' in styles_css
+
     total = 0
     unexpected: list[tuple[str, str]] = []
     for path in sorted(STATIC.glob('*.js')):
@@ -56,9 +65,9 @@ def test_inline_style_debt_is_confined_to_known_app_renderer_patterns():
         unexpected.extend((path.name, value) for value in styles if not _allowed_app_style(value))
 
     assert not unexpected, unexpected
-    # The measured baseline is 26 source attributes. Keep that exact non-growth
-    # ceiling while allowing future refactors to reduce the count toward zero.
-    assert total <= 26, f'inline style debt grew to {total} app.js attributes'
+    # PR #101 removed 22 fixed source attributes from the measured baseline of
+    # 26. Only four dynamic source attributes remain; freeze that reduced debt.
+    assert total <= 4, f'inline style debt grew to {total} app.js attributes'
 
 
 def test_frontend_does_not_add_direct_dom_style_mutation_apis():
