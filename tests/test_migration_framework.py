@@ -4,12 +4,23 @@ import sqlite3
 
 import pytest
 
+from app import auth as auth_module
 from app import database as database_module
-from app.migrations import MigrationError, migration_status, run_pending_migrations
+from app.migrations import (
+    DEMO_DEFAULT_CREDENTIALS,
+    MigrationError,
+    initialize_database,
+    migration_status,
+    run_pending_migrations,
+)
 
 
 def _cheap_hash(password: str) -> str:
     return f'test${password}'
+
+
+def _cheap_verify(password: str, stored: str) -> bool:
+    return stored == _cheap_hash(password)
 
 
 def _point_database_at(monkeypatch, path) -> None:
@@ -87,3 +98,40 @@ def test_runner_refuses_database_newer_than_application(tmp_path, monkeypatch):
     with pytest.raises(MigrationError, match='newer than this application'):
         with database_module.db() as conn:
             run_pending_migrations(conn, backend='sqlite', target_version=10)
+
+
+def test_production_bootstrap_requires_strong_admin_secret(tmp_path, monkeypatch):
+    _point_database_at(monkeypatch, tmp_path / 'production-missing-secret.db')
+    monkeypatch.setenv('EUAS_ENV', 'production')
+    monkeypatch.delenv('EUAS_BOOTSTRAP_ADMIN_PASSWORD', raising=False)
+
+    with pytest.raises(MigrationError, match='EUAS_BOOTSTRAP_ADMIN_PASSWORD'):
+        initialize_database(_cheap_hash)
+
+
+def test_production_bootstrap_never_persists_packaged_demo_passwords(tmp_path, monkeypatch):
+    path = tmp_path / 'production-safe-seed.db'
+    _point_database_at(monkeypatch, path)
+    secret = 'Production-bootstrap-secret-2026!'
+    monkeypatch.setenv('EUAS_ENV', 'production')
+    monkeypatch.setenv('EUAS_BOOTSTRAP_ADMIN_PASSWORD', secret)
+    monkeypatch.setattr(auth_module, 'verify_password', _cheap_verify)
+
+    result = initialize_database(_cheap_hash)
+    hardening = result['credential_hardening']
+    assert hardening['production'] is True
+    assert hardening['fresh_admin_initialized'] is True
+
+    with sqlite3.connect(path) as raw:
+        raw.row_factory = sqlite3.Row
+        users = {
+            row['username']: row['password_hash']
+            for row in raw.execute(
+                'SELECT username,password_hash FROM users WHERE active=1'
+            ).fetchall()
+        }
+
+    assert users['omar'] == _cheap_hash(secret)
+    for username, packaged_password in DEMO_DEFAULT_CREDENTIALS.items():
+        if username in users:
+            assert users[username] != _cheap_hash(packaged_password)
