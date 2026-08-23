@@ -26,6 +26,7 @@ from apps.integrations import IntegrationKeyNotFound, create_integration_api_key
 from apps.telemetry import TelemetryChannelNotFound, TelemetryValidationError, ingest_batch as ingest_telemetry_batch, quality_summary as _telemetry_quality_summary, readings as telemetry_reading_rows, telemetry_series as _telemetry_series
 from apps.alarm_correlation import correlate_alarm as correlate_alarm_record, graph_distance as _graph_distance, incident_member_summary as correlation_incident_member_summary, refresh_incident as refresh_correlated_incident, refresh_incidents_for_alarm as refresh_correlated_incidents_for_alarm, topology_graph as _topology_graph
 from apps.alarms import AlarmNotFound as OperationalAlarmNotFound, InvalidAlarmTransition, acknowledge_alarm as acknowledge_alarm_record, close_alarm as close_alarm_record, evaluate_telemetry_alarm as evaluate_alarm_record
+from apps.condition_monitoring import ConditionRuleError, condition_matches as _cbm_condition, threshold_text as _cbm_rule_threshold_text, validate_rule as validate_condition_rule
 from api.middleware import security_headers
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
@@ -498,25 +499,6 @@ def _validate_rcm_payload(conn, fmea:dict, data:dict, require_ready:bool=False):
     if require_ready and strategy=='Time-Based' and not pm_id:
         raise HTTPException(422,'Time-Based RCM strategies require a linked active maintenance plan before submission')
     return True
-
-def _cbm_condition(rule:dict, value:float):
-    op=str(rule.get('operator') or '').strip()
-    low=rule.get('threshold_low'); high=rule.get('threshold_high')
-    low=float(low) if low is not None else None; high=float(high) if high is not None else None
-    if op=='>=': return low is not None and value>=low
-    if op=='>': return low is not None and value>low
-    if op=='<=': return low is not None and value<=low
-    if op=='<': return low is not None and value<low
-    if op=='between': return low is not None and high is not None and low<=value<=high
-    if op=='outside': return low is not None and high is not None and (value<low or value>high)
-    return False
-
-def _cbm_rule_threshold_text(rule:dict):
-    op=rule.get('operator');low=rule.get('threshold_low');high=rule.get('threshold_high')
-    if op in ('>=','>','<=','<'): return f"{op} {low:g}" if low is not None else op
-    if op=='between': return f"between {low:g} and {high:g}"
-    if op=='outside': return f"outside {low:g} to {high:g}"
-    return str(op or '')
 
 def _create_cbm_work_order(conn, rule:dict, channel:dict, event_no:str, value:float, actor_id:int):
     asset=get_or_404(conn,'SELECT id,asset_no,name,location_id FROM assets WHERE id=?',(channel['asset_id'],),'CBM asset not found')
@@ -1500,14 +1482,11 @@ def telemetry_series(channel_id:int,hours:int=Query(24,ge=1,le=8760),bucket_minu
         return {'channel':channel,'hours':hours,'bucket_minutes':bucket_minutes,'points':_telemetry_series(conn,channel_id,hours,bucket_minutes)}
 
 def _validate_cbm_rule_payload(operator, threshold_low, threshold_high, severity, action_type, work_priority):
-    if operator not in ('>=','>','<=','<','between','outside'):raise HTTPException(422,'CBM operator must be one of >=, >, <=, <, between, outside')
-    if operator in ('>=','>','<=','<') and threshold_low is None:raise HTTPException(422,'threshold_low is required for this CBM operator')
-    if operator in ('between','outside'):
-        if threshold_low is None or threshold_high is None:raise HTTPException(422,'Both threshold_low and threshold_high are required for range CBM rules')
-        if float(threshold_high)<=float(threshold_low):raise HTTPException(422,'threshold_high must be greater than threshold_low')
-    if severity not in ('Info','Warning','Critical'):raise HTTPException(422,'CBM severity must be Info, Warning or Critical')
-    if action_type not in ('Recommendation','WorkOrder'):raise HTTPException(422,'CBM action_type must be Recommendation or WorkOrder')
-    if work_priority not in ('Low','Medium','High','Critical','Emergency'):raise HTTPException(422,'Invalid CBM work priority')
+    try:
+        validate_condition_rule(operator,threshold_low,threshold_high,severity,action_type,work_priority)
+    except ConditionRuleError as exc:
+        raise HTTPException(422,str(exc))
+
 
 @app.get('/api/reliability/failure-modes')
 def failure_modes(active_only:bool=False,user=Depends(current_user)):
