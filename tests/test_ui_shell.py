@@ -11,6 +11,8 @@ UX_JS = ROOT / "static" / "ux-enhancements.js"
 DASHBOARD_JS = ROOT / "static" / "dashboard-enhancements.js"
 PRODUCTIVITY_CSS = ROOT / "static" / "productivity-enhancements.css"
 PRODUCTIVITY_JS = ROOT / "static" / "productivity-enhancements.js"
+OPERATIONAL_CSS = ROOT / "static" / "operational-enhancements.css"
+OPERATIONAL_JS = ROOT / "static" / "operational-enhancements.js"
 
 
 def test_ui_shell_keeps_application_hooks_and_refresh_layer():
@@ -23,14 +25,18 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert DASHBOARD_JS.exists()
     assert PRODUCTIVITY_CSS.exists()
     assert PRODUCTIVITY_JS.exists()
+    assert OPERATIONAL_CSS.exists()
+    assert OPERATIONAL_JS.exists()
     assert 'href="/static/styles.css"' in html
     assert 'href="/static/ui-refresh.css"' in html
     assert 'href="/static/ux-enhancements.css"' in html
     assert 'href="/static/productivity-enhancements.css"' in html
+    assert 'href="/static/operational-enhancements.css"' in html
     assert 'src="/static/app.js"' in html
     assert 'src="/static/ux-enhancements.js"' in html
     assert 'src="/static/dashboard-enhancements.js"' in html
     assert 'src="/static/productivity-enhancements.js"' in html
+    assert 'src="/static/operational-enhancements.js"' in html
 
     required_ids = {
         "login",
@@ -84,6 +90,8 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     dashboard_js = DASHBOARD_JS.read_text(encoding="utf-8")
     productivity_css = PRODUCTIVITY_CSS.read_text(encoding="utf-8")
     productivity_js = PRODUCTIVITY_JS.read_text(encoding="utf-8")
+    operational_css = OPERATIONAL_CSS.read_text(encoding="utf-8")
+    operational_js = OPERATIONAL_JS.read_text(encoding="utf-8")
 
     assert ".nav-btn.active" in css
     assert ":focus-visible" in css
@@ -137,3 +145,19 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "event.altKey" in productivity_js
     assert "Assets & Maintenance" in productivity_js
     assert "MutationObserver" in productivity_js
+
+    assert ".network-activity" in operational_css
+    assert ".connection-status" in operational_css
+    assert ".operational-error-state" in operational_css
+    assert "form[data-euas-submitting=\"true\"]" in operational_css
+    assert ".toast.toast-error" in operational_css
+    assert "@media(prefers-reduced-motion:reduce)" in operational_css
+
+    assert "installFetchTracking" in operational_js
+    assert "markFormBusy" in operational_js
+    assert "clearSubmittingForms" in operational_js
+    assert "decorateContentState" in operational_js
+    assert "navigator.onLine" in operational_js
+    assert "operational-retry" in operational_js
+    assert "data-euas-submitting" in operational_js
+    assert "MutationObserver" in operational_js
