@@ -4,51 +4,44 @@ Factual state only. Update after each wave; do not treat as a status substitute.
 
 ## Git state (last verified)
 
-- Branch: `oxalpha/euas-next-wave`
-- HEAD: `047d44a` (docs wave on top of fully-green `e1f5de9`)
-- origin/main at last fetch: `ca632ad` (PR #47 telemetry integrity merged)
+- Branch: `oxalpha/euas-hardening-wave-3`
+- HEAD: `ade4e25`
+- origin/main at last fetch: `0541a47` (PR #49 merged by maintainer)
 - Working tree: clean
-- PR: #48 OPEN (Draft), MERGEABLE, all 7 CI gates green on `e1f5de9`
+- PR: #50 OPEN (Draft) — all 7 CI gates green on `460d514`; rerun for `ade4e25` in flight
+- PR #49 was merged upstream during this session; branch `oxalpha/euas-hardening-wave-2` is historical
 
-## Completed milestones this branch
+## Completed milestones this wave
 
-1. `98414b2` telemetry temporal-integrity port (superset of PR #47: explicit
-   `allow_equal` contract + future-dated-marker synthesis in
-   `_implicit_capture_after`; reconciled via merge `bee0f7a`)
-2. `2a62475` dependency floors: fastapi 0.141.1, uvicorn 0.52.4, httpx 0.28.1,
-   psycopg 3.3.4, pytest 9.1.1 (pip-audit clean)
-3. `78e9ed7` actions/checkout + setup-python v7 (isolated maintenance)
-4. `e784945` approval queue/delegation routes moved into `app/approval_store.py`
-   (`install_approval_routes`); queue visibility ceiling regression-tested
-5. `23c7896` maintenance-plan routes moved into `app/pm_store.py`
-6. `e1f5de9` outage close terminality fix (`app/outage_store.py`): conditional
-   one-generation claim; duplicate audits/events impossible; asset-status
-   restore post-claim in-transaction
-7. `047d44a` hardening-status evidence docs
+1. `2553d41` task-toggle transition claims (merged via PR #49)
+2. `9924c4b` Events Stalled operator KPI (merged via PR #49)
+3. `f704129` delegation security negative tests (merged via PR #49)
+4. `bfe6361` work-order note compare-and-set append (cherry-picked to wave-3 after PR #49 merged)
+5. `460d514` same-second CAS collision fix: claim includes thread contents;
+   reproduced by flaky concurrency test, 10/10 stable reruns
+6. `ade4e25` audit smoke reuses shared canonical chain validator
+
+## Reviews concluded with NO change (evidence-based)
+
+- Outbox lease/fencing: `(status, attempts)` generation tokens already fence
+  every stale-completion path (cases A/B/D/E/G); covered by unit tests and the
+  12-worker PostgreSQL smoke.
+- Scheduler singleton/failover: existing tests + CI gate cover the invariants;
+  nothing new found.
+- Audit write concurrency: chain-lock row + PG smoke validated post-refactor.
 
 ## Validation actually run
 
-- Local: pytest -q = 160 passed; compileall clean; engineering evidence check
-  exit 0 (routes 149 / methods 167 / tables 61 / indexes 38 unchanged);
-  SQLite HTTP smoke PASS; telemetry ordering+integrity and outbox concurrency
-  smokes PASS locally (SQLite adapter).
-- GitHub: all 7 required checks pass on `e1f5de9` (SQLite 3.11/3.12,
-  PostgreSQL 16 integration, dependency audit, CodeQL, container smoke +
-  Trivy HIGH/CRITICAL).
+- pytest -q = 169 passed on final head
+- compileall clean; engineering evidence check exit 0 (routes 149 / methods 167)
+- audit concurrency smoke PASS locally (SQLite adapter, 16 workers)
 
 ## Remaining priority queue
 
-1. Await review/merge decision on PR #48 (do not self-merge).
-2. Workflow invariants: work-order task toggle double-execution duplicates
-   TASK audits (minor); outage open remains insert-based (low risk).
-3. Durable events: boundary review current main for lease/fencing language;
-   exhausted-retry + metrics already done.
-4. Read-model correctness: dashboards should distinguish attempt-exhausted
-   outbox backlog (API/metrics exist; UI panel not yet updated).
-5. Asset/automation/admin read-model decomposition from application.py.
-6. Python 3.14-slim Docker bump deferred — no local Docker to validate the
-   container gate; do not commit unvalidated.
-
-## Blockers
-
-None active. PostgreSQL 16 validation relies on GitHub CI (no local PG).
+1. Await review/merge of PR #50 (do not self-merge).
+2. Additive pagination for unbounded operational lists (/api/alarms,
+   /api/outages) — additive params only, preserve response shapes.
+3. Asset/admin read-model decomposition from application.py (cohesive groups).
+4. Python 3.14-slim Docker bump — still blocked (no local Docker); isolated
+   dependency-only branch if attempted.
+5. UI: outbox table could badge exhausted rows (backend data already present).
