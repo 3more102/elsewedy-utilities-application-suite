@@ -4,7 +4,7 @@
   "application_version": "3.9.0",
   "database_backend": "sqlite",
   "explicit_indexes": 38,
-  "relational_tables": 61,
+  "relational_tables": 62,
   "schema_version": 10,
-  "source_test_definitions": 173
+  "source_test_definitions": 181
 }

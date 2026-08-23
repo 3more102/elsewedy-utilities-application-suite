@@ -101,4 +101,10 @@ def append_audit(
             digest,
         ),
     )
+    anchored = conn.execute(
+        'UPDATE audit_chain_anchor SET head_hash=?,record_count=record_count+1 WHERE id=?',
+        (digest, AUDIT_LOCK_ID),
+    )
+    if int(anchored.rowcount or 0) != 1:
+        raise RuntimeError('audit chain anchor is not initialized')
     return digest
