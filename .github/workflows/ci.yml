@@ -31,6 +31,7 @@ jobs:
           node --check static/operational-enhancements.js
           node --check static/workspace-preferences.js
           node --check static/command-palette.js
+          node --check static/navigation-history.js
           node --check static/sw.js
 
       - name: Validate web manifest JSON
