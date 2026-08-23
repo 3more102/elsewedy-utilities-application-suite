@@ -22,6 +22,7 @@ SERVICE_WORKER = ROOT / "static" / "sw.js"
 
 def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     html = INDEX.read_text(encoding="utf-8")
+    service_worker = SERVICE_WORKER.read_text(encoding="utf-8")
 
     assert BASE_CSS.exists()
     assert REFRESH_CSS.exists()
@@ -51,6 +52,11 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert 'src="/static/operational-enhancements.js"' in html
     assert 'src="/static/workspace-preferences.js"' in html
     assert 'src="/static/command-palette.js"' in html
+
+    html_assets = set(re.findall(r'(?:href|src)="(/static/[^"]+)"', html))
+    assert html_assets
+    for asset in sorted(html_assets):
+        assert f"'{asset}'" in service_worker, f'{asset} is missing from service-worker precache'
 
     required_ids = {
         "login",
@@ -211,6 +217,7 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "ArrowUp" in command_js
     assert "trapFocus" in command_js
     assert "rememberModule" in command_js
+    assert "nonRecentModules" in command_js
     assert "MutationObserver" in command_js
 
     assert "euas-shell-v3.9.0-ui8" in service_worker
