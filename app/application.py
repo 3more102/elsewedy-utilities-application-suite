@@ -579,12 +579,31 @@ def _run_reorder_scan(conn, actor_id:int):
         notify_once(conn,'Purchase requisition created',f'{no} created for {i["item_no"]}','Info',None,'procurement','procurement',no)
     return created
 
+def _run_kpi_refresh(conn, actor_id:int):
+    """Refresh active KPIs whose latest snapshot is older than their refresh interval."""
+    refreshed=0;failed=0
+    for d in rows(conn.execute('SELECT * FROM kpi_definitions WHERE active=1 ORDER BY code')):
+        last=_kpi_latest_snapshot(conn,d['id'])
+        if last:
+            try:
+                age_minutes=(datetime.now()-datetime.fromisoformat(str(last['calculated_at']))).total_seconds()/60.0
+                if age_minutes < max(1,int(d['refresh_minutes'] or 60)):
+                    continue
+            except ValueError:
+                pass
+        try:
+            evaluate_kpi(conn,d,actor_id=actor_id);refreshed+=1
+        except ValueError:
+            failed+=1
+    return {'refreshed':refreshed,'unsupported_source':failed}
+
 def _execute_automation(conn, actor_id:int, trigger_source='manual', as_of:Optional[str]=None):
     target=date.fromisoformat(as_of) if as_of else date.today();run_no=next_no(conn,'job_runs','run_no','JOB-',1)
     cur=conn.execute("INSERT INTO job_runs(run_no,trigger_source,status,actor_id,as_of,started_at) VALUES(?,?,'Running',?,?,?)",(run_no,trigger_source,actor_id,target.isoformat(),now()));run_id=cur.lastrowid
     conn.execute('SAVEPOINT automation_payload')
     try:
         pm=_generate_due_pm(conn,actor_id,target);reorders=_run_reorder_scan(conn,actor_id);sla=_run_sla_scan(conn,actor_id,target)
+        kpi_refresh=_run_kpi_refresh(conn,actor_id)
         overdue_alerts=0;warranty_alerts=0;contract_alerts=0;approval_alerts=0
         overdue=rows(conn.execute("SELECT * FROM work_orders WHERE target_finish IS NOT NULL AND target_finish<? AND status NOT IN ('Completed','Closed','Cancelled')",(target.isoformat(),)))
         for w in overdue:
@@ -608,7 +627,7 @@ def _execute_automation(conn, actor_id:int, trigger_source='manual', as_of:Optio
         expired=conn.execute('UPDATE approval_delegations SET active=0 WHERE active=1 AND end_at<?',(now(),)).rowcount
         outbox=_process_outbox(conn)
         health_avg=round(sum(x['score'] for x in health_results)/max(len(health_results),1),1)
-        summary={'pm_work_orders':len(pm),'reorder_requisitions':len(reorders),'overdue_alerts':overdue_alerts,'warranty_alerts':warranty_alerts,'contract_alerts':contract_alerts,'approval_alerts':approval_alerts,'sla_response_breaches':sla['response_breaches'],'sla_resolution_breaches':sla['resolution_breaches'],'asset_health_average':health_avg,'critical_health_assets':critical_health,'delegations_expired':expired,'outbox_delivered':outbox['delivered'],'outbox_failed':outbox['failed'],'outbox_skipped':outbox['skipped']}
+        summary={'pm_work_orders':len(pm),'reorder_requisitions':len(reorders),'overdue_alerts':overdue_alerts,'warranty_alerts':warranty_alerts,'contract_alerts':contract_alerts,'approval_alerts':approval_alerts,'sla_response_breaches':sla['response_breaches'],'sla_resolution_breaches':sla['resolution_breaches'],'asset_health_average':health_avg,'critical_health_assets':critical_health,'delegations_expired':expired,'outbox_delivered':outbox['delivered'],'outbox_failed':outbox['failed'],'outbox_skipped':outbox['skipped'],'kpi_refreshed':kpi_refresh['refreshed'],'kpi_unsupported_source':kpi_refresh['unsupported_source']}
         conn.execute('RELEASE SAVEPOINT automation_payload')
         conn.execute("UPDATE job_runs SET status='Succeeded',finished_at=?,summary_json=? WHERE id=?",(now(),json.dumps(summary),run_id));audit(conn,actor_id,'RUN','Automation',run_no,'',summary)
         return {'id':run_id,'run_no':run_no,'status':'Succeeded','as_of':target.isoformat(),'summary':summary}
