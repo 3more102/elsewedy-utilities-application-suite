@@ -220,7 +220,7 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "nonRecentModules" in command_js
     assert "MutationObserver" in command_js
 
-    assert "euas-shell-v3.9.0-ui9" in service_worker
+    assert "euas-shell-v3.9.0-ui10" in service_worker
     assert "'/static/command-palette.css'" in service_worker
     assert "'/static/command-palette.js'" in service_worker
     assert "'/static/workspace-preferences.css'" in service_worker
