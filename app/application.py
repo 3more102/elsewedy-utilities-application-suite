@@ -1588,13 +1588,13 @@ def receive_po(po_id:int,user=Depends(require_roles('admin','procurement','store
 # Outage close ownership lives in outage_store.py (terminal transition claim);
 # the read model and outage creation remain here.
 @app.get('/api/outages')
-def list_outages(status:str='',site_id:Optional[int]=None,asset_id:Optional[int]=None,user=Depends(current_user)):
+def list_outages(status:str='',site_id:Optional[int]=None,asset_id:Optional[int]=None,limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
     sql="""SELECT o.*,a.asset_no,a.name asset_name,s.site_code,s.name site_name,w.wo_no,u.full_name reported_by_name
       FROM asset_outages o JOIN assets a ON a.id=o.asset_id LEFT JOIN sites s ON s.id=o.site_id LEFT JOIN work_orders w ON w.id=o.work_order_id JOIN users u ON u.id=o.reported_by WHERE 1=1""";args=[]
     if status:sql+=' AND o.status=?';args.append(status)
     if site_id:sql+=' AND o.site_id=?';args.append(site_id)
     if asset_id:sql+=' AND o.asset_id=?';args.append(asset_id)
-    sql+=' ORDER BY o.start_at DESC,o.id DESC'
+    sql+=' ORDER BY o.start_at DESC,o.id DESC LIMIT ? OFFSET ?';args+=[limit,offset]
     with db() as conn:
         out=rows(conn.execute(sql,args));now_dt=datetime.now()
         for x in out:x['duration_hours']=round(_outage_overlap_hours(x['start_at'],x.get('end_at'),datetime(2000,1,1),now_dt),2)
