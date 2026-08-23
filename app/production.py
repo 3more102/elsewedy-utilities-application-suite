@@ -3,12 +3,16 @@
 The historical FastAPI application still emits a compatibility CSP that permits
 inline scripts. The browser shell no longer needs inline JavaScript, so the
 production entrypoint replaces that response header after the inner application
-stack has run. HTTPS responses also receive HSTS; plain HTTP responses do not,
-so local/reference deployments are not incorrectly marked as transport-secure.
-Development entrypoints remain unchanged.
+stack has run. The production stack also rejects untrusted Host headers before
+requests reach application routing. HTTPS responses receive HSTS; plain HTTP
+responses do not, so local/reference deployments are not incorrectly marked as
+transport-secure. Development entrypoints remain unchanged.
 """
 from __future__ import annotations
 
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from .config import ALLOWED_HOSTS
 from .main import app as _application
 
 
@@ -85,4 +89,18 @@ class ProductionSecurityHeaders:
         await self.application(scope, receive, send_with_policy)
 
 
-app = ProductionSecurityHeaders(_application)
+def _trusted_host_application(application):
+    if not ALLOWED_HOSTS:
+        raise RuntimeError('EUAS_ALLOWED_HOSTS must contain at least one trusted hostname')
+    if '*' in ALLOWED_HOSTS:
+        raise RuntimeError("EUAS_ALLOWED_HOSTS must not contain the unrestricted '*' wildcard")
+    return TrustedHostMiddleware(
+        application,
+        allowed_hosts=list(ALLOWED_HOSTS),
+        www_redirect=False,
+    )
+
+
+# Keep security headers outermost so even a rejected Host response receives the
+# production browser-security header set.
+app = ProductionSecurityHeaders(_trusted_host_application(_application))

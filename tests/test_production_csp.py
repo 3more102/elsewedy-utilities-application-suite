@@ -2,6 +2,8 @@ import asyncio
 import re
 from pathlib import Path
 
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
 from app.production import (
     PRODUCTION_BROWSER_HEADERS,
     PRODUCTION_ISOLATION_HEADERS,
@@ -38,6 +40,42 @@ def _run_wrapper(inner_headers, *, scheme='http'):
                 'method': 'GET',
                 'path': '/',
                 'scheme': scheme,
+            },
+            receive,
+            send,
+        )
+    )
+    return sent[0]
+
+
+def _run_trusted_host_wrapper(host: str):
+    async def inner(scope, receive, send):
+        await send({'type': 'http.response.start', 'status': 204, 'headers': []})
+        await send({'type': 'http.response.body', 'body': b''})
+
+    sent = []
+
+    async def receive():
+        return {'type': 'http.disconnect'}
+
+    async def send(message):
+        sent.append(message)
+
+    application = ProductionSecurityHeaders(
+        TrustedHostMiddleware(
+            inner,
+            allowed_hosts=['euas.example.com', '*.ops.example.com'],
+            www_redirect=False,
+        )
+    )
+    asyncio.run(
+        application(
+            {
+                'type': 'http',
+                'method': 'GET',
+                'path': '/',
+                'scheme': 'https',
+                'headers': [(b'host', host.encode('ascii'))],
             },
             receive,
             send,
@@ -133,16 +171,30 @@ def test_production_wrapper_replaces_browser_and_isolation_headers():
     assert headers[b'cross-origin-resource-policy'] == b'same-origin'
     assert headers[b'x-permitted-cross-domain-policies'] == b'none'
 
+    assert _run_trusted_host_wrapper('euas.example.com')['status'] == 204
+    assert _run_trusted_host_wrapper('north.ops.example.com')['status'] == 204
+    rejected = _run_trusted_host_wrapper('attacker.invalid')
+    assert rejected['status'] == 400
+    rejected_headers = {name.lower(): value for name, value in rejected['headers']}
+    assert rejected_headers[b'x-content-type-options'] == b'nosniff'
+    assert rejected_headers[b'x-frame-options'] == b'DENY'
+    assert rejected_headers[b'content-security-policy'] == STRICT_CONTENT_SECURITY_POLICY.encode('ascii')
+    assert rejected_headers[b'strict-transport-security'] == STRICT_TRANSPORT_SECURITY.encode('ascii')
+
 
 def test_production_entrypoint_matches_external_script_shell_contract():
     dockerfile = (ROOT / 'Dockerfile').read_text(encoding='utf-8')
     html = (ROOT / 'static' / 'index.html').read_text(encoding='utf-8')
     postgres_smoke = (ROOT / 'scripts' / 'postgres_smoke_test.py').read_text(encoding='utf-8')
+    production_source = (ROOT / 'app' / 'production.py').read_text(encoding='utf-8')
 
     assert '"app.production:app"' in dockerfile
     assert '"app.main:app"' not in dockerfile
     assert "'app.production:app'" in postgres_smoke
     assert "'app.main:app'" not in postgres_smoke
+    assert 'TrustedHostMiddleware' in production_source
+    assert 'www_redirect=False' in production_source
+    assert "must not contain the unrestricted '*' wildcard" in production_source
 
     script_tags = re.findall(r'<script\b[^>]*>.*?</script>', html, flags=re.I | re.S)
     assert script_tags
