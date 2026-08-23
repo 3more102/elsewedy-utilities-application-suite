@@ -43,4 +43,6 @@ RUN mkdir -p /app/data /app/uploads \
 USER euas
 EXPOSE 8000
 
-CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--proxy-headers"]
+# Production runs through app.production so the outermost ASGI layer can enforce
+# the deployment-only strict CSP after the compatibility middleware stack runs.
+CMD ["uvicorn","app.production:app","--host","0.0.0.0","--port","8000","--proxy-headers"]
