@@ -1,5 +1,6 @@
 """EUAS inventory stock and transaction application."""
 
+from .reservations import reservation_rows, sync_reserved_stock, work_order_parts_readiness
 from .transactions import (
     InventoryItemNotFound,
     InventoryTransactionConflict,
@@ -8,6 +9,9 @@ from .transactions import (
 )
 
 __all__ = [
+    'reservation_rows',
+    'sync_reserved_stock',
+    'work_order_parts_readiness',
     'InventoryItemNotFound',
     'InventoryTransactionConflict',
     'InventoryTransactionInvalid',

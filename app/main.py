@@ -17,7 +17,7 @@ from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow
 from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record
 from apps.maintenance import ACTION_ROLES, TRANSITIONS, InvalidWorkTransition, WorkTransitionForbidden, backfill_work_order_slas as _backfill_work_order_slas, ensure_work_sla as _ensure_work_sla, mark_sla_resolution as _mark_sla_resolution, mark_sla_response as _mark_sla_response, transition_target, validate_transition_actor
 from apps.procurement import InvalidProcurementTransition, purchase_order_receive_target, requisition_target
-from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction
+from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction, reservation_rows as _reservation_rows, sync_reserved_stock as _sync_reserved_stock, work_order_parts_readiness as _work_order_parts_readiness
 from apps.inspections import corrective_required, inspection_result
 from apps.hse import is_high_risk, risk_score, validate_hse_status
 from apps.projects import InvalidProjectTask, normalize_task_changes, recalculate_project_progress
@@ -28,6 +28,9 @@ from apps.alarm_correlation import correlate_alarm as correlate_alarm_record, gr
 from apps.alarms import AlarmNotFound as OperationalAlarmNotFound, InvalidAlarmTransition, acknowledge_alarm as acknowledge_alarm_record, close_alarm as close_alarm_record, evaluate_telemetry_alarm as evaluate_alarm_record
 from apps.condition_monitoring import ConditionRuleError, condition_matches as _cbm_condition, threshold_text as _cbm_rule_threshold_text, validate_rule as validate_condition_rule
 from apps.notifications import notify, notify_once
+from apps.workforce import forecast_bucket_start as _forecast_bucket_start, parse_days_of_week as _parse_days_of_week, week_capacity as _workforce_week_capacity
+from apps.scheduling import maintenance_forecast as _maintenance_forecast
+from apps.preventive_maintenance import generate_due_work_orders as _generate_due_pm
 from apps.approvals import create_approval, resolve_approval
 from apps.cbm import evaluate_rules as evaluate_cbm_rules
 from apps.reliability import asset_reliability_rows as _asset_reliability_rows, outage_overlap_hours as _outage_overlap_hours, site_reliability_rows as _site_reliability_rows
@@ -122,151 +125,6 @@ def _delegation_active(conn, approval, user_id:int):
     r=conn.execute("SELECT id FROM approval_delegations WHERE delegator_user_id=? AND delegate_user_id=? AND active=1 AND start_at<=? AND end_at>=? AND (module='*' OR module=?) ORDER BY id DESC LIMIT 1",
                    (assigned,user_id,stamp,stamp,approval.get('module') or '')).fetchone()
     return bool(r)
-
-def _forecast_bucket_start(d:date):
-    return d-timedelta(days=d.weekday())
-
-def _parse_days_of_week(value):
-    result=set()
-    for raw in str(value or '0,1,2,3,4').split(','):
-        try:
-            n=int(raw.strip())
-            if 0<=n<=6:result.add(n)
-        except Exception:
-            pass
-    return result or {0,1,2,3,4}
-
-def _workforce_week_capacity(conn, week_start:date, site_id:Optional[int]=None):
-    week_end=week_start+timedelta(days=6)
-    sql="""SELECT tp.*,u.full_name,u.username,c.craft_code,c.name craft_name,s.site_code,s.name site_name
-             FROM technician_profiles tp JOIN users u ON u.id=tp.user_id JOIN roles r ON r.id=u.role_id
-             LEFT JOIN crafts c ON c.id=tp.craft_id LEFT JOIN sites s ON s.id=tp.home_site_id
-             WHERE tp.active=1 AND u.active=1 AND r.code='technician'"""
-    args=[]
-    if site_id is not None:sql+=' AND tp.home_site_id=?';args.append(site_id)
-    techs=rows(conn.execute(sql,args))
-    details=[];craft_capacity={};total=0.0
-    for t in techs:
-        assignments=rows(conn.execute("""SELECT tsa.*,st.paid_hours,st.shift_code,st.name shift_name FROM technician_shift_assignments tsa
-          JOIN shift_templates st ON st.id=tsa.shift_id WHERE tsa.user_id=? AND tsa.active=1 AND st.active=1
-          AND tsa.effective_from<=? AND (tsa.effective_to IS NULL OR tsa.effective_to>=?)""",(t['user_id'],week_end.isoformat(),week_start.isoformat())))
-        scheduled=0.0
-        if assignments:
-            for offset in range(7):
-                day=week_start+timedelta(days=offset);day_hours=0.0
-                for a in assignments:
-                    if day.weekday() not in _parse_days_of_week(a.get('days_of_week')):continue
-                    if str(a['effective_from'])[:10]>day.isoformat():continue
-                    if a.get('effective_to') and str(a['effective_to'])[:10]<day.isoformat():continue
-                    day_hours=max(day_hours,float(a.get('paid_hours') or 0))
-                scheduled+=day_hours
-        else:
-            scheduled=float(t.get('weekly_hours') or 40)
-        absence=0.0
-        absences=rows(conn.execute("""SELECT * FROM technician_absences WHERE user_id=? AND status='Approved'
-          AND start_date<=? AND end_date>=?""",(t['user_id'],week_end.isoformat(),week_start.isoformat())))
-        for a in absences:
-            try:a_start=date.fromisoformat(str(a['start_date'])[:10]);a_end=date.fromisoformat(str(a['end_date'])[:10])
-            except Exception:continue
-            for offset in range(7):
-                day=week_start+timedelta(days=offset)
-                if a_start<=day<=a_end and day.weekday()<5:absence+=float(a.get('hours_per_day') or 8)
-        available=max(0.0,scheduled-absence)*max(0.0,min(100.0,float(t.get('efficiency_pct') or 100)))/100.0
-        available=round(available,1);total+=available
-        craft=t.get('craft_code') or 'UNASSIGNED';craft_capacity[craft]=round(craft_capacity.get(craft,0.0)+available,1)
-        details.append({'user_id':t['user_id'],'username':t['username'],'name':t['full_name'],'craft_code':t.get('craft_code'),'craft_name':t.get('craft_name'),
-                        'site_code':t.get('site_code'),'site_name':t.get('site_name'),'scheduled_hours':round(scheduled,1),'absence_hours':round(absence,1),
-                        'efficiency_pct':float(t.get('efficiency_pct') or 100),'available_hours':available})
-    # Compatibility fallback for upgraded databases that do not yet have workforce profiles.
-    if not techs:
-        q="SELECT COUNT(*) FROM users u JOIN roles r ON r.id=u.role_id WHERE r.code='technician' AND u.active=1"
-        count=int(conn.execute(q).fetchone()[0]);total=float(count)*40.0
-        return {'technicians':count,'capacity_hours':round(total,1),'craft_capacity':{'UNASSIGNED':round(total,1)},'details':[],'source':'role_fallback'}
-    return {'technicians':len(techs),'capacity_hours':round(total,1),'craft_capacity':craft_capacity,'details':details,'source':'workforce_schedule'}
-
-def _reservation_rows(conn, work_order_id:int):
-    return rows(conn.execute("""SELECT r.*,i.item_no,i.name item_name,i.unit,i.current_stock,i.reserved_stock,u.full_name reserved_by_name
-      FROM inventory_reservations r JOIN inventory_items i ON i.id=r.inventory_item_id JOIN users u ON u.id=r.reserved_by
-      WHERE r.work_order_id=? ORDER BY r.id DESC""",(work_order_id,)))
-
-def _sync_reserved_stock(conn, item_id:int):
-    reserved=conn.execute("SELECT COALESCE(SUM(quantity-issued_quantity),0) FROM inventory_reservations WHERE inventory_item_id=? AND status IN ('Reserved','Partially Issued')",(item_id,)).fetchone()[0] or 0
-    conn.execute('UPDATE inventory_items SET reserved_stock=? WHERE id=?',(max(0.0,float(reserved)),item_id))
-    return max(0.0,float(reserved))
-
-def _work_order_parts_readiness(conn, work_order_id:int):
-    reqs=rows(conn.execute("""SELECT r.*,i.item_no,i.name,i.unit,i.current_stock,i.reserved_stock,w.warehouse_code,w.name warehouse_name
-      FROM work_order_requirements r JOIN inventory_items i ON i.id=r.inventory_item_id JOIN warehouses w ON w.id=i.warehouse_id
-      WHERE r.work_order_id=? AND r.status<>'Cancelled' ORDER BY i.item_no""",(work_order_id,)))
-    if not reqs:return {'state':'Unknown','ready':None,'requirements':[],'shortage_items':0,'reserved_items':0}
-    shortages=0;reserved_items=0
-    for r in reqs:
-        issued=float(conn.execute('SELECT COALESCE(SUM(quantity),0) FROM work_order_materials WHERE work_order_id=? AND inventory_item_id=?',(work_order_id,r['inventory_item_id'])).fetchone()[0] or 0)
-        reserved=float(conn.execute("SELECT COALESCE(SUM(quantity-issued_quantity),0) FROM inventory_reservations WHERE work_order_id=? AND inventory_item_id=? AND status IN ('Reserved','Partially Issued')",(work_order_id,r['inventory_item_id'])).fetchone()[0] or 0)
-        unreserved=max(0.0,float(r['current_stock'])-float(r['reserved_stock']))
-        remaining=max(0.0,float(r['quantity'])-issued)
-        secured=reserved+unreserved
-        r['available_stock']=round(unreserved,3);r['reserved_for_work']=round(reserved,3);r['issued_quantity']=round(issued,3);r['remaining_required']=round(remaining,3)
-        r['shortage']=round(max(0.0,remaining-secured),3);r['ready']=r['shortage']<=0
-        if reserved>0:reserved_items+=1
-        if not r['ready']:shortages+=1
-    return {'state':'Ready' if shortages==0 else 'Shortage','ready':shortages==0,'requirements':reqs,'shortage_items':shortages,'reserved_items':reserved_items}
-
-def _maintenance_forecast(conn,horizon_days:int=90,site_id:Optional[int]=None):
-    start=date.today();end=start+timedelta(days=horizon_days)
-    weeks={}
-    cursor=_forecast_bucket_start(start)
-    while cursor<=end:
-        cap=_workforce_week_capacity(conn,cursor,site_id)
-        weeks[cursor.isoformat()]={'week_start':cursor.isoformat(),'pm_jobs':0,'backlog_jobs':0,'demand_hours':0.0,'capacity_hours':cap['capacity_hours'],
-                                   'technicians':cap['technicians'],'capacity_source':cap['source'],'parts_ready_jobs':0,'parts_shortage_jobs':0,'parts_unknown_jobs':0,
-                                   'craft_demand':{},'craft_capacity':cap['craft_capacity']}
-        cursor+=timedelta(days=7)
-    site_clause='';args=[]
-    if site_id is not None:
-        site_clause=' AND l.site_id=?';args.append(site_id)
-    pms=rows(conn.execute("SELECT p.*,a.asset_no,l.site_id FROM maintenance_plans p JOIN assets a ON a.id=p.asset_id LEFT JOIN locations l ON l.id=a.location_id WHERE p.active=1 AND p.next_due IS NOT NULL"+site_clause,args))
-    for p in pms:
-        try:d=date.fromisoformat(str(p['next_due'])[:10])
-        except Exception:continue
-        if start<=d<=end:
-            key=_forecast_bucket_start(d).isoformat();b=weeks.get(key)
-            if b:
-                b['pm_jobs']+=1;b['demand_hours']+=2.0;b['parts_unknown_jobs']+=1
-    wargs=[];wsite=''
-    if site_id is not None:wsite=' AND l.site_id=?';wargs.append(site_id)
-    work=rows(conn.execute("SELECT w.*,l.site_id FROM work_orders w LEFT JOIN locations l ON l.id=w.location_id WHERE w.status NOT IN ('Completed','Closed','Cancelled')"+wsite,wargs))
-    for w in work:
-        raw=w.get('target_start') or w.get('target_finish') or start.isoformat()
-        try:d=date.fromisoformat(str(raw)[:10])
-        except Exception:d=start
-        if d<start:d=start
-        if d>end:continue
-        key=_forecast_bucket_start(d).isoformat();b=weeks.get(key)
-        if not b:continue
-        demand=float(w.get('estimated_hours') or 2.0);b['backlog_jobs']+=1;b['demand_hours']+=demand
-        readiness=_work_order_parts_readiness(conn,w['id'])
-        if readiness['state']=='Ready':b['parts_ready_jobs']+=1
-        elif readiness['state']=='Shortage':b['parts_shortage_jobs']+=1
-        else:b['parts_unknown_jobs']+=1
-        crafts=rows(conn.execute("""SELECT c.craft_code,r.planned_hours FROM work_order_craft_requirements r JOIN crafts c ON c.id=r.craft_id WHERE r.work_order_id=?""",(w['id'],)))
-        if crafts:
-            for c in crafts:b['craft_demand'][c['craft_code']]=round(b['craft_demand'].get(c['craft_code'],0.0)+float(c['planned_hours'] or 0),1)
-        else:b['craft_demand']['UNASSIGNED']=round(b['craft_demand'].get('UNASSIGNED',0.0)+demand,1)
-    out=[]
-    for b in weeks.values():
-        b['demand_hours']=round(b['demand_hours'],1);capacity=float(b['capacity_hours'] or 0);b['utilization_pct']=round(100*b['demand_hours']/capacity,1) if capacity else (100.0 if b['demand_hours'] else 0.0)
-        b['capacity_state']='Over Capacity' if b['utilization_pct']>100 else 'High' if b['utilization_pct']>=80 else 'Available'
-        craft_states={}
-        for code,demand in b['craft_demand'].items():
-            cap=float(b['craft_capacity'].get(code,0));craft_states[code]={'demand_hours':round(demand,1),'capacity_hours':round(cap,1),'shortage_hours':round(max(0,demand-cap),1)}
-        b['craft_states']=craft_states
-        out.append(b)
-    total_capacity=round(sum(x['capacity_hours'] for x in out),1)
-    return {'horizon_days':horizon_days,'technicians':max([x['technicians'] for x in out] or [0]),'weekly_capacity_hours':round(out[0]['capacity_hours'],1) if out else 0,'capacity_source':out[0]['capacity_source'] if out else 'none','weeks':out,
-            'summary':{'pm_jobs':sum(x['pm_jobs'] for x in out),'backlog_jobs':sum(x['backlog_jobs'] for x in out),'demand_hours':round(sum(x['demand_hours'] for x in out),1),
-                       'capacity_hours':total_capacity,'peak_utilization_pct':max([x['utilization_pct'] for x in out] or [0]),
-                       'parts_shortage_jobs':sum(x['parts_shortage_jobs'] for x in out),'parts_ready_jobs':sum(x['parts_ready_jobs'] for x in out)}}
 
 def get_or_404(conn, sql, args, message='Record not found'):
     r=conn.execute(sql,args).fetchone()
@@ -475,42 +333,9 @@ def _process_outbox(conn):
         request_factory=urllib_request.Request,
     )
 
-def notify_once(conn,title,message,severity='Info',user_id=None,role_code=None,module='',record_id=''):
-    existing=conn.execute('''SELECT id FROM notifications WHERE title=? AND link_module=? AND link_id=? AND is_read=0
-      AND ((user_id=? ) OR (user_id IS NULL AND ? IS NULL))
-      AND ((role_code=? ) OR (role_code IS NULL AND ? IS NULL)) LIMIT 1''',(title,module,record_id,user_id,user_id,role_code,role_code)).fetchone()
-    if existing:return False
-    notify(conn,title,message,severity,user_id,role_code,module,record_id);return True
-
 def csv_response(filename, headers, data_rows):
     buf=io.StringIO();w=csv.writer(buf);w.writerow(headers);w.writerows(data_rows)
     return StreamingResponse(iter([buf.getvalue()]),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="{filename}"'})
-
-def _generate_due_pm(conn, actor_id:int, target:date):
-    generated=[]
-    plans=rows(conn.execute('''SELECT p.*,a.asset_no,a.location_id,a.meter_reading,a.condition FROM maintenance_plans p JOIN assets a ON a.id=p.asset_id WHERE p.active=1'''))
-    for p in plans:
-        due=False
-        if p['trigger_type']=='Calendar' and p['next_due'] and date.fromisoformat(p['next_due'])<=target:due=True
-        if p['trigger_type'] in ('Meter','Runtime','Usage') and p['meter_interval'] and p['meter_reading']-p['last_meter']>=p['meter_interval']:due=True
-        if p['trigger_type']=='Condition':due=p['condition'] in ('Warning','Poor','Critical')
-        if not due:continue
-        if conn.execute("SELECT id FROM work_orders WHERE pm_plan_id=? AND status NOT IN ('Closed','Cancelled')",(p['id'],)).fetchone():continue
-        no=next_no(conn,'work_orders','wo_no','WO-',10026)
-        cur=conn.execute('''INSERT INTO work_orders(wo_no,title,description,asset_id,location_id,priority,status,work_type,requested_by,target_start,target_finish,instructions,pm_plan_id,created_at,updated_at) VALUES(?,?,?,?,?,?, 'Submitted','Preventive Maintenance',?,?,?,?,?,?,?)''',(no,p['name'],p['job_plan'],p['asset_id'],p['location_id'],p['priority'],actor_id,target.isoformat(),target.isoformat(),p['job_plan'],p['id'],now(),now()))
-        _ensure_work_sla(conn,cur.lastrowid)
-        create_approval(conn,'Work Management','work_order',cur.lastrowid,no,f'Approve {no} — {p["name"]}',actor_id,assigned_role='supervisor')
-        workflow_event(conn,'Work Management','work_order',cur.lastrowid,no,'AUTO SUBMIT','', 'Submitted',actor_id,f'Generated from {p["pm_no"]}')
-        next_due=p['next_due'];last_meter=p['last_meter']
-        if p['trigger_type']=='Calendar' and p['interval_days']:
-            d=date.fromisoformat(p['next_due'])
-            while d<=target:d+=timedelta(days=p['interval_days'])
-            next_due=d.isoformat()
-        if p['trigger_type'] in ('Meter','Runtime','Usage'):last_meter=p['meter_reading']
-        conn.execute('UPDATE maintenance_plans SET next_due=?,last_meter=?,last_generated=? WHERE id=?',(next_due,last_meter,now(),p['id']))
-        audit(conn,actor_id,'GENERATE WO','Preventive Maintenance',p['pm_no'],'',no);generated.append(no)
-        notify_once(conn,'Preventive work generated',f'{no} generated from {p["pm_no"]}','Info',None,'planner','maintenance',p['pm_no'])
-    return generated
 
 def _run_reorder_scan(conn, actor_id:int):
     created=[]
