@@ -130,7 +130,7 @@ def test_v44_signature_chain_detects_tampering_and_preserves_delegation_evidence
         current_version = (root / 'VERSION').read_text(encoding='utf-8').strip()
         config_src = (root / 'core' / 'configuration' / 'settings.py').read_text(encoding='utf-8')
         schema_version = int(re.search(r'SCHEMA_VERSION\s*=\s*(\d+)', config_src).group(1))
-        test_count = sum(len(re.findall(r'^def test_', f.read_text(encoding='utf-8'), re.M)) for f in (root / 'tests').glob('test_*.py'))
+        test_count = sum(len(re.findall(r'^def test_', f.read_text(encoding='utf-8'), re.M)) for f in (root / 'tests').rglob('test_*.py'))
         assert manifest['version'] == current_version and manifest['schema_version'] == schema_version
         assert manifest['api_endpoints'] == len(all_routes)
         assert manifest['api_routes_under_api'] == len(api_routes)
