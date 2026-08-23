@@ -25,6 +25,12 @@ STRICT_CONTENT_SECURITY_POLICY = (
     "frame-ancestors 'none'"
 )
 STRICT_TRANSPORT_SECURITY = 'max-age=31536000'
+PRODUCTION_BROWSER_HEADERS = {
+    b'x-content-type-options': b'nosniff',
+    b'x-frame-options': b'DENY',
+    b'referrer-policy': b'strict-origin-when-cross-origin',
+    b'permissions-policy': b'camera=(self), geolocation=(self), microphone=()',
+}
 PRODUCTION_ISOLATION_HEADERS = {
     b'cross-origin-opener-policy': b'same-origin',
     b'cross-origin-resource-policy': b'same-origin',
@@ -52,6 +58,7 @@ class ProductionSecurityHeaders:
                 managed_headers = {
                     b'content-security-policy',
                     b'strict-transport-security',
+                    *PRODUCTION_BROWSER_HEADERS.keys(),
                     *PRODUCTION_ISOLATION_HEADERS.keys(),
                 }
                 headers = [
@@ -60,6 +67,7 @@ class ProductionSecurityHeaders:
                     if name.lower() not in managed_headers
                 ]
                 headers.append((b'content-security-policy', self._csp))
+                headers.extend(PRODUCTION_BROWSER_HEADERS.items())
                 headers.extend(PRODUCTION_ISOLATION_HEADERS.items())
                 if is_https:
                     headers.append((b'strict-transport-security', self._hsts))
