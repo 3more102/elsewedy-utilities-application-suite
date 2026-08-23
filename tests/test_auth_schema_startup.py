@@ -6,6 +6,7 @@ import pytest
 
 from app import auth_store
 from app import database as database_module
+from app import migrations
 
 
 def _cheap_hash(password: str) -> str:
@@ -48,7 +49,16 @@ def test_successful_auth_migration_advances_v9_to_v10(tmp_path, monkeypatch):
     path = tmp_path / 'ordering-success.db'
     _point_database_at(monkeypatch, path)
 
+    called = {'runner': False}
+    original_runner = migrations.run_pending_migrations
+
+    def tracking_runner(*args, **kwargs):
+        called['runner'] = True
+        return original_runner(*args, **kwargs)
+
+    monkeypatch.setattr(migrations, 'run_pending_migrations', tracking_runner)
     result = auth_store.initialize_auth_database(_cheap_hash)
+    assert called['runner'] is True
     assert result['legacy_sessions_migrated'] == 0
 
     versions = _versions(path)
