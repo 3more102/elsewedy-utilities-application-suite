@@ -15,6 +15,7 @@ from .database import db, init_db, now
 from apps.audit import audit, verify_audit_chain
 from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
 from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record
+from apps.maintenance import ACTION_ROLES, TRANSITIONS, InvalidWorkTransition, WorkTransitionForbidden, transition_target, validate_transition_actor
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
 from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
@@ -2575,22 +2576,15 @@ def update_work(wo_id:int,body:WorkOrderPatch,user=Depends(require_permission('w
             if 'priority' in changes:_ensure_work_sla(conn,wo_id,force=True)
             if 'assigned_to' in changes and changes['assigned_to']:notify(conn,'Work order assigned',f"{old['wo_no']} — {changes.get('title',old['title'])}",'Info',changes['assigned_to'],None,'work',old['wo_no'])
         return {'ok':True}
-TRANSITIONS={'Draft':{'submit':'Submitted'},'Rejected':{'resubmit':'Submitted'},'Submitted':{'approve':'Approved'},'Approved':{'assign':'Assigned'},'Assigned':{'start':'In Progress'},'In Progress':{'pause':'Assigned','complete':'Completed'},'Completed':{'close':'Closed'}}
-ACTION_ROLES={
-    'approve':('admin','maintenance_manager','supervisor'),
-    'assign':('admin','maintenance_manager','planner','supervisor'),
-    'close':('admin','maintenance_manager','supervisor'),
-    'submit':('admin','maintenance_manager','planner','supervisor'),
-    'resubmit':('admin','maintenance_manager','planner','supervisor'),
-}
 @app.post('/api/work-orders/{wo_id}/transition')
 def transition_work(wo_id:int,body:TransitionIn,user=Depends(require_permission('work.transition',*WORK_ROLES))):
     with db() as conn:
-        w=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(wo_id,),'Work order not found');action=body.action.lower();target=TRANSITIONS.get(w['status'],{}).get(action)
-        if not target: raise HTTPException(409,f"Action '{body.action}' is not valid from {w['status']}")
-        if action in ACTION_ROLES and user['role'] not in ACTION_ROLES[action]: raise HTTPException(403,f"Role {user['role']} cannot perform {action}")
-        if user['role']=='technician' and action in ('start','pause','complete') and w['assigned_to']!=user['id']: raise HTTPException(403,'Technicians can only execute work assigned to them')
-        if action=='assign' and not w['assigned_to']: raise HTTPException(409,'Assign a technician before moving to Assigned')
+        w=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(wo_id,),'Work order not found');action=body.action.lower()
+        try:
+            target=transition_target(w['status'],action)
+            validate_transition_actor(w,action,user)
+        except WorkTransitionForbidden as exc:raise HTTPException(403,str(exc))
+        except InvalidWorkTransition as exc:raise HTTPException(409,str(exc))
         fields={'status':target,'updated_at':now()}
         if action=='start':fields['actual_start']=now()
         if action=='complete':fields['actual_finish']=now();fields['completion_notes']=body.notes or w['completion_notes'];fields['technician_signature']=body.signature or w.get('technician_signature','')
