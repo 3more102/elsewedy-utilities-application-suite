@@ -17,6 +17,8 @@ WORKSPACE_CSS = ROOT / "static" / "workspace-preferences.css"
 WORKSPACE_JS = ROOT / "static" / "workspace-preferences.js"
 COMMAND_CSS = ROOT / "static" / "command-palette.css"
 COMMAND_JS = ROOT / "static" / "command-palette.js"
+SHORTCUT_CSS = ROOT / "static" / "shortcut-center.css"
+SHORTCUT_JS = ROOT / "static" / "shortcut-center.js"
 SERVICE_WORKER = ROOT / "static" / "sw.js"
 
 
@@ -37,6 +39,8 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert WORKSPACE_JS.exists()
     assert COMMAND_CSS.exists()
     assert COMMAND_JS.exists()
+    assert SHORTCUT_CSS.exists()
+    assert SHORTCUT_JS.exists()
     assert SERVICE_WORKER.exists()
     assert 'href="/static/styles.css"' in html
     assert 'href="/static/ui-refresh.css"' in html
@@ -45,6 +49,7 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert 'href="/static/operational-enhancements.css"' in html
     assert 'href="/static/workspace-preferences.css"' in html
     assert 'href="/static/command-palette.css"' in html
+    assert 'href="/static/shortcut-center.css"' in html
     assert 'src="/static/app.js"' in html
     assert 'src="/static/ux-enhancements.js"' in html
     assert 'src="/static/dashboard-enhancements.js"' in html
@@ -52,6 +57,8 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert 'src="/static/operational-enhancements.js"' in html
     assert 'src="/static/workspace-preferences.js"' in html
     assert 'src="/static/command-palette.js"' in html
+    assert 'src="/static/navigation-history.js"' in html
+    assert 'src="/static/shortcut-center.js"' in html
 
     html_assets = set(re.findall(r'(?:href|src)="(/static/[^"]+)"', html))
     assert html_assets
@@ -116,6 +123,8 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     workspace_js = WORKSPACE_JS.read_text(encoding="utf-8")
     command_css = COMMAND_CSS.read_text(encoding="utf-8")
     command_js = COMMAND_JS.read_text(encoding="utf-8")
+    shortcut_css = SHORTCUT_CSS.read_text(encoding="utf-8")
+    shortcut_js = SHORTCUT_JS.read_text(encoding="utf-8")
     service_worker = SERVICE_WORKER.read_text(encoding="utf-8")
 
     assert ".nav-btn.active" in css
@@ -220,9 +229,29 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "nonRecentModules" in command_js
     assert "MutationObserver" in command_js
 
-    assert "euas-shell-v3.9.0-ui10" in service_worker
+    assert ".shortcut-center-layer" in shortcut_css
+    assert ".shortcut-center-item" in shortcut_css
+    assert ".shortcut-center-toggle" in shortcut_css
+    assert "@media(max-width:560px)" in shortcut_css
+    assert "@media(prefers-reduced-motion:reduce)" in shortcut_css
+    assert "@media(prefers-contrast:more)" in shortcut_css
+
+    assert "Keyboard Shortcuts" in shortcut_js
+    assert "shortcut-center-toggle" in shortcut_js
+    assert "aria-keyshortcuts" in shortcut_js
+    assert "event.key === '?'" in shortcut_js
+    assert "isEditable" in shortcut_js
+    assert "trapFocus" in shortcut_js
+    assert "event.key === 'Escape'" in shortcut_js
+    assert "aria-describedby" in shortcut_js
+    assert "Browser Back / Forward" in shortcut_js
+
+    assert "euas-shell-v3.9.0-ui11" in service_worker
     assert "'/static/command-palette.css'" in service_worker
     assert "'/static/command-palette.js'" in service_worker
+    assert "'/static/shortcut-center.css'" in service_worker
+    assert "'/static/shortcut-center.js'" in service_worker
+    assert "'/static/navigation-history.js'" in service_worker
     assert "'/static/workspace-preferences.css'" in service_worker
     assert "'/static/operational-enhancements.js'" in service_worker
     assert "url.origin===self.location.origin" in service_worker

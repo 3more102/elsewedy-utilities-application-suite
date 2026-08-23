@@ -1,4 +1,4 @@
-const CACHE='euas-shell-v3.9.0-ui10';
+const CACHE='euas-shell-v3.9.0-ui11';
 const ASSETS=[
   '/',
   '/static/styles.css',
@@ -8,6 +8,7 @@ const ASSETS=[
   '/static/operational-enhancements.css',
   '/static/workspace-preferences.css',
   '/static/command-palette.css',
+  '/static/shortcut-center.css',
   '/static/app.js',
   '/static/ux-enhancements.js',
   '/static/dashboard-enhancements.js',
@@ -16,6 +17,7 @@ const ASSETS=[
   '/static/workspace-preferences.js',
   '/static/command-palette.js',
   '/static/navigation-history.js',
+  '/static/shortcut-center.js',
   '/static/manifest.webmanifest'
 ];
 
