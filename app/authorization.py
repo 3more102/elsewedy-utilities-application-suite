@@ -188,6 +188,7 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('GET', '/api/automation/runs'): 'operations.automation.read',
     ('GET', '/api/metrics'): 'observability.metrics.read',
     ('GET', '/api/audit'): 'audit.read',
+    ('GET', '/api/audit/replay'): 'audit.read',
     ('GET', '/api/exports/audit.csv'): 'audit.export',
     ('POST', '/api/assets'): 'assets.create',
     ('PATCH', '/api/assets/{asset_id}'): 'assets.update',

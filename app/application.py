@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from .config import APP_NAME, APP_VERSION, STATIC_DIR, UPLOAD_DIR, SESSION_HOURS, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, ALLOWED_DOC_SUFFIXES, DB_BACKEND, DB_PATH, SCHEMA_VERSION, AUTOMATION_INTERVAL_MINUTES, EVENT_WEBHOOK_URL, EVENT_WEBHOOK_SECRET, OUTBOX_MAX_ATTEMPTS
 from .database import db, init_db, now, audit_digest
+from .audit_verification import AuditIntegrityError, replay_audit_history, verify_audit_chain_report
 from .auth import hash_password, verify_password, current_user, require_roles
 
 @asynccontextmanager
@@ -103,15 +104,9 @@ def audit(conn, user_id:int, action:str, module:str, record_id:str, old='', new=
     return digest
 
 def verify_audit_chain(conn):
-    prev=''
-    checked=0
-    for r in conn.execute('SELECT id,user_id,action,module,record_id,old_value,new_value,created_at,prev_hash,audit_hash FROM audit_logs ORDER BY id').fetchall():
-        checked+=1
-        expected=audit_digest(prev,r['user_id'],r['action'],r['module'],r['record_id'],r['old_value'],r['new_value'],r['created_at'])
-        if (r['prev_hash'] or '')!=prev or (r['audit_hash'] or '')!=expected:
-            return {'valid':False,'checked':checked,'first_invalid_id':r['id'],'head_hash':prev}
-        prev=r['audit_hash']
-    return {'valid':True,'checked':checked,'first_invalid_id':None,'head_hash':prev}
+    # Delegates to the shared validator so the API, the replay endpoint and the
+    # operational CLI can never drift apart on chain rules.
+    return verify_audit_chain_report(conn)
 
 def post_cost(conn, work_order, cost_type, amount, quantity, reference, user_id):
     if amount<=0:return None
@@ -2201,6 +2196,21 @@ def analytics(user=Depends(current_user)):
 @app.get('/api/audit/integrity')
 def audit_integrity(user=Depends(require_roles('admin','maintenance_manager','executive'))):
     with db() as conn:return verify_audit_chain(conn)
+
+@app.get('/api/audit/replay')
+def audit_replay(limit:int=Query(1000,ge=1,le=10000),user=Depends(require_roles('admin','maintenance_manager','executive'))):
+    """Return the verified, replayable audit timeline for governance evidence.
+
+    The chain is verified first; a tampered chain is rejected with 409 instead
+    of ever serving reconstructed history from untrusted records.
+    """
+    with db() as conn:
+        try:
+            history=replay_audit_history(conn)
+        except AuditIntegrityError as exc:
+            raise HTTPException(409,str(exc))
+    events=history[-limit:]
+    return {'valid':True,'total':len(history),'returned':len(events),'head_hash':(events[-1]['audit_hash'] if events else ''),'events':events}
 
 @app.get('/api/governance/retention')
 def retention_policies(user=Depends(require_roles('admin','maintenance_manager','executive'))):
