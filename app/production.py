@@ -135,7 +135,10 @@ class TrustedProxyScheme:
         return values[0]
 
     async def __call__(self, scope, receive, send):
-        if scope.get('type') not in {'http', 'websocket'}:
+        # X-Forwarded-Proto uses HTTP transport values. Do not write those into
+        # WebSocket scopes, whose ASGI scheme contract is ws/wss rather than
+        # http/https. EUAS currently has no production WebSocket proxy contract.
+        if scope.get('type') != 'http':
             await self.application(scope, receive, send)
             return
 
