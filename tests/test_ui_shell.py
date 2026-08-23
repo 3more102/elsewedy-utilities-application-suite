@@ -15,6 +15,9 @@ OPERATIONAL_CSS = ROOT / "static" / "operational-enhancements.css"
 OPERATIONAL_JS = ROOT / "static" / "operational-enhancements.js"
 WORKSPACE_CSS = ROOT / "static" / "workspace-preferences.css"
 WORKSPACE_JS = ROOT / "static" / "workspace-preferences.js"
+COMMAND_CSS = ROOT / "static" / "command-palette.css"
+COMMAND_JS = ROOT / "static" / "command-palette.js"
+SERVICE_WORKER = ROOT / "static" / "sw.js"
 
 
 def test_ui_shell_keeps_application_hooks_and_refresh_layer():
@@ -31,18 +34,23 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert OPERATIONAL_JS.exists()
     assert WORKSPACE_CSS.exists()
     assert WORKSPACE_JS.exists()
+    assert COMMAND_CSS.exists()
+    assert COMMAND_JS.exists()
+    assert SERVICE_WORKER.exists()
     assert 'href="/static/styles.css"' in html
     assert 'href="/static/ui-refresh.css"' in html
     assert 'href="/static/ux-enhancements.css"' in html
     assert 'href="/static/productivity-enhancements.css"' in html
     assert 'href="/static/operational-enhancements.css"' in html
     assert 'href="/static/workspace-preferences.css"' in html
+    assert 'href="/static/command-palette.css"' in html
     assert 'src="/static/app.js"' in html
     assert 'src="/static/ux-enhancements.js"' in html
     assert 'src="/static/dashboard-enhancements.js"' in html
     assert 'src="/static/productivity-enhancements.js"' in html
     assert 'src="/static/operational-enhancements.js"' in html
     assert 'src="/static/workspace-preferences.js"' in html
+    assert 'src="/static/command-palette.js"' in html
 
     required_ids = {
         "login",
@@ -100,6 +108,9 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     operational_js = OPERATIONAL_JS.read_text(encoding="utf-8")
     workspace_css = WORKSPACE_CSS.read_text(encoding="utf-8")
     workspace_js = WORKSPACE_JS.read_text(encoding="utf-8")
+    command_css = COMMAND_CSS.read_text(encoding="utf-8")
+    command_js = COMMAND_JS.read_text(encoding="utf-8")
+    service_worker = SERVICE_WORKER.read_text(encoding="utf-8")
 
     assert ".nav-btn.active" in css
     assert ":focus-visible" in css
@@ -184,3 +195,26 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "matchMedia" in workspace_js
     assert "density-toggle" in workspace_js
     assert "sidebar-collapse" in workspace_js
+
+    assert ".command-palette-layer" in command_css
+    assert ".command-palette-item.is-active" in command_css
+    assert ".command-palette-toggle" in command_css
+    assert "@media(max-width:560px)" in command_css
+    assert "@media(prefers-reduced-motion:reduce)" in command_css
+    assert "@media(prefers-contrast:more)" in command_css
+
+    assert "euas_recent_modules" in command_js
+    assert "command-palette-toggle" in command_js
+    assert "Control+Shift+P" in command_js
+    assert "aria-activedescendant" in command_js
+    assert "ArrowDown" in command_js
+    assert "ArrowUp" in command_js
+    assert "trapFocus" in command_js
+    assert "rememberModule" in command_js
+    assert "MutationObserver" in command_js
+
+    assert "euas-shell-v3.9.0-ui8" in service_worker
+    assert "'/static/command-palette.css'" in service_worker
+    assert "'/static/command-palette.js'" in service_worker
+    assert "'/static/workspace-preferences.css'" in service_worker
+    assert "'/static/operational-enhancements.js'" in service_worker
