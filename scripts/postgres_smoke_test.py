@@ -49,13 +49,14 @@ def main() -> int:
     if not url.startswith(('postgresql://', 'postgres://')):
         print('FAIL: EUAS_DATABASE_URL must point to PostgreSQL.', file=sys.stderr)
         return 2
+    admin_password = os.getenv('EUAS_BOOTSTRAP_ADMIN_PASSWORD', '').strip()
+    if len(admin_password) < 16:
+        print('FAIL: EUAS_BOOTSTRAP_ADMIN_PASSWORD must be configured for production smoke.', file=sys.stderr)
+        return 2
 
     env = os.environ.copy()
     env.setdefault('EUAS_ENV', 'test')
     env['EUAS_AUTOMATION_INTERVAL_MINUTES'] = '0'
-    # Inherit stdout/stderr so any Uvicorn/FastAPI traceback is visible directly
-    # in CI. A failed HTTP smoke must leave enough evidence to diagnose the
-    # backend path instead of only reporting a generic HTTP 500.
     process = subprocess.Popen(
         [sys.executable, '-m', 'uvicorn', 'app.main:app', '--host', HOST, '--port', str(PORT)],
         cwd=ROOT,
@@ -87,16 +88,11 @@ def main() -> int:
         status, _, ready = request('/api/health/ready')
         assert status == 200 and ready['status'] == 'ready'
 
-        status, _, login = request(
-            '/api/auth/login',
-            method='POST',
-            data={'username': 'omar', 'password': 'EUAS@2026'},
-        )
+        status, _, login = request('/api/auth/login', method='POST', data={'username': 'omar', 'password': admin_password})
         assert status == 200 and login['user']['role'] == 'admin'
         token = login['token']
         digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
 
-        # Prove the live PostgreSQL store contains only the one-way token digest.
         import psycopg
 
         with psycopg.connect(url) as pg:
@@ -109,10 +105,6 @@ def main() -> int:
                 cur.execute('SELECT COUNT(*) FROM sessions WHERE token=%s', (token,))
                 assert cur.fetchone()[0] == 0
 
-                # Seed one historical plaintext session to prove populated-v9
-                # compatibility on the real production database backend. The
-                # next authenticated request must migrate it to a digest row and
-                # delete the raw token without forcing the user to log in again.
                 legacy_token = 'pg-ci-legacy-session-token-' + str(int(time.time() * 1000))
                 created = datetime.now().isoformat(timespec='seconds')
                 expires = (datetime.now() + timedelta(hours=1)).isoformat(timespec='seconds')
@@ -140,16 +132,13 @@ def main() -> int:
         status, _, dashboard = request('/api/dashboard', token=token)
         assert status == 200 and dashboard['kpis']['total_assets'] >= 1
 
-        # Prove ordinary generated-ID CRUD, not only seeded read paths.
         status, _, assets = request('/api/assets', token=token)
         assert status == 200 and len(assets) >= 2
         transformer = next(x for x in assets if x['asset_no'] == 'TR-001')
         breaker = next(x for x in assets if x['asset_no'] == 'CB-101')
 
         status, _, work = request(
-            '/api/work-orders',
-            method='POST',
-            token=token,
+            '/api/work-orders', method='POST', token=token,
             data={
                 'title': 'PostgreSQL CI transactional smoke',
                 'asset_id': transformer['id'],
@@ -163,12 +152,9 @@ def main() -> int:
         status, _, work_detail = request(f'/api/work-orders/{work_id}', token=token)
         assert status == 200 and work_detail['title'] == 'PostgreSQL CI transactional smoke'
 
-        # Prove time-series insertion, threshold evaluation and alarm/work linkage.
         channel_code = 'PG-CI-CB101-CURRENT'
         status, _, channel = request(
-            '/api/telemetry/channels',
-            method='POST',
-            token=token,
+            '/api/telemetry/channels', method='POST', token=token,
             data={
                 'channel_code': channel_code,
                 'asset_id': breaker['id'],
@@ -184,32 +170,24 @@ def main() -> int:
         channel_id = int(channel['id'])
 
         status, _, ingestion = request(
-            '/api/telemetry/ingest',
-            method='POST',
-            token=token,
+            '/api/telemetry/ingest', method='POST', token=token,
             data={'readings': [{'channel_code': channel_code, 'value': 60, 'quality': 'Good'}]},
         )
         assert status == 200 and ingestion['alarms_opened'] == 1
         alarm_id = int(ingestion['results'][0]['alarm_id'])
 
-        status, _, readings = request(
-            f'/api/telemetry/readings?channel_id={channel_id}&hours=24', token=token
-        )
+        status, _, readings = request(f'/api/telemetry/readings?channel_id={channel_id}&hours=24', token=token)
         assert status == 200 and readings and readings[0]['channel_code'] == channel_code
 
-        status, _, alarm_work = request(
-            f'/api/alarms/{alarm_id}/work-order', method='POST', token=token, data={}
-        )
+        status, _, alarm_work = request(f'/api/alarms/{alarm_id}/work-order', method='POST', token=token, data={})
         assert status == 200 and int(alarm_work['id']) > 0
         status, _, linked_work = request(f"/api/work-orders/{alarm_work['id']}", token=token)
         assert status == 200 and linked_work['status'] == 'Submitted'
 
         status, _, channels = request('/api/telemetry/channels', token=token)
         assert status == 200 and any(x['id'] == channel_id for x in channels)
-
         status, _, alarms = request('/api/alarms', token=token)
         assert status == 200 and any(x['id'] == alarm_id for x in alarms)
-
         status, _, automation = request('/api/automation/run', method='POST', token=token)
         assert status == 200 and automation['status'] == 'Succeeded'
 
@@ -218,8 +196,6 @@ def main() -> int:
         assert 'euas_active_sessions ' in metrics
         assert 'euas_outbox_attempt_exhausted ' in metrics
 
-        # Prove the tamper-evident chain validates on the live PostgreSQL store
-        # and the replay endpoint serves verified history only.
         status, _, integrity = request('/api/audit/integrity', token=token)
         assert status == 200 and integrity['valid'] is True
         assert int(integrity['checked']) >= 1

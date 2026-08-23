@@ -53,6 +53,7 @@ def test_database_checks_validate_audit_chain():
     assert state['critical_tables'] == 'PASS'
     assert state['seed_integrity'] == 'PASS'
     assert state['schema_migrations'] == 'PASS'
+    assert state['default_credentials'] in {'PASS', 'WARN'}
     assert state['audit_chain_integrity'] == 'PASS'
 
 
@@ -60,29 +61,22 @@ def test_tampered_audit_chain_fails_deployment_preflight():
     from app.audit_store import append_audit, ensure_audit_chain_lock
     from app.database import db
 
-    # Ensure schema/lock bootstrap has run even when this module executes alone.
     first = statuses(run_database_checks())
     assert first['schema_migrations'] == 'PASS'
+    assert first['default_credentials'] in {'PASS', 'WARN'}
     assert first['audit_chain_integrity'] == 'PASS'
     with db() as conn:
         ensure_audit_chain_lock(conn)
         user = conn.execute('SELECT id FROM users ORDER BY id LIMIT 1').fetchone()
         append_audit(conn, int(user['id']), 'READINESS', 'AuditReadiness', 'preflight')
-        row = conn.execute(
-            "SELECT id,new_value FROM audit_logs WHERE module='AuditReadiness'"
-        ).fetchone()
+        row = conn.execute("SELECT id,new_value FROM audit_logs WHERE module='AuditReadiness'").fetchone()
         audit_id, original = int(row['id']), row['new_value']
-        conn.execute(
-            'UPDATE audit_logs SET new_value=? WHERE id=?',
-            ('tampered-preflight-regression', audit_id),
-        )
+        conn.execute('UPDATE audit_logs SET new_value=? WHERE id=?', ('tampered-preflight-regression', audit_id))
     try:
         state = statuses(run_database_checks())
         assert state['schema_migrations'] == 'PASS'
         assert state['audit_chain_integrity'] == 'FAIL'
     finally:
         with db() as conn:
-            conn.execute(
-                'UPDATE audit_logs SET new_value=? WHERE id=?', (original, audit_id)
-            )
+            conn.execute('UPDATE audit_logs SET new_value=? WHERE id=?', (original, audit_id))
     assert statuses(run_database_checks())['audit_chain_integrity'] == 'PASS'

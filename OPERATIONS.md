@@ -1,5 +1,29 @@
 # EUAS Operations Guide
 
+## Production credential bootstrap
+
+EUAS reference/demo mode retains packaged sample users so local demonstrations remain deterministic. Production mode does not permit those packaged passwords to remain active.
+
+For a fresh production database, configure both database and initial administrator secrets before startup. `EUAS_BOOTSTRAP_ADMIN_PASSWORD` must contain at least 16 characters and must not equal any packaged demo password.
+
+```bash
+export EUAS_POSTGRES_PASSWORD='replace-with-managed-database-secret'
+export EUAS_BOOTSTRAP_ADMIN_PASSWORD='replace-with-managed-admin-secret'
+docker compose -f docker-compose.postgres.yml up --build
+```
+
+On first production bootstrap, `omar` remains the initial administrator principal but receives the operator-supplied bootstrap password. Other seeded principals receive non-public derived passwords so the connected reference dataset can retain its foreign-key relationships without leaving known credentials active. Reset or provision those accounts through the normal administration/identity process before operational use.
+
+For an existing production database, startup scans active packaged demo principals. If one still matches its published demo password, startup refuses to proceed unless `EUAS_BOOTSTRAP_ADMIN_PASSWORD` is supplied; when supplied, those known credentials are rotated and their active/legacy sessions are revoked. Once no packaged password remains, an existing production database can restart without retaining the bootstrap secret in its environment.
+
+Deployment preflight exposes this as the `default_credentials` check:
+
+```bash
+python scripts/production_readiness.py --strict-production --require-postgres --check-db
+```
+
+`default_credentials` is a hard failure in production and only a warning in reference/demo mode.
+
 ## Automation engine
 
 EUAS v3.9.0 includes an auditable automation engine for recurring operational controls. Each run is recorded in `job_runs` with a unique run number, trigger source, actor, business date, completion status and JSON summary.
@@ -113,7 +137,6 @@ For PostgreSQL production deployments, use platform-native PostgreSQL backup too
 
 Users can mark individual notifications as read or use **Mark all read** in the Notification Centre. Automation-generated unread alerts are de-duplicated until the existing alert is read or resolved by operational action.
 
-
 ## SLA operations
 
 Management roles can inspect `/api/sla/summary`, `/api/sla/work-orders`, `/api/sla/events` and `/api/sla/policies`. Each work order receives a policy from its priority at creation/backfill time. Starting work stamps the first-response result; completing work stamps the resolution result. Automation detects overdue response/resolution clocks, records a unique `sla_events` breach, sends de-duplicated escalation notifications and publishes an integration event.
@@ -133,7 +156,6 @@ Administrators and Maintenance Managers can change these targets from Automation
 ## Integration event outbox
 
 Workflow and SLA events are persisted in `event_outbox` before external delivery. With no webhook configured, automation marks events `Skipped` while retaining the complete event record. With a webhook configured, delivery is attempted and recorded as `Delivered` or `Failed`; failed events can be manually re-queued. See `INTEGRATIONS.md`.
-
 
 ## Audit-chain verification
 
@@ -158,7 +180,6 @@ A valid result includes the number of records checked and the current head hash.
 ## Retention preview
 
 `GET /api/governance/retention/preview` calculates how many records are older than each active policy cutoff. The reference application does **not** automatically purge those records. Retention execution should require an approved enterprise policy, backup/recovery controls, legal-hold handling and production change governance.
-
 
 ## v3.6 planning operations
 
