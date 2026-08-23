@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,27 @@ def make_db(path: Path) -> None:
         conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("INSERT INTO sample(value) VALUES ('alpha'), ('beta')")
         conn.commit()
+    finally:
+        conn.close()
+
+
+def plant_stale_wal_target(target: Path) -> None:
+    """Leave target.db plus a live-consistent -wal sidecar, as after a crash.
+
+    EUAS runs SQLite in WAL mode; a crashed host leaves the main file together
+    with WAL frames that SQLite will replay on the next open.
+    """
+    stale = target.with_name(target.name + ".stale-seed")
+    conn = sqlite3.connect(stale)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sample(value) VALUES ('stale')")
+        conn.commit()
+        wal = Path(str(stale) + "-wal")
+        assert wal.exists(), "expected an un-checkpointed WAL sidecar"
+        shutil.copy2(stale, target)
+        shutil.copy2(wal, str(target) + "-wal")
     finally:
         conn.close()
 
@@ -112,3 +134,27 @@ def test_restore_refuses_to_overwrite_without_force(tmp_path: Path):
         restore_backup(backup, sqlite_target=target)
 
     assert target.read_text(encoding="utf-8") == "do not overwrite"
+
+
+def test_restore_removes_stale_wal_sidecars(tmp_path: Path):
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    make_db(source)
+    plant_stale_wal_target(target)
+    backup = create_backup(
+        tmp_path / "backups",
+        backend="sqlite",
+        sqlite_path=source,
+        include_uploads=False,
+    )
+
+    restore_backup(backup, sqlite_target=target, force=True)
+
+    # The stale WAL frames must not be replayed over the restored database.
+    assert not Path(str(target) + "-wal").exists()
+    conn = sqlite3.connect(target)
+    try:
+        rows = conn.execute("SELECT value FROM sample ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    assert rows == [("alpha",), ("beta",)]

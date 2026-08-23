@@ -217,6 +217,16 @@ def verify_backup(backup_dir: Path, *, deep: bool = True) -> dict:
     }
 
 
+def _remove_sqlite_sidecars(target: Path) -> None:
+    # EUAS runs SQLite in WAL mode. Replacing only the main database file while
+    # a crashed host's -wal/-shm sidecars survive lets the next open replay
+    # pre-restore frames over (or corrupt) the restored image.
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = target.with_name(target.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+
+
 def _restore_uploads(archive_path: Path, target: Path, *, force: bool) -> None:
     if target.exists() and any(target.iterdir()) and not force:
         raise RuntimeError(f"Uploads target is not empty; use --force: {target}")
@@ -250,8 +260,13 @@ def restore_backup(
         if sqlite_target.exists() and not force:
             raise RuntimeError(f"SQLite target exists; use --force: {sqlite_target}")
         temp_target = sqlite_target.with_name(sqlite_target.name + ".restore-tmp")
-        shutil.copy2(source, temp_target)
-        _sqlite_quick_check(temp_target)
+        try:
+            shutil.copy2(source, temp_target)
+            _sqlite_quick_check(temp_target)
+        except Exception:
+            temp_target.unlink(missing_ok=True)
+            raise
+        _remove_sqlite_sidecars(sqlite_target)
         os.replace(temp_target, sqlite_target)
     else:
         if not target_database_url.startswith(("postgresql://", "postgres://")):

@@ -80,6 +80,13 @@ def main() -> int:
             safety = db_path.with_name(db_path.name + '.pre_restore_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
             shutil.copy2(db_path, safety)
             print(f'Safety copy: {safety}')
+        # EUAS runs SQLite in WAL mode. Replacing only the main database file
+        # while stale -wal/-shm sidecars survive lets the next open replay
+        # pre-restore frames over (or corrupt) the restored database.
+        for suffix in ('-wal', '-shm', '-journal'):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
         shutil.copy2(restored, db_path)
 
         extracted_uploads = td / 'uploads'
