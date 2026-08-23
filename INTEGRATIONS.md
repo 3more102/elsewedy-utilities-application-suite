@@ -7,10 +7,14 @@ EUAS includes a durable transactional event outbox for external integration with
 1. A business transaction changes state (for example Work Order `SUBMIT`, `APPROVE`, `START`, `COMPLETE`).
 2. EUAS writes `workflow_events` for internal history and an `event_outbox` record in the same database transaction.
 3. The automation runner processes `Pending` / retryable `Failed` events.
-4. If no webhook is configured, the event is retained and marked `Skipped`.
-5. If a webhook is configured, EUAS POSTs the event and records `Delivered` or `Failed` with attempt count/error.
+4. Before outbound I/O, the processor commits a short durable lease. `attempts` is the delivery-generation fence and `processed_at` is the lease token while the event is in flight.
+5. Active leases are not reclaimed. A lease older than `EUAS_OUTBOX_LEASE_SECONDS` is eligible for recovery as a newer attempt generation.
+6. If no webhook is configured, the event is retained and marked `Skipped`.
+7. If a webhook is configured, EUAS POSTs the event and records `Delivered` or `Failed` with attempt count/error. Finalization is fenced to the exact generation and lease that performed the send.
 
-This design keeps maintenance and procurement transactions independent from external network availability.
+This design keeps maintenance and procurement transactions independent from external network availability and avoids holding a database row lock for the duration of the webhook request.
+
+Crash recovery remains intentionally at-least-once. If a sender dies after the receiver accepts an event but before EUAS records `Delivered`, a stale lease can later be reclaimed. Receivers should therefore deduplicate on the stable `X-EUAS-Event-ID` when exactly-once downstream effects are required.
 
 ## Configuration
 
@@ -18,9 +22,10 @@ This design keeps maintenance and procurement transactions independent from exte
 EUAS_EVENT_WEBHOOK_URL=https://integration.example.com/euas/events
 EUAS_EVENT_WEBHOOK_SECRET=<strong-shared-secret>
 EUAS_OUTBOX_MAX_ATTEMPTS=5
+EUAS_OUTBOX_LEASE_SECONDS=30
 ```
 
-Outbound delivery is disabled when `EUAS_EVENT_WEBHOOK_URL` is blank.
+Outbound delivery is disabled when `EUAS_EVENT_WEBHOOK_URL` is blank. The lease duration has a minimum of 10 seconds and should remain comfortably above the fixed five-second webhook timeout.
 
 ## HTTP delivery
 
@@ -64,10 +69,13 @@ Receivers should compare signatures in constant time and reject replayed event I
 ## Management APIs
 
 - `GET /api/events/outbox`
+- `GET /api/events/outbox/status` — payload-free operator snapshot with retryable, active-lease, stale-lease, exhausted and oldest-backlog age signals
 - `POST /api/events/outbox/{id}/retry`
 - `GET /api/automation/status`
 - `POST /api/automation/run`
 - `GET /api/metrics`
+
+The status endpoint is read-only and is limited to the existing observability operator ceiling (`admin`, `maintenance_manager`, `executive`) plus the database-backed `observability.metrics.read` capability.
 
 ## Current event families
 
