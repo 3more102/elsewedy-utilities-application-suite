@@ -154,6 +154,20 @@ def _ensure_schema_columns(conn):
     cols=_table_columns(conn,'audit_logs')
     if 'prev_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT DEFAULT ''")
     if 'audit_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN audit_hash TEXT DEFAULT ''")
+    _ensure_telemetry_idempotency(conn)
+
+def _ensure_telemetry_idempotency(conn):
+    """Give telemetry readings an optional client idempotency reference.
+
+    Applied outside the numbered migration flow (same pattern as the audit
+    chain columns) so retries carrying a client_ref are deduplicated on both
+    SQLite and PostgreSQL without a disruptive schema-version bump.
+    """
+    cols=_table_columns(conn,'telemetry_readings')
+    if 'client_ref' not in cols: conn.execute('ALTER TABLE telemetry_readings ADD COLUMN client_ref TEXT')
+    conn.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_readings_client_ref
+                    ON telemetry_readings(channel_id,client_ref)
+                    WHERE client_ref IS NOT NULL''')
 
 def _backfill_audit_chain(conn):
     prev=''
@@ -479,9 +493,10 @@ def init_db(hash_password):
         CREATE TABLE IF NOT EXISTS telemetry_readings(
           id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER NOT NULL REFERENCES telemetry_channels(id) ON DELETE CASCADE,
           value REAL NOT NULL, quality TEXT NOT NULL DEFAULT 'Good', source TEXT NOT NULL DEFAULT 'Manual',
-          captured_at TEXT NOT NULL, ingested_at TEXT NOT NULL, ingested_by INTEGER REFERENCES users(id)
+          captured_at TEXT NOT NULL, ingested_at TEXT NOT NULL, ingested_by INTEGER REFERENCES users(id), client_ref TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_telemetry_readings_channel_time ON telemetry_readings(channel_id,captured_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_readings_client_ref ON telemetry_readings(channel_id,client_ref) WHERE client_ref IS NOT NULL;
         CREATE TABLE IF NOT EXISTS operational_alarms(
           id INTEGER PRIMARY KEY AUTOINCREMENT, alarm_no TEXT UNIQUE NOT NULL,
           channel_id INTEGER NOT NULL REFERENCES telemetry_channels(id), asset_id INTEGER NOT NULL REFERENCES assets(id), site_id INTEGER REFERENCES sites(id),

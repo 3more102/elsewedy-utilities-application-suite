@@ -721,6 +721,7 @@ class TelemetryChannelPatch(BaseModel):
     warning_low:Optional[float]=None; critical_low:Optional[float]=None; warning_high:Optional[float]=None; critical_high:Optional[float]=None; active:Optional[bool]=None
 class TelemetryReadingItem(BaseModel):
     channel_code:str; value:float=Field(allow_inf_nan=False); captured_at:Optional[str]=None; quality:str='Good'; source:Optional[str]=None
+    client_ref:Optional[str]=Field(default=None,max_length=128)
 class TelemetryIngestIn(BaseModel):
     readings:list[TelemetryReadingItem]=Field(min_length=1,max_length=500)
 class AlarmWorkOrderIn(BaseModel):
