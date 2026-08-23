@@ -20,6 +20,7 @@ from apps.procurement import InvalidProcurementTransition, purchase_order_receiv
 from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction
 from apps.inspections import corrective_required, inspection_result
 from apps.hse import is_high_risk, risk_score, validate_hse_status
+from apps.projects import InvalidProjectTask, normalize_task_changes, recalculate_project_progress
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
 from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
@@ -3222,12 +3223,6 @@ def update_hse(incident_id:int,body:HSEPatch,user=Depends(require_permission('hs
             notify(conn,'High HSE risk',f"{old['incident_no']} escalated to risk score {changes['risk_score']}",'Critical',None,'maintenance_manager','hse',old['incident_no'])
         return one(conn.execute('SELECT * FROM safety_incidents WHERE id=?',(incident_id,)))
 
-def _recalculate_project_progress(conn, project_id:int):
-    r=conn.execute("SELECT AVG(CASE WHEN status='Completed' THEN 100 ELSE progress END) avg_progress FROM project_tasks WHERE project_id=? AND status<>'Cancelled'",(project_id,)).fetchone()
-    progress=round(float(r['avg_progress'] or 0),1)
-    conn.execute('UPDATE projects SET progress=? WHERE id=?',(progress,project_id))
-    return progress
-
 # ---------- projects ----------
 @app.get('/api/projects')
 def list_projects(user=Depends(current_user)):
@@ -3244,21 +3239,20 @@ def create_project_task(project_id:int,body:ProjectTaskIn,user=Depends(require_p
     with db() as conn:
         project=get_or_404(conn,'SELECT * FROM projects WHERE id=?',(project_id,),'Project not found')
         cur=conn.execute('INSERT INTO project_tasks(project_id,task_name,owner_id,due_date,status,progress) VALUES(?,?,?,?,?,?)',(project_id,body.task_name,body.owner_id,body.due_date,body.status,body.progress))
-        _recalculate_project_progress(conn,project_id)
+        recalculate_project_progress(conn,project_id)
         audit(conn,user['id'],'ADD TASK','Projects',project['project_no'],'',body.model_dump())
         return {'id':cur.lastrowid}
 @app.patch('/api/projects/{project_id}/tasks/{task_id}')
 def update_project_task(project_id:int,task_id:int,body:ProjectTaskPatch,user=Depends(require_permission('projects.write',*PROJECT_ROLES))):
     changes={k:v for k,v in body.model_dump().items() if v is not None}
-    if 'status' in changes and changes['status'] not in ('Open','In Progress','Blocked','Completed','Cancelled'):
-        raise HTTPException(400,'Invalid project task status')
+    try:changes=normalize_task_changes(changes)
+    except InvalidProjectTask as exc:raise HTTPException(400,str(exc))
     with db() as conn:
         project=get_or_404(conn,'SELECT * FROM projects WHERE id=?',(project_id,),'Project not found')
         old=get_or_404(conn,'SELECT * FROM project_tasks WHERE id=? AND project_id=?',(task_id,project_id),'Project task not found')
         if changes:
-            if changes.get('status')=='Completed' and 'progress' not in changes: changes['progress']=100
             sets=','.join(f'{k}=?' for k in changes);conn.execute(f'UPDATE project_tasks SET {sets} WHERE id=?',(*changes.values(),task_id))
-            _recalculate_project_progress(conn,project_id)
+            recalculate_project_progress(conn,project_id)
             audit(conn,user['id'],'UPDATE TASK','Projects',project['project_no'],old,changes)
         return one(conn.execute('SELECT t.*,u.full_name owner_name FROM project_tasks t LEFT JOIN users u ON u.id=t.owner_id WHERE t.id=?',(task_id,)))
 
