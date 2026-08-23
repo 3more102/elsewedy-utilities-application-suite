@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#b6242a"><title>EUAS — Elsewedy Utilities Application Suite</title>
-<link rel="manifest" href="/static/manifest.webmanifest"><link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/ui-refresh.css">
+<link rel="manifest" href="/static/manifest.webmanifest"><link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/ui-refresh.css"><link rel="stylesheet" href="/static/ux-enhancements.css">
 </head>
 <body>
 <a class="skip-link" href="#content">Skip to main content</a>
@@ -22,14 +22,14 @@
 </div>
 
 <div id="app" class="app hidden">
-  <aside class="sidebar" aria-label="Primary navigation">
+  <aside id="sidebar" class="sidebar" aria-label="Primary navigation">
     <div class="side-brand"><div class="logo-mark small" aria-hidden="true">E</div><div><div class="eyebrow">ELSEWEDY UTILITIES</div><strong>EUAS</strong></div></div>
     <nav id="nav" aria-label="EUAS modules"></nav>
     <div class="side-foot"><div id="avatar" class="avatar" aria-hidden="true">OI</div><div class="user-mini"><strong id="user-name"></strong><span id="user-role"></span></div><button id="logout-btn" class="icon-btn" title="Logout" aria-label="Logout">↪</button></div>
   </aside>
   <div class="workspace">
     <header class="topbar">
-      <div class="crumb"><button id="mobile-menu" class="icon-btn mobile-only" aria-label="Open navigation" aria-controls="nav">☰</button><div><div id="breadcrumb" class="eyebrow dark">EUAS / HOME</div><h2 id="page-title">Home</h2></div></div>
+      <div class="crumb"><button id="mobile-menu" class="icon-btn mobile-only" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">☰</button><div><div id="breadcrumb" class="eyebrow dark">EUAS / HOME</div><h2 id="page-title">Home</h2></div></div>
       <div class="top-actions">
         <div class="search-wrap"><input id="global-search" aria-label="Global search" placeholder="Search assets, work orders, documents…"><div id="search-results" class="search-results hidden" role="listbox" aria-label="Search results"></div></div>
         <select id="site-selector" title="Site" aria-label="Site filter"><option value="">All Sites</option></select>
@@ -45,6 +45,6 @@
 <div id="modal-layer" class="modal-layer hidden"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><header><div><div class="eyebrow dark">EUAS</div><h2 id="modal-title"></h2></div><button id="modal-close" class="icon-btn" aria-label="Close dialog">×</button></header><div id="modal-body" class="modal-body"></div></section></div>
 <aside id="drawer" class="drawer hidden" aria-label="Notification centre"><header><div><div class="eyebrow dark">NOTIFICATIONS</div><h3>Notification Centre</h3></div><button id="drawer-close" class="icon-btn" aria-label="Close notifications">×</button></header><div id="drawer-body"></div></aside>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
-<script src="/static/app.js"></script>
+<script src="/static/app.js"></script><script src="/static/ux-enhancements.js"></script>
 </body>
 </html>
