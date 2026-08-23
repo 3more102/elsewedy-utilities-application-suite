@@ -25,10 +25,15 @@ STRICT_CONTENT_SECURITY_POLICY = (
     "frame-ancestors 'none'"
 )
 STRICT_TRANSPORT_SECURITY = 'max-age=31536000'
+PRODUCTION_ISOLATION_HEADERS = {
+    b'cross-origin-opener-policy': b'same-origin',
+    b'cross-origin-resource-policy': b'same-origin',
+    b'x-permitted-cross-domain-policies': b'none',
+}
 
 
 class ProductionSecurityHeaders:
-    """Apply deployment-only CSP and HTTPS transport policy to HTTP responses."""
+    """Apply deployment-only browser and transport policy to HTTP responses."""
 
     def __init__(self, application):
         self.application = application
@@ -44,15 +49,18 @@ class ProductionSecurityHeaders:
 
         async def send_with_policy(message):
             if message.get('type') == 'http.response.start':
+                managed_headers = {
+                    b'content-security-policy',
+                    b'strict-transport-security',
+                    *PRODUCTION_ISOLATION_HEADERS.keys(),
+                }
                 headers = [
                     (name, value)
                     for name, value in message.get('headers', [])
-                    if name.lower() not in {
-                        b'content-security-policy',
-                        b'strict-transport-security',
-                    }
+                    if name.lower() not in managed_headers
                 ]
                 headers.append((b'content-security-policy', self._csp))
+                headers.extend(PRODUCTION_ISOLATION_HEADERS.items())
                 if is_https:
                     headers.append((b'strict-transport-security', self._hsts))
                 message = {**message, 'headers': headers}
