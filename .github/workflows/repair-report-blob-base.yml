@@ -53,7 +53,7 @@ jobs:
           app = app.replace(old_report, new_report, 1)
 
           anchor = "    assert \"appropriately provisioned technician account\" in app_js\n"
-          extra = """    assert \"text=await r.text()\" in app_js\n    assert \"location.origin+'/'\" in app_js\n    assert '<base href=' in app_js\n    assert 'new Blob([html],{type:ct})' in app_js\n    assert \"await openProtected(`/api/work-orders/${id}/report`)\" in app_js\n    assert \"throw new Error('Report HTML is missing a head element')\" in app_js\n    assert \"const b=await r.blob(),u=URL.createObjectURL(b)\" not in app_js\n"""
+          extra = """    assert \"text=await r.text()\" in app_js\n    assert \"location.origin+'/'\" in app_js\n    assert '<base href=' in app_js\n    assert 'new Blob([html],{type:ct})' in app_js\n    assert \"await openProtected(`/api/work-orders/${id}/report`)\" in app_js\n    assert \"throw new Error('Report HTML is missing a head element')\" in app_js\n    assert \"if(!r.ok)throw new Error('Report failed');const b=await r.blob()\" not in app_js\n"""
           if anchor not in tests:
               raise SystemExit('UI shell regression insertion point not found')
           tests = tests.replace(anchor, anchor + extra, 1)
