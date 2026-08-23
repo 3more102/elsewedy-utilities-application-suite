@@ -15,7 +15,7 @@ from core.database import db, init_db, now
 from apps.audit import audit, verify_audit_chain
 from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
 from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record
-from apps.maintenance import ACTION_ROLES, TRANSITIONS, InvalidWorkTransition, WorkTransitionForbidden, transition_target, validate_transition_actor
+from apps.maintenance import ACTION_ROLES, TRANSITIONS, InvalidWorkTransition, WorkTransitionForbidden, backfill_work_order_slas as _backfill_work_order_slas, ensure_work_sla as _ensure_work_sla, mark_sla_resolution as _mark_sla_resolution, mark_sla_response as _mark_sla_response, transition_target, validate_transition_actor
 from apps.procurement import InvalidProcurementTransition, purchase_order_receive_target, requisition_target
 from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction
 from apps.inspections import corrective_required, inspection_result
@@ -27,6 +27,9 @@ from apps.telemetry import TelemetryChannelNotFound, TelemetryValidationError, i
 from apps.alarm_correlation import correlate_alarm as correlate_alarm_record, graph_distance as _graph_distance, incident_member_summary as correlation_incident_member_summary, refresh_incident as refresh_correlated_incident, refresh_incidents_for_alarm as refresh_correlated_incidents_for_alarm, topology_graph as _topology_graph
 from apps.alarms import AlarmNotFound as OperationalAlarmNotFound, InvalidAlarmTransition, acknowledge_alarm as acknowledge_alarm_record, close_alarm as close_alarm_record, evaluate_telemetry_alarm as evaluate_alarm_record
 from apps.condition_monitoring import ConditionRuleError, condition_matches as _cbm_condition, threshold_text as _cbm_rule_threshold_text, validate_rule as validate_condition_rule
+from apps.notifications import notify, notify_once
+from apps.approvals import create_approval, resolve_approval
+from apps.cbm import evaluate_rules as evaluate_cbm_rules
 from api.middleware import security_headers
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
@@ -314,24 +317,6 @@ def _site_reliability_rows(conn, period_days:int=365):
         s['period_hours']=round(s['period_hours'],1);s['downtime_hours']=round(s['downtime_hours'],2);out.append(s)
     return sorted(out,key=lambda x:(x['availability_pct'],x['site_name'] or ''))
 
-def notify(conn,title,message,severity='Info',user_id=None,role_code=None,module='',record_id=''):
-    conn.execute('INSERT INTO notifications(user_id,role_code,title,message,severity,link_module,link_id,created_at) VALUES(?,?,?,?,?,?,?,?)',(user_id,role_code,title,message,severity,module,record_id,now()))
-
-def create_approval(conn,module,record_type,record_id,record_code,title,requested_by,assigned_role=None,assigned_user_id=None):
-    existing=conn.execute("SELECT * FROM approval_requests WHERE module=? AND record_type=? AND record_id=? AND status='Pending'",(module,record_type,record_id)).fetchone()
-    if existing:return dict(existing)
-    no=next_no(conn,'approval_requests','approval_no','APR-',9001)
-    cur=conn.execute("INSERT INTO approval_requests(approval_no,module,record_type,record_id,record_code,title,requested_by,assigned_role,assigned_user_id,status,requested_at) VALUES(?,?,?,?,?,?,?,?,?,'Pending',?)",(no,module,record_type,record_id,record_code,title,requested_by,assigned_role,assigned_user_id,now()))
-    notify(conn,'Approval waiting',f'{record_code} requires approval','Info',assigned_user_id,assigned_role,'approvals',no)
-    return {'id':cur.lastrowid,'approval_no':no}
-
-def resolve_approval(conn,module,record_type,record_id,decision,user_id,comments=''):
-    ap=conn.execute("SELECT * FROM approval_requests WHERE module=? AND record_type=? AND record_id=? AND status='Pending' ORDER BY id DESC LIMIT 1",(module,record_type,record_id)).fetchone()
-    if not ap:return None
-    new_status='Approved' if decision.lower()=='approve' else 'Rejected'
-    conn.execute('UPDATE approval_requests SET status=?,decided_at=?,decided_by=?,comments=? WHERE id=?',(new_status,now(),user_id,comments,ap['id']))
-    return dict(ap)|{'status':new_status}
-
 def get_or_404(conn, sql, args, message='Record not found'):
     r=conn.execute(sql,args).fetchone()
     if not r: raise HTTPException(404,message)
@@ -500,80 +485,11 @@ def _validate_rcm_payload(conn, fmea:dict, data:dict, require_ready:bool=False):
         raise HTTPException(422,'Time-Based RCM strategies require a linked active maintenance plan before submission')
     return True
 
-def _create_cbm_work_order(conn, rule:dict, channel:dict, event_no:str, value:float, actor_id:int):
-    asset=get_or_404(conn,'SELECT id,asset_no,name,location_id FROM assets WHERE id=?',(channel['asset_id'],),'CBM asset not found')
-    fmea=_fmea_record(conn,rule['asset_fmea_id'],asset['id']) if rule.get('asset_fmea_id') else None
-    no=next_no(conn,'work_orders','wo_no','WO-',10026)
-    priority=rule.get('work_priority') or ('Critical' if rule.get('severity')=='Critical' else 'High')
-    finish_days=1 if priority in ('Emergency','Critical') else 2 if priority=='High' else 5
-    title=f"CBM: {rule['name']} — {asset['asset_no']}"
-    fmea_text=f" Linked FMEA {fmea['fmea_no']} / {fmea['mode_no']} ({fmea['failure_mode_name']}), current RPN {fmea['rpn']} {fmea['risk_band']}." if fmea else ''
-    desc=f"Generated by {rule['rule_no']} after {int(rule['consecutive_readings'])} consecutive Good-quality reading(s). Channel {channel['channel_code']} measured {value:g} {channel.get('unit') or ''}; rule condition {_cbm_rule_threshold_text(rule)}. Source event {event_no}.{fmea_text}"
-    instructions=(rule.get('instructions') or (fmea.get('recommended_action') if fmea else '') or 'Inspect the asset condition, validate the signal and perform condition-based maintenance as required.').strip()
-    failure_code=fmea['mode_no'] if fmea else f"CBM-{rule['rule_no']}"
-    cur=conn.execute("""INSERT INTO work_orders(wo_no,title,description,asset_id,location_id,priority,status,work_type,failure_code,asset_fmea_id,requested_by,target_start,target_finish,estimated_hours,instructions,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,'Submitted','Condition-Based Maintenance',?,?,?,?,?,?,?,?,?)""",
-      (no,title,desc,asset['id'],asset.get('location_id'),priority,failure_code,fmea['id'] if fmea else None,actor_id,date.today().isoformat(),(date.today()+timedelta(days=finish_days)).isoformat(),2.0,instructions,now(),now()))
-    _ensure_work_sla(conn,cur.lastrowid)
-    create_approval(conn,'Work Management','work_order',cur.lastrowid,no,f"Approve {no} — {title}",actor_id,assigned_role='maintenance_manager')
-    workflow_event(conn,'Work Management','work_order',cur.lastrowid,no,'CBM GENERATED','', 'Submitted',actor_id,event_no)
-    emit_event(conn,'maintenance.cbm.work_order_created','cbm_event',event_no,{'event_no':event_no,'rule_no':rule['rule_no'],'work_order':no,'asset_id':asset['id'],'fmea_no':fmea['fmea_no'] if fmea else None})
-    return {'id':cur.lastrowid,'wo_no':no}
-
 def _evaluate_cbm_rules(conn, channel:dict, value:float, captured_at:str, reading_id:int, actor_id:int):
-    results=[]
-    rules=rows(conn.execute('SELECT * FROM cbm_rules WHERE channel_id=? AND active=1 ORDER BY id',(channel['id'],)))
-    for rule in rules:
-        state=one(conn.execute('SELECT * FROM cbm_rule_state WHERE rule_id=?',(rule['id'],))) or {'consecutive_hits':0,'last_triggered_at':None,'active_event_id':None}
-        breached=_cbm_condition(rule,value);hits=int(state.get('consecutive_hits') or 0)+1 if breached else 0
-        active=one(conn.execute("SELECT * FROM cbm_events WHERE rule_id=? AND status IN ('Open','Acknowledged') ORDER BY id DESC LIMIT 1",(rule['id'],)))
-        if not breached:
-            resolved_no=None
-            if active:
-                reason=f"Condition cleared by Good-quality telemetry reading {value:g} {channel.get('unit') or ''}".strip()
-                conn.execute("UPDATE cbm_events SET status='Resolved',resolved_at=?,resolution_reason=?,last_seen_at=? WHERE id=?",(captured_at,reason,captured_at,active['id']))
-                emit_event(conn,'maintenance.cbm.event_resolved','cbm_event',active['event_no'],{'event_no':active['event_no'],'rule_no':rule['rule_no'],'value':value,'captured_at':captured_at})
-                if actor_id:audit(conn,actor_id,'CBM AUTO RESOLVE','Condition-Based Maintenance',active['event_no'],active['status'],'Resolved')
-                resolved_no=active['event_no']
-            conn.execute("""INSERT INTO cbm_rule_state(rule_id,consecutive_hits,last_value,last_quality,last_evaluated_at,last_triggered_at,active_event_id)
-              VALUES(?,0,?,'Good',?,?,NULL) ON CONFLICT(rule_id) DO UPDATE SET consecutive_hits=0,last_value=excluded.last_value,last_quality='Good',last_evaluated_at=excluded.last_evaluated_at,active_event_id=NULL""",
-              (rule['id'],value,captured_at,state.get('last_triggered_at')))
-            results.append({'rule_no':rule['rule_no'],'action':'resolved' if resolved_no else 'normal','event_no':resolved_no,'work_order':None})
-            continue
-        if active:
-            conn.execute('UPDATE cbm_events SET trigger_value=?,last_seen_at=?,occurrence_count=occurrence_count+1 WHERE id=?',(value,captured_at,active['id']))
-            conn.execute("""INSERT INTO cbm_rule_state(rule_id,consecutive_hits,last_value,last_quality,last_evaluated_at,last_triggered_at,active_event_id)
-              VALUES(?,? ,?,'Good',?,?,?) ON CONFLICT(rule_id) DO UPDATE SET consecutive_hits=excluded.consecutive_hits,last_value=excluded.last_value,last_quality='Good',last_evaluated_at=excluded.last_evaluated_at,active_event_id=excluded.active_event_id""",
-              (rule['id'],hits,value,captured_at,state.get('last_triggered_at'),active['id']))
-            results.append({'rule_no':rule['rule_no'],'action':'active','event_no':active['event_no'],'work_order':None})
-            continue
-        required=max(1,int(rule.get('consecutive_readings') or 1))
-        cooldown=False
-        if state.get('last_triggered_at'):
-            try: cooldown=_dt(captured_at) < _dt(state['last_triggered_at'])+timedelta(minutes=max(0,int(rule.get('cooldown_minutes') or 0)))
-            except Exception: cooldown=False
-        if hits<required or cooldown:
-            conn.execute("""INSERT INTO cbm_rule_state(rule_id,consecutive_hits,last_value,last_quality,last_evaluated_at,last_triggered_at,active_event_id)
-              VALUES(?,? ,?,'Good',?,?,NULL) ON CONFLICT(rule_id) DO UPDATE SET consecutive_hits=excluded.consecutive_hits,last_value=excluded.last_value,last_quality='Good',last_evaluated_at=excluded.last_evaluated_at""",
-              (rule['id'],hits,value,captured_at,state.get('last_triggered_at')))
-            results.append({'rule_no':rule['rule_no'],'action':'cooldown' if cooldown else 'pending','event_no':None,'work_order':None,'hits':hits,'required':required})
-            continue
-        event_no=next_no(conn,'cbm_events','event_no','CBM-',80001)
-        message=f"{rule['name']}: {channel['channel_code']} value {value:g} {channel.get('unit') or ''} matched {_cbm_rule_threshold_text(rule)} after {hits} consecutive Good reading(s).".strip()
-        cur=conn.execute("""INSERT INTO cbm_events(event_no,rule_id,channel_id,asset_id,reading_id,severity,status,trigger_value,message,asset_fmea_id,opened_at,last_seen_at,occurrence_count)
-          VALUES(?,?,?,?,?,?,'Open',?,?,?,?,?,1)""",(event_no,rule['id'],channel['id'],channel['asset_id'],reading_id,rule['severity'],value,message,rule.get('asset_fmea_id'),captured_at,captured_at))
-        work=None
-        if rule['action_type']=='WorkOrder':
-            work=_create_cbm_work_order(conn,rule,channel,event_no,value,actor_id)
-            conn.execute('UPDATE cbm_events SET work_order_id=? WHERE id=?',(work['id'],cur.lastrowid))
-        notify_once(conn,'Condition-based maintenance trigger',f"{event_no} — {message}",rule['severity'],None,'maintenance_manager','telemetry',event_no)
-        emit_event(conn,'maintenance.cbm.event_opened','cbm_event',event_no,{'event_no':event_no,'rule_no':rule['rule_no'],'channel_code':channel['channel_code'],'asset_id':channel['asset_id'],'value':value,'action_type':rule['action_type'],'work_order':work['wo_no'] if work else None})
-        if actor_id:audit(conn,actor_id,'CBM TRIGGER','Condition-Based Maintenance',event_no,'',{'rule':rule['rule_no'],'value':value,'work_order':work['wo_no'] if work else None})
-        conn.execute("""INSERT INTO cbm_rule_state(rule_id,consecutive_hits,last_value,last_quality,last_evaluated_at,last_triggered_at,active_event_id)
-          VALUES(?,? ,?,'Good',?,?,?) ON CONFLICT(rule_id) DO UPDATE SET consecutive_hits=excluded.consecutive_hits,last_value=excluded.last_value,last_quality='Good',last_evaluated_at=excluded.last_evaluated_at,last_triggered_at=excluded.last_triggered_at,active_event_id=excluded.active_event_id""",
-          (rule['id'],hits,value,captured_at,captured_at,cur.lastrowid))
-        results.append({'rule_no':rule['rule_no'],'action':'opened','event_no':event_no,'work_order':work['wo_no'] if work else None})
-    return results
+    return evaluate_cbm_rules(
+        conn, channel, value, captured_at, reading_id, actor_id,
+        fmea_lookup=_fmea_record, approval_creator=create_approval,
+    )
 
 def _evaluate_telemetry_alarm(conn, channel:dict, value:float, captured_at:str, actor_id:Optional[int]):
     return evaluate_alarm_record(
@@ -610,39 +526,6 @@ def _operations_intelligence(conn, site_id:Optional[int]=None):
     quality=_telemetry_quality_summary(conn,24,site_id)
     return {'active_alarms':active_alarms,'critical_alarms':critical,'telemetry_channels':channels,'stale_channels_24h':stale,
             'open_incidents':incidents,'active_suppressions':suppressions,'active_cbm_rules':cbm_rules_active,'open_cbm_events':cbm_events_open,'data_quality':quality}
-
-def _ensure_work_sla(conn,work_order_id:int,force:bool=False):
-    w=conn.execute('SELECT id,priority,status,created_at,actual_start,actual_finish FROM work_orders WHERE id=?',(work_order_id,)).fetchone()
-    if not w:return None
-    existing=conn.execute('SELECT * FROM work_order_sla WHERE work_order_id=?',(work_order_id,)).fetchone()
-    if existing and not force:return dict(existing)
-    policy=conn.execute('SELECT * FROM sla_policies WHERE priority=? AND active=1',(w['priority'],)).fetchone() or conn.execute("SELECT * FROM sla_policies WHERE priority='Medium' AND active=1").fetchone()
-    if not policy:return None
-    created=_dt(w['created_at']); response_due=created+timedelta(minutes=policy['response_minutes']); resolution_due=created+timedelta(minutes=policy['resolution_minutes'])
-    first=w['actual_start'];resolved=w['actual_finish']
-    response_status='Pending' if not first else ('Met' if _dt(first)<=response_due else 'Breached')
-    resolution_status='Pending' if not resolved else ('Met' if _dt(resolved)<=resolution_due else 'Breached')
-    if existing:
-        conn.execute('UPDATE work_order_sla SET policy_id=?,response_due=?,resolution_due=?,first_response_at=?,resolved_at=?,response_status=?,resolution_status=?,updated_at=? WHERE work_order_id=?',(policy['id'],response_due.isoformat(timespec='seconds'),resolution_due.isoformat(timespec='seconds'),first,resolved,response_status,resolution_status,now(),work_order_id))
-    else:
-        conn.execute('INSERT INTO work_order_sla(work_order_id,policy_id,response_due,resolution_due,first_response_at,resolved_at,response_status,resolution_status,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(work_order_id,policy['id'],response_due.isoformat(timespec='seconds'),resolution_due.isoformat(timespec='seconds'),first,resolved,response_status,resolution_status,now()))
-    return dict(conn.execute('SELECT * FROM work_order_sla WHERE work_order_id=?',(work_order_id,)).fetchone())
-
-def _backfill_work_order_slas(conn):
-    for w in rows(conn.execute('SELECT id FROM work_orders WHERE id NOT IN (SELECT work_order_id FROM work_order_sla)')):
-        _ensure_work_sla(conn,w['id'])
-
-def _mark_sla_response(conn,work_order_id:int,at_value:str):
-    sla=_ensure_work_sla(conn,work_order_id)
-    if not sla:return
-    status='Met' if _dt(at_value)<=_dt(sla['response_due']) else 'Breached'
-    conn.execute('UPDATE work_order_sla SET first_response_at=?,response_status=?,updated_at=? WHERE work_order_id=?',(at_value,status,now(),work_order_id))
-
-def _mark_sla_resolution(conn,work_order_id:int,at_value:str):
-    sla=_ensure_work_sla(conn,work_order_id)
-    if not sla:return
-    status='Met' if _dt(at_value)<=_dt(sla['resolution_due']) else 'Breached'
-    conn.execute('UPDATE work_order_sla SET resolved_at=?,resolution_status=?,updated_at=? WHERE work_order_id=?',(at_value,status,now(),work_order_id))
 
 def _run_sla_scan(conn,actor_id:int,target:date):
     _backfill_work_order_slas(conn); cutoff=datetime.now() if target==date.today() else datetime.combine(target,datetime.max.time()).replace(microsecond=0)
