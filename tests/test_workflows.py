@@ -5,10 +5,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 TEST_DB = Path(__file__).resolve().parent / 'euas_test.db'
-if TEST_DB.exists():
-    TEST_DB.unlink()
-os.environ['EUAS_DB_PATH'] = str(TEST_DB)
-
 from fastapi.testclient import TestClient
 from app.main import app
 
