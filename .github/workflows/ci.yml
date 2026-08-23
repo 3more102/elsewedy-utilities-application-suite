@@ -40,6 +40,9 @@ jobs:
       - name: Compile backend
         run: python -m compileall -q app scripts
 
+      - name: Collect deterministic engineering evidence
+        run: python scripts/engineering_evidence.py
+
       - name: Run readiness policy tests
         run: pytest -q tests/test_production_readiness.py tests/test_database_adapter.py
 
