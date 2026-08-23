@@ -116,7 +116,7 @@ def run_database_checks() -> list[Check]:
     # Import after CLI/environment handling so app.config sees deployment values.
     from app.auth import hash_password, verify_password
     from app.audit_verification import verify_audit_chain_report
-    from app.config import DB_BACKEND, SCHEMA_VERSION
+    from app.config import DB_BACKEND, ENVIRONMENT, SCHEMA_VERSION
     from app.database import db
     from app.migrations import (
         find_insecure_demo_users,
@@ -186,18 +186,24 @@ def run_database_checks() -> list[Check]:
             )
 
             insecure_demo_users = find_insecure_demo_users(conn, verify_password)
-            checks.append(
-                Check(
-                    "default_credentials",
-                    "FAIL" if insecure_demo_users else "PASS",
-                    (
+            if insecure_demo_users:
+                checks.append(
+                    Check(
+                        "default_credentials",
+                        "FAIL" if ENVIRONMENT == "production" else "WARN",
                         "Packaged demo credentials remain active for: "
                         + ", ".join(insecure_demo_users)
+                        + ("." if ENVIRONMENT == "production" else "; permitted only in reference/demo mode."),
                     )
-                    if insecure_demo_users
-                    else "No active user retains a packaged demo password.",
                 )
-            )
+            else:
+                checks.append(
+                    Check(
+                        "default_credentials",
+                        "PASS",
+                        "No active user retains a packaged demo password.",
+                    )
+                )
 
             # A deployment must never go live on a database whose tamper-evident
             # audit chain is already broken; this is part of the security gate.
