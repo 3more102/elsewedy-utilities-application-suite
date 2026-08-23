@@ -1,5 +1,22 @@
-const CACHE='euas-shell-v3.9.0';
-const ASSETS=['/','/static/styles.css','/static/app.js','/static/manifest.webmanifest'];
+const CACHE='euas-shell-v3.9.0-ui8';
+const ASSETS=[
+  '/',
+  '/static/styles.css',
+  '/static/ui-refresh.css',
+  '/static/ux-enhancements.css',
+  '/static/productivity-enhancements.css',
+  '/static/operational-enhancements.css',
+  '/static/workspace-preferences.css',
+  '/static/command-palette.css',
+  '/static/app.js',
+  '/static/ux-enhancements.js',
+  '/static/dashboard-enhancements.js',
+  '/static/productivity-enhancements.js',
+  '/static/operational-enhancements.js',
+  '/static/workspace-preferences.js',
+  '/static/command-palette.js',
+  '/static/manifest.webmanifest'
+];
 
 self.addEventListener('install',event=>{
   event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(ASSETS)).then(()=>self.skipWaiting()));
