@@ -33,6 +33,7 @@ jobs:
           node --check static/command-palette.js
           node --check static/navigation-history.js
           node --check static/shortcut-center.js
+          node --check static/help-security.js
           node --check static/sw.js
 
       - name: Validate web manifest JSON
