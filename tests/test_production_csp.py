@@ -211,6 +211,38 @@ def test_forwarded_scheme_is_ignored_outside_trusted_proxy_boundary():
     assert b'strict-transport-security' not in headers
 
 
+def test_forwarded_http_scheme_does_not_corrupt_websocket_scope():
+    observed = []
+
+    async def inner(scope, receive, send):
+        observed.append((scope.get('type'), scope.get('scheme')))
+
+    async def receive():
+        return {'type': 'websocket.disconnect'}
+
+    async def send(message):
+        raise AssertionError(f'unexpected WebSocket send: {message}')
+
+    application = TrustedProxyScheme(
+        inner,
+        trusted_networks=(ip_network('10.0.0.0/8'),),
+    )
+    asyncio.run(
+        application(
+            {
+                'type': 'websocket',
+                'path': '/socket',
+                'scheme': 'wss',
+                'client': ('10.0.0.10', 43123),
+                'headers': [(b'x-forwarded-proto', b'https')],
+            },
+            receive,
+            send,
+        )
+    )
+    assert observed == [('websocket', 'wss')]
+
+
 def test_production_wrapper_replaces_browser_and_isolation_headers():
     start = _run_wrapper([
         (b'x-content-type-options', b'legacy'),
