@@ -79,17 +79,10 @@ def collect_evidence() -> dict:
                          AND name NOT LIKE 'sqlite_%'"""
                 ).fetchone()[0]
             )
-            persisted_schema = conn.execute(
-                "SELECT value FROM app_meta WHERE key='schema_version'"
-            ).fetchone()
 
-        persisted_schema_version = (
-            int(persisted_schema[0]) if persisted_schema is not None else None
-        )
         return {
             'application_version': APP_VERSION,
             'schema_version': int(SCHEMA_VERSION),
-            'persisted_schema_version': persisted_schema_version,
             'database_backend': DB_BACKEND,
             'api_routes': api_routes,
             'api_route_methods': api_route_methods,
