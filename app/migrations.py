@@ -291,12 +291,18 @@ def _secure_seed_hasher(hash_password, secret: str):
 
 
 def find_insecure_demo_users(conn, verify_password) -> list[str]:
+    """Return seeded accounts that still retain a packaged demo password.
+
+    Inactive accounts are intentionally included. Leaving a known credential on
+    a dormant principal would make a later administrative reactivation restore a
+    publicly documented login without requiring a password reset.
+    """
     insecure: list[str] = []
     for username, packaged_password in DEMO_DEFAULT_CREDENTIALS.items():
         row = conn.execute(
             'SELECT password_hash,active FROM users WHERE username=?', (username,)
         ).fetchone()
-        if row and int(row['active'] or 0) and verify_password(packaged_password, row['password_hash']):
+        if row and verify_password(packaged_password, row['password_hash']):
             insecure.append(username)
     return insecure
 
@@ -308,7 +314,7 @@ def _rotate_insecure_demo_credentials(conn, hash_password, verify_password, secr
         row = conn.execute(
             'SELECT id,password_hash,active FROM users WHERE username=?', (username,)
         ).fetchone()
-        if not row or not int(row['active'] or 0):
+        if not row:
             continue
         if not verify_password(packaged_password, row['password_hash']):
             continue
@@ -370,7 +376,7 @@ def initialize_database(hash_password) -> dict:
             insecure = find_insecure_demo_users(conn, verify_password)
             if insecure and not secret:
                 raise MigrationError(
-                    'packaged demo credentials remain active for: '
+                    'packaged demo credentials remain for: '
                     + ','.join(insecure)
                     + '; set EUAS_BOOTSTRAP_ADMIN_PASSWORD to rotate them before startup'
                 )
@@ -393,7 +399,7 @@ def initialize_database(hash_password) -> dict:
             remaining = find_insecure_demo_users(conn, verify_password)
             if remaining:
                 raise MigrationError(
-                    'packaged demo credentials remain active after hardening: '
+                    'packaged demo credentials remain after hardening: '
                     + ','.join(remaining)
                 )
 
