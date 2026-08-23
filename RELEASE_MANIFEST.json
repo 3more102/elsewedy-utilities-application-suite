@@ -1,15 +1,15 @@
 {
   "application": "Elsewedy Utilities Application Suite (EUAS)",
   "version": "4.9.0",
-  "release_focus": "Approval delegation scope, immutable decision evidence, target snapshot binding and authority narrowing",
+  "release_focus": "Approval evidence, maintenance command atomicity, dispatch ownership and inventory startup reconciliation",
   "schema_version": 22,
   "api_endpoints": 244,
   "api_routes_under_api": 243,
   "relational_tables": 89,
   "explicit_indexes": 88,
-  "automated_tests": 88,
+  "automated_tests": 91,
   "verification": {
-    "pytest": "PASS — 88 source test definitions / 90 collected tests",
+    "pytest": "PASS — 91 source test definitions / 93 collected tests",
     "fresh_uvicorn_http_smoke": "PASS — version=4.9.0 with RCM read surface",
     "fresh_sqlite_schema": "PASS — schema 22, 89 tables, 88 indexes, integrity ok",
     "python_compile": "PASS",

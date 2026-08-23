@@ -15,9 +15,9 @@ from core.database import db, init_db, now
 from apps.audit import audit, verify_audit_chain
 from apps.events import emit_event, process_outbox, rearm_outbox_event, workflow_event
 from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as create_asset_record, delete_asset as delete_asset_record, update_asset as update_asset_record
-from apps.maintenance import ACTION_ROLES, TRANSITIONS, InvalidWorkTransition, WorkTransitionForbidden, backfill_work_order_slas as _backfill_work_order_slas, ensure_work_sla as _ensure_work_sla, mark_sla_resolution as _mark_sla_resolution, mark_sla_response as _mark_sla_response, transition_target, validate_transition_actor
+from apps.maintenance import ACTION_ROLES, TRANSITIONS, DispatchError, InvalidWorkTransition, MaintenanceCommandError, WorkTransitionForbidden, backfill_work_order_slas as _backfill_work_order_slas, create_dispatch as create_dispatch_record, create_work_order as create_work_order_record, ensure_work_sla as _ensure_work_sla, mark_sla_resolution as _mark_sla_resolution, mark_sla_response as _mark_sla_response, transition_dispatch as transition_dispatch_record, transition_target, transition_work_order as transition_work_order_record, update_work_order as update_work_order_record, validate_transition_actor
 from apps.procurement import InvalidProcurementTransition, purchase_order_receive_target, requisition_target
-from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction, reservation_rows as _reservation_rows, sync_reserved_stock as _sync_reserved_stock, work_order_parts_readiness as _work_order_parts_readiness
+from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction, reconcile_reserved_stock as _reconcile_reserved_stock, reservation_rows as _reservation_rows, sync_reserved_stock as _sync_reserved_stock, work_order_parts_readiness as _work_order_parts_readiness
 from apps.inspections import corrective_required, inspection_result
 from apps.hse import is_high_risk, risk_score, validate_hse_status
 from apps.projects import InvalidProjectTask, normalize_task_changes, recalculate_project_progress
@@ -51,6 +51,7 @@ from apps.authorization import require_roles, require_permission, effective_perm
 async def lifespan(app: FastAPI):
     init_db(hash_password)
     with db() as conn:
+        _reconcile_reserved_stock(conn)
         _backfill_work_order_slas(conn)
         for incident in rows(conn.execute('SELECT id FROM alarm_incidents ORDER BY id')):
             _refresh_incident(conn,incident['id'])
@@ -1846,52 +1847,21 @@ def get_work(wo_id:int,user=Depends(current_user)):
 @app.post('/api/work-orders')
 def create_work(body:WorkOrderIn,user=Depends(require_permission('work.write',*WRITE_ROLES))):
     with db() as conn:
-        linked_fmea=_fmea_record(conn,body.asset_fmea_id,body.asset_id) if body.asset_fmea_id else None
-        asset_id=body.asset_id or (linked_fmea['asset_id'] if linked_fmea else None)
-        no=next_no(conn,'work_orders','wo_no','WO-',10026);loc=body.location_id
-        if asset_id and not loc:
-            r=conn.execute('SELECT location_id FROM assets WHERE id=?',(asset_id,)).fetchone();loc=r['location_id'] if r else None
-        failure_code=body.failure_code or (linked_fmea['mode_no'] if linked_fmea else '')
-        cur=conn.execute('''INSERT INTO work_orders(wo_no,title,description,asset_id,location_id,priority,status,work_type,failure_code,asset_fmea_id,requested_by,assigned_to,supervisor_id,target_start,target_finish,estimated_hours,safety_requirements,instructions,checklist,estimated_cost,created_at,updated_at) VALUES(?,?,?,?,?,?, 'Draft',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(no,body.title,body.description,asset_id,loc,body.priority,body.work_type,failure_code,body.asset_fmea_id,user['id'],body.assigned_to,body.supervisor_id,body.target_start,body.target_finish,body.estimated_hours,body.safety_requirements,body.instructions,body.checklist,body.estimated_cost,now(),now()))
-        checklist=[x.strip() for x in body.checklist.replace('\n',';').replace(',',';').split(';') if x.strip()]
-        for seq,task in enumerate(checklist,1): conn.execute("INSERT INTO work_order_tasks(work_order_id,sequence_no,task,status) VALUES(?,?,?,'Pending')",(cur.lastrowid,seq,task))
-        _ensure_work_sla(conn,cur.lastrowid)
-        workflow_event(conn,'Work Management','work_order',cur.lastrowid,no,'CREATE','', 'Draft',user['id'])
-        if body.assigned_to: notify(conn,'Work order assigned',f'{no} — {body.title}','High' if body.priority in ('High','Critical','Emergency') else 'Info',body.assigned_to,None,'work',no)
-        audit(conn,user['id'],'CREATE','Work Management',no,'',body.model_dump());return {'id':cur.lastrowid,'wo_no':no}
+        try:return create_work_order_record(conn,body.model_dump(),user)
+        except FmeaError as exc:raise HTTPException(exc.status_code,str(exc))
+        except MaintenanceCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 @app.patch('/api/work-orders/{wo_id}')
 def update_work(wo_id:int,body:WorkOrderPatch,user=Depends(require_permission('work.write',*WRITE_ROLES))):
-    changes={k:v for k,v in body.model_dump().items() if v is not None}
     with db() as conn:
-        old=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(wo_id,),'Work order not found')
-        if changes:
-            conn.execute('UPDATE work_orders SET '+','.join(f'{k}=?' for k in changes)+',updated_at=? WHERE id=?',(*changes.values(),now(),wo_id));audit(conn,user['id'],'UPDATE','Work Management',old['wo_no'],old,changes)
-            if 'priority' in changes:_ensure_work_sla(conn,wo_id,force=True)
-            if 'assigned_to' in changes and changes['assigned_to']:notify(conn,'Work order assigned',f"{old['wo_no']} — {changes.get('title',old['title'])}",'Info',changes['assigned_to'],None,'work',old['wo_no'])
-        return {'ok':True}
+        try:return update_work_order_record(conn,wo_id,body.model_dump(),user)
+        except MaintenanceCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 @app.post('/api/work-orders/{wo_id}/transition')
 def transition_work(wo_id:int,body:TransitionIn,user=Depends(require_permission('work.transition',*WORK_ROLES))):
     with db() as conn:
-        w=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(wo_id,),'Work order not found');action=body.action.lower()
-        try:
-            target=transition_target(w['status'],action)
-            validate_transition_actor(w,action,user)
+        try:return transition_work_order_record(conn,wo_id,body.action,user,notes=body.notes,signature=body.signature)
         except WorkTransitionForbidden as exc:raise HTTPException(403,str(exc))
         except InvalidWorkTransition as exc:raise HTTPException(409,str(exc))
-        fields={'status':target,'updated_at':now()}
-        if action=='start':fields['actual_start']=now()
-        if action=='complete':fields['actual_finish']=now();fields['completion_notes']=body.notes or w['completion_notes'];fields['technician_signature']=body.signature or w.get('technician_signature','')
-        conn.execute('UPDATE work_orders SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?',(*fields.values(),wo_id))
-        if action=='start':_mark_sla_response(conn,wo_id,fields['actual_start'])
-        if action=='complete':_mark_sla_resolution(conn,wo_id,fields['actual_finish'])
-        if action in ('submit','resubmit'):
-            create_approval(conn,'Work Management','work_order',wo_id,w['wo_no'],f"Approve {w['wo_no']} — {w['title']}",user['id'],assigned_user_id=w['supervisor_id'],assigned_role=None if w['supervisor_id'] else 'maintenance_manager')
-        if action=='approve':resolve_approval(conn,'Work Management','work_order',wo_id,'approve',user['id'],body.notes)
-        if target=='Closed' and w['asset_id']:
-            conn.execute('UPDATE assets SET last_maintenance=?,updated_at=? WHERE id=?',(date.today().isoformat(),now(),w['asset_id']))
-        workflow_event(conn,'Work Management','work_order',wo_id,w['wo_no'],action.upper(),w['status'],target,user['id'],body.notes)
-        audit(conn,user['id'],action.upper(),'Work Management',w['wo_no'],w['status'],target);notify(conn,'Work order status changed',f"{w['wo_no']} is now {target}",'Info',w['requested_by'],None,'work',w['wo_no'])
-        return {'ok':True,'status':target}
+        except MaintenanceCommandError as exc:raise HTTPException(exc.status_code,str(exc))
 @app.get('/api/work-orders/{wo_id}/parts-readiness')
 def work_parts_readiness(wo_id:int,user=Depends(current_user)):
     with db() as conn:
@@ -2414,38 +2384,14 @@ def dispatch_board(site_id:Optional[int]=None,user=Depends(current_user)):
 @app.post('/api/work-orders/{wo_id}/dispatch')
 def dispatch_work(wo_id:int,body:DispatchIn,user=Depends(require_permission('work.write','admin','maintenance_manager','planner','supervisor'))):
     with db() as conn:
-        w=get_or_404(conn,'SELECT * FROM work_orders WHERE id=?',(wo_id,),'Work order not found')
-        if w['status'] not in ('Approved','Assigned'):raise HTTPException(409,'Work order must be Approved or Assigned before dispatch')
-        tech=get_or_404(conn,"SELECT u.id,u.full_name FROM users u JOIN roles r ON r.id=u.role_id WHERE u.id=? AND u.active=1 AND r.code='technician'",(body.technician_user_id,),'Active technician not found')
-        busy=conn.execute("SELECT d.dispatch_no,w.wo_no FROM dispatch_assignments d JOIN work_orders w ON w.id=d.work_order_id WHERE d.technician_user_id=? AND d.work_order_id<>? AND d.status IN ('Dispatched','Accepted','En Route','On Site') ORDER BY d.id DESC LIMIT 1",(body.technician_user_id,wo_id)).fetchone()
-        if busy:raise HTTPException(409,f"Technician already has active dispatch {busy['dispatch_no']} for {busy['wo_no']}")
-        conn.execute("UPDATE dispatch_assignments SET status='Cancelled',cancelled_at=? WHERE work_order_id=? AND status IN ('Dispatched','Accepted','En Route','On Site')",(now(),wo_id))
-        no=next_no(conn,'dispatch_assignments','dispatch_no','DSP-',40001);cur=conn.execute("INSERT INTO dispatch_assignments(dispatch_no,work_order_id,technician_user_id,dispatched_by,status,eta_minutes,notes,dispatched_at) VALUES(?,?,?,?, 'Dispatched',?,?,?)",(no,wo_id,body.technician_user_id,user['id'],body.eta_minutes,body.notes,now()))
-        old=w['status'];conn.execute("UPDATE work_orders SET assigned_to=?,status='Assigned',updated_at=? WHERE id=?",(body.technician_user_id,now(),wo_id))
-        workflow_event(conn,'Work Management','work_order',wo_id,w['wo_no'],'DISPATCH',old,'Assigned',user['id'],f'{no} → {tech["full_name"]}');audit(conn,user['id'],'DISPATCH','Field Service',no,'',{'work_order':w['wo_no'],'technician':tech['full_name'],'eta_minutes':body.eta_minutes})
-        notify(conn,'Dispatch assigned',f'{no} — {w["wo_no"]}: {w["title"]}','High' if w['priority'] in ('Emergency','Critical','High') else 'Info',body.technician_user_id,None,'dispatch',no)
-        return {'id':cur.lastrowid,'dispatch_no':no,'status':'Dispatched'}
+        try:return create_dispatch_record(conn,wo_id,body.technician_user_id,user,eta_minutes=body.eta_minutes,notes=body.notes)
+        except DispatchError as exc:raise HTTPException(exc.status_code,str(exc))
 
 @app.post('/api/dispatch/{dispatch_id}/transition')
 def transition_dispatch(dispatch_id:int,body:DispatchTransitionIn,user=Depends(require_permission('work.transition',*WORK_ROLES))):
-    action=body.action.lower().replace(' ','');mapping={'accept':('Dispatched','Accepted','accepted_at'),'enroute':('Accepted','En Route','enroute_at'),'arrive':('En Route','On Site','arrived_at'),'complete':('On Site','Completed','completed_at')}
     with db() as conn:
-        d=get_or_404(conn,'SELECT d.*,w.wo_no,w.status work_status FROM dispatch_assignments d JOIN work_orders w ON w.id=d.work_order_id WHERE d.id=?',(dispatch_id,),'Dispatch not found')
-        elevated=user['role'] in ('admin','maintenance_manager','planner','supervisor')
-        if user['role']=='technician' and d['technician_user_id']!=user['id']:raise HTTPException(403,'Technicians can only update their own dispatch')
-        if action=='cancel':
-            if not elevated:raise HTTPException(403,'Only planners/supervisors can cancel dispatch')
-            if d['status'] in ('Completed','Cancelled'):raise HTTPException(409,f"Dispatch is {d['status']}")
-            target='Cancelled';field='cancelled_at'
-        else:
-            if action not in mapping:raise HTTPException(400,'Action must be accept, enroute, arrive, complete or cancel')
-            expected,target,field=mapping[action]
-            if d['status']!=expected:raise HTTPException(409,f"Action {action} requires {expected}, current status is {d['status']}")
-        stamp=now();conn.execute(f'UPDATE dispatch_assignments SET status=?,{field}=?,notes=CASE WHEN ?<>\'\' THEN ? ELSE notes END WHERE id=?',(target,stamp,body.notes,body.notes,dispatch_id))
-        if action=='arrive' and d['work_status']=='Assigned':
-            conn.execute("UPDATE work_orders SET status='In Progress',actual_start=COALESCE(actual_start,?),updated_at=? WHERE id=?",(stamp,stamp,d['work_order_id']));_mark_sla_response(conn,d['work_order_id'],stamp)
-            workflow_event(conn,'Work Management','work_order',d['work_order_id'],d['wo_no'],'ARRIVE','Assigned','In Progress',user['id'],body.notes)
-        audit(conn,user['id'],'DISPATCH '+action.upper(),'Field Service',d['dispatch_no'],d['status'],target);return {'ok':True,'status':target}
+        try:return transition_dispatch_record(conn,dispatch_id,body.action,user,notes=body.notes)
+        except DispatchError as exc:raise HTTPException(exc.status_code,str(exc))
 
 # ---------- field service ----------
 @app.get('/api/field/my-work')

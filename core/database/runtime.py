@@ -981,7 +981,7 @@ def init_db(hash_password):
               ('OIL-FLT-TR','Transformer Oil Filter','Replacement filtration cartridge','Electrical',w['WH-NCS'],3,1,2,12,4,165,'ea',v['VND-ABB'],'E-01-02'),
               ('BRK-COIL-11KV','11 kV Breaker Trip Coil','Trip coil spare for breaker','Electrical',w['WH-NCS'],2,0,1,6,2,410,'ea',v['VND-SCH'],'E-02-01'),
               ('PUMP-SEAL-301','Pump Mechanical Seal Kit','Seal kit compatible with PMP-301','Mechanical',w['WH-IWP'],1,0,1,5,2,520,'kit',v['VND-PMP'],'M-01-04'),
-              ('AHU-FLT-600','AHU Filter 600x600','MERV filter','HVAC',w['WH-CAI'],18,2,8,30,10,28,'ea',v['VND-HVAC'],'H-03-06')])
+              ('AHU-FLT-600','AHU Filter 600x600','MERV filter','HVAC',w['WH-CAI'],18,0,8,30,10,28,'ea',v['VND-HVAC'],'H-03-06')])
 
         if conn.execute('SELECT COUNT(*) FROM maintenance_plans').fetchone()[0] == 0:
             a={r['asset_no']:r['id'] for r in conn.execute('SELECT id,asset_no FROM assets')}; today=date.today()

@@ -21,3 +21,20 @@ def test_inventory_transaction_boundary_preserves_reserved_stock_guard():
         )
         assert blocked.status_code == 409
         assert 'Insufficient unreserved stock' in blocked.text
+
+
+def test_reserved_stock_cache_matches_active_reservation_ledger_on_fresh_startup():
+    import sqlite3
+    from pathlib import Path
+
+    test_db = Path(__file__).resolve().parents[1] / 'euas_test.db'
+    with TestClient(app):
+        pass
+    with sqlite3.connect(test_db) as conn:
+        mismatches = conn.execute(
+            """SELECT i.item_no,i.reserved_stock,COALESCE(SUM(CASE WHEN r.status IN ('Reserved','Partially Issued')
+                       THEN r.quantity-r.issued_quantity ELSE 0 END),0) ledger_reserved
+               FROM inventory_items i LEFT JOIN inventory_reservations r ON r.inventory_item_id=i.id
+               GROUP BY i.id HAVING ABS(i.reserved_stock-ledger_reserved)>0.000001"""
+        ).fetchall()
+    assert mismatches == []

@@ -11,9 +11,9 @@ EUAS remains one deployable platform and one database-backed application. The mo
 | Identity | `apps/identity/` | passwords, sessions, login throttling |
 | Authorization | `apps/authorization/` | role checks, permission/capability policy evaluation |
 | Assets | `apps/assets/` | asset mutation service and asset-created event publication |
-| Maintenance | `apps/maintenance/` | work-order transition policy shared by API and field sync |
+| Maintenance | `apps/maintenance/` | work-order creation/update commands, atomic lifecycle transitions, dispatch ownership, SLA handling |
 | Procurement | `apps/procurement/` | requisition/PO lifecycle policy |
-| Inventory | `apps/inventory/` | stock transaction engine and reserved-stock protection |
+| Inventory | `apps/inventory/` | stock transaction engine, reservations/readiness, reserved-stock reconciliation and protection |
 | HSE | `apps/hse/` | HSE risk/status policy |
 | Inspections | `apps/inspections/` | inspection result/corrective-action policy and failure event trigger |
 | Projects | `apps/projects/` | project-task normalization and progress recalculation |
@@ -66,10 +66,10 @@ DeadLetter --manual retry/reset--> Pending
 
 ## Jobs boundary status
 
-A persistent worker queue with leasing, heartbeat and worker registry is **not present in the current v4.9 source tree**. No empty `apps/jobs/` placeholder is created. Existing synchronous automation history remains in `job_runs` until a real persistent worker subsystem is introduced and can be migrated behind a meaningful app interface.
+`apps/jobs/` is a real persistent worker subsystem backed by the shared database. It owns durable jobs, workers, job attempts and leases, including atomic claim, heartbeat, retry/backoff, lease-expiry recovery, DeadLetter, manual replay, cancellation, deduplication and handler registration. Event dispatch consumes this platform through the canonical Events boundary rather than a parallel queue.
 
 ## Remaining monolithic work
 
-`app/main.py` still contains substantial API orchestration and several large read/reporting/service helpers, including telemetry/alarm intelligence, reliability/FMEA/RCM, approval/evidence, retention, workforce planning, field sync, reports/exports and some maintenance/asset read models. These should be extracted incrementally with focused tests rather than by a big-bang route move.
+`app/main.py` still contains substantial API orchestration and large read/reporting helpers, including procurement/inventory HTTP commands, inspection/HSE execution, retention, field synchronization, reports/exports and several cross-domain read models. Telemetry, alarms, correlation, condition monitoring, jobs, CBM, reliability/FMEA/RCM, workforce/scheduling/preventive maintenance and approval evidence already have canonical application boundaries.
 
-The next migration target should be the telemetry/alarm operations service because it is one of the largest remaining coherent domains and already has extensive regression coverage.
+The next migration target is procurement and inventory command/concurrency hardening, followed by inspection/HSE execution and route decomposition.

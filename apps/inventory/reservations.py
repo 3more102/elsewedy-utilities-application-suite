@@ -25,6 +25,14 @@ def sync_reserved_stock(conn, item_id: int) -> float:
     return value
 
 
+def reconcile_reserved_stock(conn) -> int:
+    """Rebuild the cached reserved_stock values from the reservation ledger."""
+    item_ids = [row[0] for row in conn.execute('SELECT id FROM inventory_items').fetchall()]
+    for item_id in item_ids:
+        sync_reserved_stock(conn, int(item_id))
+    return len(item_ids)
+
+
 def work_order_parts_readiness(conn, work_order_id: int) -> dict:
     requirements = _rows(conn.execute(
         """SELECT r.*,i.item_no,i.name,i.unit,i.current_stock,i.reserved_stock,w.warehouse_code,w.name warehouse_name
