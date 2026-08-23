@@ -17,7 +17,7 @@ def test_help_override_is_last_credential_free_and_precached():
     html = INDEX.read_text(encoding='utf-8')
     help_js = HELP_SECURITY.read_text(encoding='utf-8')
     service_worker = SERVICE_WORKER.read_text(encoding='utf-8')
-    legacy_app = APP_JS.read_text(encoding='utf-8')
+    app_js = APP_JS.read_text(encoding='utf-8')
     scripts = re.findall(r'<script src="([^"]+)"', html)
 
     assert HELP_SECURITY.exists()
@@ -31,10 +31,11 @@ def test_help_override_is_last_credential_free_and_precached():
     assert 'EUAS@2026' not in help_js
     assert 'Tech@2026' not in help_js
 
-    # The legacy monolith currently contains reference-account copy in more than
-    # one render path. Until that monolith is decomposed, the last-loaded guard
-    # must protect every matching display shape rather than Help alone.
-    assert len(LEGACY_CREDENTIAL_DISPLAY.findall(legacy_app)) >= 2
+    # PR #92 removes the historical credential display strings from the source
+    # monolith. Keep the last-loaded scrubber as defense in depth for future
+    # dynamically generated legacy content, but require the known source debt to
+    # stay at zero rather than depending on the guard for current app.js text.
+    assert LEGACY_CREDENTIAL_DISPLAY.findall(app_js) == []
 
     assert "const CACHE='euas-shell-v3.9.0-ui12'" in service_worker
     assert "'/static/help-security.js'" in service_worker
