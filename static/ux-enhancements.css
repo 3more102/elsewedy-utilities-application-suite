@@ -1,0 +1,38 @@
+/* EUAS UX enhancement layer — interaction feedback and accessibility affordances. */
+.mobile-scrim{position:fixed;inset:0;background:rgba(15,23,34,.44);backdrop-filter:blur(2px);opacity:0;visibility:hidden;transition:opacity .18s ease,visibility .18s ease;z-index:18}
+.mobile-scrim.show{opacity:1;visibility:visible}
+body.nav-open{overflow:hidden}
+
+/* Loading feedback for async module transitions. */
+#content>.empty.loading-state{position:relative;min-height:220px;display:grid;place-items:center;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:linear-gradient(180deg,#fff,#f8fafc);font-weight:700;color:var(--muted)}
+#content>.empty.loading-state:before{content:"";position:absolute;inset:24px;background:linear-gradient(90deg,#edf0f3 20%,#f8fafc 38%,#edf0f3 56%);background-size:220% 100%;border-radius:12px;opacity:.78;animation:euas-shimmer 1.35s linear infinite;clip-path:polygon(0 0,60% 0,60% 18%,100% 18%,100% 34%,74% 34%,74% 52%,92% 52%,92% 68%,54% 68%,54% 84%,100% 84%,100% 100%,0 100%,0 82%,44% 82%,44% 65%,8% 65%,8% 49%,36% 49%,36% 32%,0 32%)}
+#content>.empty.loading-state{isolation:isolate}#content>.empty.loading-state>*{position:relative;z-index:1}
+@keyframes euas-shimmer{to{background-position:-220% 0}}
+
+/* Keyboard search navigation. */
+.search-item.keyboard-active{background:#fff1f2!important;border-color:#e9bdc0!important;box-shadow:inset 3px 0 0 var(--red)}
+.search-item[role="option"]{outline:none}
+.search-results[aria-busy="true"]{opacity:.7}
+
+/* Better focus treatment inside modal/drawer surfaces. */
+.modal:focus,.drawer:focus{outline:none}
+.modal .icon-btn:focus-visible,.drawer .icon-btn:focus-visible{outline:3px solid rgba(182,36,42,.22);outline-offset:2px}
+body.modal-open,body.drawer-open{overflow:hidden}
+.drawer{transition:transform .2s ease,visibility .2s ease}
+
+/* Action feedback. */
+.btn[aria-busy="true"]{position:relative;pointer-events:none;opacity:.78;padding-right:34px}
+.btn[aria-busy="true"]:after{content:"";position:absolute;right:12px;top:50%;width:12px;height:12px;margin-top:-7px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:euas-spin .7s linear infinite}
+@keyframes euas-spin{to{transform:rotate(360deg)}}
+
+/* Small-screen shell refinements. */
+@media(max-width:820px){
+  .sidebar{z-index:30}.mobile-scrim{display:block}.topbar{z-index:20}
+  .search-results{max-height:min(420px,58vh)}
+}
+@media(min-width:821px){.mobile-scrim{display:none!important}}
+
+@media(prefers-reduced-motion:reduce){
+  .mobile-scrim,.drawer{transition:none!important}
+  #content>.empty.loading-state:before,.btn[aria-busy="true"]:after{animation:none!important}
+}
