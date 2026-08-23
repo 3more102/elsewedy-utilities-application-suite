@@ -18,6 +18,8 @@ from apps.assets import AssetDeleteBlocked, AssetNotFound, create_asset as creat
 from apps.maintenance import ACTION_ROLES, TRANSITIONS, InvalidWorkTransition, WorkTransitionForbidden, transition_target, validate_transition_actor
 from apps.procurement import InvalidProcurementTransition, purchase_order_receive_target, requisition_target
 from apps.inventory import InventoryItemNotFound, InventoryTransactionConflict, InventoryTransactionInvalid, apply_inventory_transaction
+from apps.inspections import corrective_required, inspection_result
+from apps.hse import is_high_risk, risk_score, validate_hse_status
 from core.shared import next_no
 from apps.identity import hash_password, verify_password, current_user, login_key as _login_key, login_is_blocked as _login_is_blocked, login_failure as _login_failure, login_success as _login_success
 from apps.authorization import require_roles, require_permission, effective_permissions, has_permission
@@ -3184,12 +3186,13 @@ def create_inspection(body:InspectionIn,user=Depends(require_permission('work.tr
 @app.post('/api/inspections/{inspection_id}/submit')
 def submit_inspection(inspection_id:int,body:InspectionSubmit,user=Depends(require_permission('work.transition',*WORK_ROLES))):
     with db() as conn:
-        ins=get_or_404(conn,'SELECT * FROM inspections WHERE id=?',(inspection_id,),'Inspection not found');failed=False
+        ins=get_or_404(conn,'SELECT * FROM inspections WHERE id=?',(inspection_id,),'Inspection not found');result=inspection_result(body.responses)
         for r in body.responses:
-            resp=r.get('response','N/A'); failed=failed or resp=='Fail';conn.execute('UPDATE inspection_items SET response=?,reading=?,remarks=? WHERE id=? AND inspection_id=?',(resp,r.get('reading',''),r.get('remarks',''),r.get('id'),inspection_id))
-        corrective=None;result='Fail' if failed else 'Pass'
-        if failed and body.create_corrective_on_fail:
+            resp=r.get('response','N/A');conn.execute('UPDATE inspection_items SET response=?,reading=?,remarks=? WHERE id=? AND inspection_id=?',(resp,r.get('reading',''),r.get('remarks',''),r.get('id'),inspection_id))
+        corrective=None
+        if corrective_required(result,body.create_corrective_on_fail):
             asset=conn.execute('SELECT * FROM assets WHERE id=?',(ins['asset_id'],)).fetchone() if ins['asset_id'] else None;no=next_no(conn,'work_orders','wo_no','WO-',10026);cur=conn.execute('''INSERT INTO work_orders(wo_no,title,description,asset_id,location_id,priority,status,work_type,requested_by,target_start,target_finish,instructions,created_at,updated_at) VALUES(?,?,?,?,?,'High','Submitted','Corrective Maintenance',?,?,?,?,?,?)''',(no,f"Corrective action from {ins['inspection_no']}",f"Inspection {ins['inspection_no']} failed. Review failed items and correct defects.",ins['asset_id'],asset['location_id'] if asset else None,user['id'],date.today().isoformat(),(date.today()+timedelta(days=2)).isoformat(),'Review failed inspection items and implement corrective actions.',now(),now()));corrective=cur.lastrowid;conn.execute('UPDATE inspections SET corrective_wo_id=? WHERE id=?',(corrective,inspection_id));notify(conn,'Inspection failed',f'{ins["inspection_no"]} failed and generated {no}','High',None,'planner','inspections',ins['inspection_no'])
+        if result=='Fail':emit_event(conn,'inspection.failed','inspection',ins['inspection_no'],{'inspection_id':inspection_id,'inspection_no':ins['inspection_no'],'corrective_work_order_id':corrective})
         conn.execute("UPDATE inspections SET status='Completed',result=?,inspected_at=?,remarks=? WHERE id=?",(result,now(),body.remarks,inspection_id));audit(conn,user['id'],'SUBMIT','Inspections',ins['inspection_no'],'Draft',result);return {'ok':True,'result':result,'corrective_work_order_id':corrective}
 
 # ---------- HSE ----------
@@ -3199,8 +3202,8 @@ def list_hse(user=Depends(current_user)):
 @app.post('/api/hse')
 def create_hse(body:HSEIn,user=Depends(require_permission('hse.write',*HSE_ROLES))):
     with db() as conn:
-        no=next_no(conn,'safety_incidents','incident_no','HSE-',7001);risk=body.severity*body.probability;cur=conn.execute('''INSERT INTO safety_incidents(incident_no,incident_type,title,site_id,location_id,asset_id,reported_by,severity,probability,risk_score,status,description,corrective_action,occurred_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?, 'Open',?,?,?,?)''',(no,body.incident_type,body.title,body.site_id,body.location_id,body.asset_id,user['id'],body.severity,body.probability,risk,body.description,body.corrective_action,body.occurred_at or now(),now()));audit(conn,user['id'],'CREATE','HSE',no,'',body.model_dump());
-        if risk>=12:notify(conn,'High HSE risk',f'{no} has risk score {risk}','Critical',None,'maintenance_manager','hse',no)
+        no=next_no(conn,'safety_incidents','incident_no','HSE-',7001);risk=risk_score(body.severity,body.probability);cur=conn.execute('''INSERT INTO safety_incidents(incident_no,incident_type,title,site_id,location_id,asset_id,reported_by,severity,probability,risk_score,status,description,corrective_action,occurred_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?, 'Open',?,?,?,?)''',(no,body.incident_type,body.title,body.site_id,body.location_id,body.asset_id,user['id'],body.severity,body.probability,risk,body.description,body.corrective_action,body.occurred_at or now(),now()));audit(conn,user['id'],'CREATE','HSE',no,'',body.model_dump());
+        if is_high_risk(risk):notify(conn,'High HSE risk',f'{no} has risk score {risk}','Critical',None,'maintenance_manager','hse',no)
         return {'id':cur.lastrowid,'incident_no':no,'risk_score':risk}
 @app.patch('/api/hse/{incident_id}')
 def update_hse(incident_id:int,body:HSEPatch,user=Depends(require_permission('hse.write',*HSE_ROLES))):
@@ -3208,14 +3211,14 @@ def update_hse(incident_id:int,body:HSEPatch,user=Depends(require_permission('hs
     with db() as conn:
         old=get_or_404(conn,'SELECT * FROM safety_incidents WHERE id=?',(incident_id,),'HSE record not found')
         if not changes:return old
-        if 'status' in changes and changes['status'] not in ('Open','Investigating','Action Required','Closed','Cancelled'):
+        if 'status' in changes and not validate_hse_status(changes['status']):
             raise HTTPException(400,'Invalid HSE status')
         severity=int(changes.get('severity',old['severity'])); probability=int(changes.get('probability',old['probability']))
-        if 'severity' in changes or 'probability' in changes: changes['risk_score']=severity*probability
+        if 'severity' in changes or 'probability' in changes: changes['risk_score']=risk_score(severity,probability)
         sets=','.join(f'{k}=?' for k in changes)
         conn.execute(f'UPDATE safety_incidents SET {sets} WHERE id=?',(*changes.values(),incident_id))
         audit(conn,user['id'],'UPDATE','HSE',old['incident_no'],old,changes)
-        if changes.get('risk_score',old['risk_score'])>=12 and old['risk_score']<12:
+        if is_high_risk(changes.get('risk_score',old['risk_score'])) and not is_high_risk(old['risk_score']):
             notify(conn,'High HSE risk',f"{old['incident_no']} escalated to risk score {changes['risk_score']}",'Critical',None,'maintenance_manager','hse',old['incident_no'])
         return one(conn.execute('SELECT * FROM safety_incidents WHERE id=?',(incident_id,)))
 
