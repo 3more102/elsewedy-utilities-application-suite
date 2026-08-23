@@ -27,6 +27,14 @@ TRUSTED_PROXY_CIDRS = tuple(
     for x in os.getenv('EUAS_TRUSTED_PROXY_CIDRS', '').split(',')
     if x.strip()
 )
+# Fail closed when the production entrypoint is used without deployment-specific
+# host configuration: local health/smoke traffic remains available, while an
+# arbitrary public Host header is not accepted accidentally.
+ALLOWED_HOSTS = tuple(
+    x.strip().lower()
+    for x in os.getenv('EUAS_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
+    if x.strip()
+)
 
 EVENT_WEBHOOK_URL = os.getenv('EUAS_EVENT_WEBHOOK_URL', '').strip()
 EVENT_WEBHOOK_SECRET = os.getenv('EUAS_EVENT_WEBHOOK_SECRET', '').strip()
