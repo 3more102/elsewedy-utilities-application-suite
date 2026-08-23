@@ -357,11 +357,21 @@ def append_work_note_atomic(conn, wo_id: int, body, user: dict) -> dict:
 
     entry = f"[{_application.now()}] {user['full_name']}: {body.note}"
     new_comments = ((work['comments'] or '') + '\n' + entry).strip()
+    # The claim includes the observed thread contents, not only updated_at:
+    # that stamp has second resolution, so two concurrent appends in the same
+    # second would otherwise both satisfy an updated_at-only predicate and the
+    # loser would silently erase the winner's note.
     changed = conn.execute(
         '''UPDATE work_orders
            SET comments=?,updated_at=?
-           WHERE id=? AND updated_at=?''',
-        (new_comments, _application.now(), wo_id, work['updated_at']),
+           WHERE id=? AND updated_at=? AND comments=?''',
+        (
+            new_comments,
+            _application.now(),
+            wo_id,
+            work['updated_at'],
+            work['comments'] or '',
+        ),
     )
     if not _rowcount_one(changed):
         raise WorkflowTransitionConflict(
