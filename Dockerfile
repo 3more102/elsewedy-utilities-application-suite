@@ -46,5 +46,7 @@ EXPOSE 8000
 # Production runs through app.production so EUAS can enforce the deployment-only
 # browser policy and resolve forwarded scheme using EUAS_TRUSTED_PROXY_CIDRS.
 # Uvicorn proxy-header rewriting stays disabled so the application retains the
-# raw socket peer required for spoof-resistant X-Forwarded-For validation.
-CMD ["uvicorn","app.production:app","--host","0.0.0.0","--port","8000","--no-proxy-headers"]
+# raw socket peer required for spoof-resistant X-Forwarded-For validation. The
+# default Server header is also disabled to avoid exposing the ASGI server
+# implementation/version family to unauthenticated clients.
+CMD ["uvicorn","app.production:app","--host","0.0.0.0","--port","8000","--no-proxy-headers","--no-server-header"]
