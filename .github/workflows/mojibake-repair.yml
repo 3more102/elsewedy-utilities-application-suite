@@ -1,0 +1,84 @@
+name: One-shot mojibake source repair
+
+on:
+  push:
+    branches:
+      - oxalpha/euas-mojibake-hardening
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact branch head
+        uses: actions/checkout@v7
+        with:
+          ref: oxalpha/euas-mojibake-hardening
+          fetch-depth: 0
+
+      - name: Restore intended UTF-8 source text
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("app/application.py")
+          text = path.read_text(encoding="utf-8")
+          replacements = {
+              "â€”": "—",
+              "Ã—": "×",
+              "â†’": "→",
+              "Â·": "·",
+          }
+
+          counts = {broken: text.count(broken) for broken in replacements}
+          missing = [broken for broken, count in counts.items() if count == 0]
+          if missing:
+              raise SystemExit(f"Expected known mojibake markers are absent: {missing!r}")
+
+          repaired = text
+          for broken, intended in replacements.items():
+              repaired = repaired.replace(broken, intended)
+
+          remaining = [broken for broken in replacements if broken in repaired]
+          if remaining:
+              raise SystemExit(f"Mojibake markers remain after repair: {remaining!r}")
+          if repaired == text:
+              raise SystemExit("Repair made no changes")
+
+          path.write_text(repaired, encoding="utf-8")
+          print("replacement counts:", counts)
+
+      - name: Validate repaired source
+        shell: bash
+        run: |
+          python -m compileall -q app/application.py
+          python - <<'PY'
+          from pathlib import Path
+          roots = (Path('app'), Path('static'))
+          suffixes = {'.py', '.js', '.css', '.html'}
+          markers = ('â€”', 'Ã—', 'â†’', 'Â·')
+          offenders = []
+          for root in roots:
+              for path in root.rglob('*'):
+                  if path.is_file() and path.suffix.lower() in suffixes:
+                      text = path.read_text(encoding='utf-8')
+                      for marker in markers:
+                          if marker in text:
+                              offenders.append(f'{path}: {marker!r}')
+          if offenders:
+              raise SystemExit('Known mojibake remains:\n' + '\n'.join(offenders))
+          PY
+
+      - name: Commit only the repaired source and remove this one-shot workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/mojibake-repair.yml
+          git add app/application.py
+          git diff --cached --check
+          git commit -m "fix(text): restore intended UTF-8 operational strings"
+          git push origin HEAD:oxalpha/euas-mojibake-hardening
