@@ -86,7 +86,7 @@ def _run_trusted_host_wrapper(host: str):
 
 def test_production_wrapper_replaces_legacy_inline_script_policy():
     start = _run_wrapper([
-        (b'content-security-policy', b"default-src 'self'; script-src 'self' 'unsafe-inline'"),
+        (b'content-security-policy', b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"),
         (b'x-content-type-options', b'nosniff'),
         (b'strict-transport-security', b'max-age=0'),
     ])
@@ -105,13 +105,15 @@ def test_production_wrapper_replaces_legacy_inline_script_policy():
     assert hsts_values == []
     csp = csp_values[0]
     assert "script-src 'self'" in csp
-    assert "script-src 'self' 'unsafe-inline'" not in csp
     assert "script-src-elem 'self'" in csp
     assert "script-src-attr 'none'" in csp
-    assert "style-src 'self' 'unsafe-inline'" in csp
+    assert "script-src 'self' 'unsafe-inline'" not in csp
+    assert "style-src 'self'" in csp
     assert "style-src-elem 'self'" in csp
+    assert "style-src-attr 'none'" in csp
+    assert "style-src 'self' 'unsafe-inline'" not in csp
     assert "style-src-elem 'self' 'unsafe-inline'" not in csp
-    assert "style-src-attr 'unsafe-inline'" in csp
+    assert "style-src-attr 'unsafe-inline'" not in csp
     assert "font-src 'self'" in csp
     assert "media-src 'self'" in csp
     assert "worker-src 'self'" in csp
@@ -122,6 +124,7 @@ def test_production_wrapper_replaces_legacy_inline_script_policy():
     assert "base-uri 'self'" in csp
     assert "form-action 'self'" in csp
     assert "frame-ancestors 'none'" in csp
+    assert "'unsafe-inline'" not in csp
     assert '*' not in csp
 
 
@@ -200,3 +203,8 @@ def test_production_entrypoint_matches_external_script_shell_contract():
     assert script_tags
     assert all(re.search(r'\bsrc="/static/[^"]+"', tag, flags=re.I) for tag in script_tags)
     assert not re.search(r'\son[a-z]+\s*=', html, flags=re.I)
+    application_source = (ROOT / 'app' / 'application.py').read_text(encoding='utf-8')
+    report_css = (ROOT / 'static' / 'report.css').read_text(encoding='utf-8')
+    assert application_source.count('/static/report.css') == 2
+    assert '<style' not in application_source.casefold()
+    assert '.report{' in report_css

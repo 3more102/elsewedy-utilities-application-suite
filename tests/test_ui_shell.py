@@ -109,6 +109,13 @@ def test_ui_shell_keeps_application_hooks_and_refresh_layer():
     assert 'value="omar"' not in html
     assert "appropriately provisioned account for technician workflows" in app_js
     assert "appropriately provisioned technician account" in app_js
+    assert "text=await r.text()" in app_js
+    assert "location.origin+'/'" in app_js
+    assert '<base href=' in app_js
+    assert 'new Blob([html],{type:ct})' in app_js
+    assert "await openProtected(`/api/work-orders/${id}/report`)" in app_js
+    assert "throw new Error('Report HTML is missing a head element')" in app_js
+    assert "if(!r.ok)throw new Error('Report failed');const b=await r.blob()" not in app_js
 
     required_ids = {
         "login",
