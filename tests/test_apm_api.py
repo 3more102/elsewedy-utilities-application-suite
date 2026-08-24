@@ -217,6 +217,8 @@ def test_alarm_correlation_finds_recurrence_bursts_and_groups():
 
     base = datetime.now() - timedelta(minutes=30)
     with db() as conn:
+        # Seeded demo alarms must not leak into this correlation window.
+        conn.execute('DELETE FROM operational_alarms')
         asset_id = _make_asset(conn, 'AST-APM-A1')
         ch1 = _make_channel(conn, 'TEL-APM-A1-C1', asset_id)
         ch2 = _make_channel(conn, 'TEL-APM-A1-C2', asset_id)
@@ -346,7 +348,12 @@ def test_cbm_recommendation_lifecycle_and_authorization():
                     'DELETE FROM cbm_recommendations WHERE recommendation_no=?',
                     (recommendation_id,),
                 )
-            conn.execute('DELETE FROM work_orders WHERE title LIKE ?', (f'%{asset_id}%',))
+            conn.execute(
+                'DELETE FROM work_order_sla WHERE work_order_id IN '
+                '(SELECT id FROM work_orders WHERE asset_id=?)',
+                (asset_id,),
+            )
+            conn.execute('DELETE FROM work_orders WHERE asset_id=?', (asset_id,))
             conn.execute('DELETE FROM telemetry_readings WHERE channel_id=?', (channel_id,))
             conn.execute('DELETE FROM telemetry_channels WHERE id=?', (channel_id,))
             conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))

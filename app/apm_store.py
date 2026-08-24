@@ -85,7 +85,8 @@ def _asset_trend_level(conn, asset_id: int) -> tuple[str, list[dict]]:
         level, signals = _channel_condition_level(conn, channel)
         if signals:
             findings.append({
-                'channel': channel['channel_code'],
+                'channel_id': channel['id'],
+                'channel_code': channel['channel_code'],
                 'name': channel['name'],
                 'level': level,
                 'signals': signals,
@@ -562,13 +563,16 @@ def convert_cbm_to_work_order(conn, recommendation_id: int, user: dict) -> dict:
         '''INSERT INTO work_orders(
              wo_no,title,description,asset_id,priority,status,work_type,failure_code,
              requested_by,target_start,created_at,updated_at
-           ) VALUES(?,?,?,?,?,'Submitted','Corrective','',?,?,?,?,?)''',
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
         (
             no,
             title,
             description,
             rec['asset_id'],
             _SEVERITY_PRIORITY.get(rec['severity'], 'Medium'),
+            'Submitted',
+            'Corrective',
+            '',
             user['id'],
             _iso(datetime.now()),
             now(),
@@ -983,6 +987,16 @@ def install_apm_routes() -> None:
             sql += ' ORDER BY CASE r.status WHEN \'Open\' THEN 0 WHEN \'Reviewed\' THEN 1 ELSE 2 END, r.id DESC LIMIT 200'
             return _rows(conn.execute(sql, args))
 
+    @app.post('/api/reliability/cbm-recommendations/{recommendation_id}/convert-to-work-order')
+    def cbm_convert_route(
+        recommendation_id: int,
+        user=Depends(require_roles(*RELIABILITY_MANAGE_ROLES, 'planner')),
+    ):
+        with db() as conn:
+            return convert_cbm_to_work_order(conn, recommendation_id, user)
+
+    # Registered AFTER the literal convert-to-work-order path so FastAPI never
+    # captures it as an {action} decision (whose role list excludes planners).
     @app.post('/api/reliability/cbm-recommendations/{recommendation_id}/{action}')
     def cbm_decide_route(
         recommendation_id: int,
@@ -998,14 +1012,6 @@ def install_apm_routes() -> None:
                 user,
                 suggested_action=body.suggested_action if body else None,
             )
-
-    @app.post('/api/reliability/cbm-recommendations/{recommendation_id}/convert-to-work-order')
-    def cbm_convert_route(
-        recommendation_id: int,
-        user=Depends(require_roles(*RELIABILITY_MANAGE_ROLES, 'planner')),
-    ):
-        with db() as conn:
-            return convert_cbm_to_work_order(conn, recommendation_id, user)
 
     @app.get('/api/reliability/bad-actors')
     def bad_actors_route(
