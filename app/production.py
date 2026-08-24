@@ -24,6 +24,11 @@ The legacy application still mounts ``UPLOAD_DIR`` at ``/uploads`` for reference
 compatibility. Production blocks that mount before routing so randomized stored
 attachment names can never become an alternate unauthenticated download path;
 documents remain available only through the authenticated API download route.
+
+FastAPI's Swagger/OpenAPI introspection routes remain useful in development, but
+production blocks them before application routing. This avoids publishing the
+full API schema and interactive documentation to unauthenticated clients while
+leaving normal API routes and local/reference developer workflows unchanged.
 """
 from __future__ import annotations
 
@@ -73,6 +78,11 @@ PRODUCTION_API_CACHE_HEADERS = {
     b'pragma': b'no-cache',
     b'expires': b'0',
 }
+PRODUCTION_PRIVATE_INTROSPECTION_PATHS = frozenset({
+    '/api/docs',
+    '/openapi.json',
+    '/docs/oauth2-redirect',
+})
 
 
 class ProductionSecurityHeaders:
@@ -118,6 +128,31 @@ class ProductionSecurityHeaders:
             await send(message)
 
         await self.application(scope, receive, send_with_policy)
+
+
+class ProductionPrivateIntrospectionBoundary:
+    """Hide FastAPI documentation and schema routes from production clients."""
+
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') == 'http':
+            path = str(scope.get('path') or '')
+            if path in PRODUCTION_PRIVATE_INTROSPECTION_PATHS or path.startswith('/api/docs/'):
+                body = b'Not Found'
+                await send({
+                    'type': 'http.response.start',
+                    'status': 404,
+                    'headers': [
+                        (b'content-type', b'text/plain; charset=utf-8'),
+                        (b'content-length', str(len(body)).encode('ascii')),
+                        (b'cache-control', b'no-store, private, max-age=0'),
+                    ],
+                })
+                await send({'type': 'http.response.body', 'body': body})
+                return
+        await self.application(scope, receive, send)
 
 
 class ProductionPrivateUploadBoundary:
@@ -211,10 +246,14 @@ def _trusted_host_application(application):
 
 # TrustedProxyScheme only normalizes the request scope. Security headers remain
 # outside TrustedHostMiddleware so even a rejected Host response receives the
-# production browser-security header set. The private-upload boundary sits
+# production browser-security header set. Private production boundaries sit
 # behind host validation but in front of the legacy application router.
 app = TrustedProxyScheme(
     ProductionSecurityHeaders(
-        _trusted_host_application(ProductionPrivateUploadBoundary(_application))
+        _trusted_host_application(
+            ProductionPrivateIntrospectionBoundary(
+                ProductionPrivateUploadBoundary(_application)
+            )
+        )
     )
 )
