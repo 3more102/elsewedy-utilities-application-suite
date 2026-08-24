@@ -17,24 +17,25 @@ It is a runnable multi-app reference suite—not one monolithic application—an
 The latest verified implementation checkpoint on `main` is:
 
 ```text
-1f1e3ee32b99f10f452a90d8050593527f79f575
+6a41c79eb3c84ab46262478e0d2320981074a6a7
 ```
 
-This is the merge of **PR #145 — expand canonical reliability operational trend intelligence**, validated on exact PR head:
+This is the merge of **PR #153 — explain PM compliance through canonical overdue plans**, validated on exact PR head:
 
 ```text
-b17a905f705ffa8ba4c2b20ed658a8173b3776b0
+1a0b839
 ```
 
-The merge record identifies **EUAS CI #420** and **EUAS Security #385** as the exact-head validation gates for that PR.
+The merge record identifies **EUAS CI #455 (run 32754343198)** and **EUAS Security (run 32754343349)** as the exact-head validation gates for that PR.
 
 Immediately preceding integrated work includes:
 
-- **PR #144 — canonicalize production request IDs**: preserves one compact valid client `X-Request-ID`; missing, duplicated, overlong, or malformed values are replaced with a server-generated 128-bit hexadecimal ID.
-- **PR #143 — expand canonical maintenance trend and WHY adapters**: exposes canonical maintenance KPIs through the trend/explanation adapter without duplicating formulas and restricts overdue-work contributors to relevant maintenance metrics.
-- **PR #142 — complete production cross-origin isolation**: adds COEP `require-corp` and `Origin-Agent-Cluster: ?1` alongside same-origin COOP/CORP policy.
-- **PR #141 — hide FastAPI introspection routes in production**: Swagger/OpenAPI/OAuth introspection surfaces return non-cacheable `404` responses in production while development documentation remains available.
-- **PR #139 — post-reconciliation operations integration**: DR/audit hardening, expedite bridge, command strip, and scoped executive export integration.
+- **PR #152 — asset and procurement trend intelligence with snapshot guard**: attempted trend registration for point-in-time computes was reverted after review proved it fabricated flat histories; a structural guard now rejects snapshot-only metrics at `/api/kpi/trend` until genuine as-of evaluation exists.
+- **PR #151 — align repeat-failure contributors with the rate scope**: chronic bad-actor contributors are extracted inside `compute_maintenance_kpis` from the identical joins, scope and predicates as `repeat_failure_rate_pct` itself; location-less (CBM-style) corrective work can no longer surface as a scoped contributor invisible to the displayed rate.
+- **PR #150 — explain repeat failures through canonical chronic bad actors**: `/api/kpi/explanation` for `maintenance/repeat_failure_rate_pct` returns ranked chronic bad actors (assets with ≥ 2 corrective completions in 90 days) with contributor attribution and resolvable drill targets.
+- **PR #149 — repair reliability scope per review**: removed the commissioning-date disjunction that let every commissioned asset into availability/SAIDI denominators regardless of executive scope, and kept open/scheduled planned outages resolvable as WHY evidence.
+- **PR #148 — enforce scope and planned semantics on reliability WHY**: outage numerators match denominator scope under type/criticality filters, WHY contributors are filtered by site/region/type/criticality, planned-outage explanations cite planned records only.
+- **PR #146 — docs refresh** for PR #145 reliability intelligence.
 
 ### Generated engineering evidence
 
@@ -43,12 +44,12 @@ The repository-generated `ENGINEERING_EVIDENCE.json` on current `main` reports:
 | Evidence | Current value |
 |---|---:|
 | Application version | `3.9.0` |
-| API routes | `186` |
-| API route-method registrations | `204` |
+| API routes | `193` |
+| API route-method registrations | `211` |
 | Relational tables | `67` |
 | Explicit indexes | `45` |
 | Schema version | `12` |
-| Source test definitions | `393` |
+| Source test definitions | `413` |
 | Reference database backend | `sqlite` |
 
 These values are generated from the repository tree; they are not manually estimated release claims.
@@ -129,7 +130,7 @@ Trend values are extracted from the canonical `compute_reliability` result; the 
 
 Reliability WHY/contributor responses use outage records as correlation evidence and retain the explicit correlation-not-causation disclaimer.
 
-### Scope model and known Reliability WHY limitation
+### Scope model and WHY contributor guarantees
 
 The canonical KPI computation layer supports executive filtering by:
 
@@ -141,14 +142,16 @@ asset type
 criticality
 ```
 
-Snapshot and trend values are computed through the scoped canonical KPI contracts.
+Snapshot, trend and WHY values are computed through the scoped canonical KPI contracts. The former reliability scope limitation is **resolved** (PRs #148, #149, #151):
 
-**Known limitation on current `main` after PR #145:** two review findings on the reliability WHY contributor adapter remain unresolved:
+1. `compute_reliability` outage numerators apply the same asset-type/criticality scope as the availability denominator; the denominator itself can no longer admit commissioned assets portfolio-wide through an SQL precedence tautology.
+2. Reliability WHY contributors are filtered by every requested site/region/asset-type/criticality dimension; a scoped KPI is never explained by out-of-scope records.
+3. `planned_outages` explanations cite planned (non-forced) records only, including zero-elapsed scheduled/open plans with explicit state labels.
+4. Repeat-failure and PM-compliance contributors are extracted inside the maintenance compute from predicates identical to their metrics — contributor scope equals metric scope by construction.
 
-1. reliability contributor records are not yet guaranteed to be filtered by every requested `site`, `region`, `asset type`, or `criticality` scope;
-2. the `planned_outages` explanation path can reuse forced-outage driver records rather than planned-outage records.
+**Known structural constraint on trends:** a trend sample claims a metric evaluated over a historical window. Canonical computes that read only current row state (asset statuses, live reservations, present stock or PO status) cannot honour that claim and are rejected at `/api/kpi/trend` by a structural guard (`tests/test_kpi_trend_snapshot_guard.py`). Genuine as-of evaluation requires temporal history that the schema does not keep today; `inventory/stockout_lines` remains registered as a pre-existing snapshot-based exception pending temporal redesign.
 
-Therefore, reliability WHY contributors should currently be treated as diagnostic correlation evidence, not as fully scope-faithful causal attribution for filtered or planned-outage explanation requests.
+**Known cache bound:** executive snapshot freshness uses a source watermark plus a 15-minute TTL. Mutations recorded with backdated timestamps (for example historical imports) do not advance the watermark until the TTL expires; this bounds staleness but does not eliminate it.
 
 ---
 
