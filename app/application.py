@@ -338,6 +338,72 @@ def _asset_reliability_rows(conn, period_days:int=365, site_id:Optional[int]=Non
                        'downtime_source':source,'mtbf_hours':mtbf,'mttr_hours':mttr,'availability_pct':availability,'maintenance_cost':round(float(cost),2)})
     return result
 
+def _bad_actor_rows(conn, period_days:int=365, site_id:Optional[int]=None, limit:int=20):
+    """Rank assets by disproportionate contribution to failures, downtime and cost.
+
+    Transparent composite: each asset's share of total failures, downtime hours,
+    maintenance cost and open alarms is reported alongside a mean-share score
+    (0-100). An asset is flagged as a bad actor when its failure share is at
+    least twice its population share or its composite score reaches 50.
+    """
+    rel=_asset_reliability_rows(conn,period_days,site_id)
+    totals={'failures':sum(a['failures'] for a in rel),'downtime_hours':sum(a['downtime_hours'] for a in rel),
+            'maintenance_cost':sum(a['maintenance_cost'] for a in rel)}
+    if not rel or (totals['failures']==0 and totals['downtime_hours']==0 and totals['maintenance_cost']==0):
+        return [],{'population':len(rel),**totals,'flagged':0,
+                   'methodology':'No failure, downtime or cost evidence in the window; no bad actors claimed.'}
+    population=len(rel)
+    alarm_counts={r['asset_id']:r['n'] for r in rows(conn.execute(
+        "SELECT asset_id,COUNT(*) n FROM operational_alarms WHERE status IN ('Open','Acknowledged') AND asset_id IS NOT NULL GROUP BY asset_id"))}
+    scored=[]
+    for a in rel:
+        shares={
+          'failures_share':(a['failures']/totals['failures']) if totals['failures'] else 0.0,
+          'downtime_share':(a['downtime_hours']/totals['downtime_hours']) if totals['downtime_hours'] else 0.0,
+          'cost_share':(a['maintenance_cost']/totals['maintenance_cost']) if totals['maintenance_cost'] else 0.0,
+        }
+        active=any(shares.values())
+        if not active:continue
+        components=[s for s in shares.values() if s>0]
+        composite=round(100*sum(components)/len(components),1)
+        completed=rows(conn.execute('''SELECT id,failure_code,COALESCE(actual_finish,created_at) event_date FROM work_orders
+            WHERE asset_id=? AND status IN ('Completed','Closed')
+            AND (work_type LIKE 'Corrective%' OR work_type='Breakdown') AND length(COALESCE(failure_code,''))>0''',(a['id'],)))
+        stamps=[]
+        for c in completed:
+            try:stamps.append((c['failure_code'],datetime.fromisoformat(str(c['event_date'])[:19])))
+            except ValueError:pass
+        repeat_failures=0
+        for code,ts in stamps:
+            if any(code==c2 and abs((t2-ts).days)<=30 for c2,t2 in stamps if t2!=ts):repeat_failures+=1
+        entry={'asset_id':a['id'],'asset_no':a['asset_no'],'name':a['name'],'site_name':a.get('site_name'),
+               'criticality':a.get('criticality'),'period_days':period_days,
+               'failures':a['failures'],'downtime_hours':a['downtime_hours'],
+               'maintenance_cost':a['maintenance_cost'],'open_alarms':alarm_counts.get(a['id'],0),
+               'repeat_failure_codes':int(repeat_failures),
+               **{k:round(v,4) for k,v in shares.items()},
+               'evidence_share':composite,
+               'bad_actor':False,
+               'reasons':[r for r,c in (
+                  ('failure share at least twice the population share', totals['failures'] and shares['failures_share'] >= 2.0/population),
+                  ('composite evidence share reached 50', composite>=50)) if c]}
+        if entry['reasons']:entry['bad_actor']=True
+        scored.append(entry)
+    scored.sort(key=lambda x:(-x['evidence_share'],-x['failures']))
+    flagged=sum(1 for x in scored if x['bad_actor'])
+    methodology=('Composite = mean of the asset\'s shares of total failures, downtime hours and '
+                 f'maintenance cost over {period_days} days. Bad-actor flag: failure share >= '
+                 'twice the population share or composite >= 50. Correlation is reported as '
+                 'evidence, not proven causation.')
+    return scored[:limit],{'population':population,**totals,'flagged':flagged,'methodology':methodology}
+
+@app.get('/api/reliability/bad-actors')
+def reliability_bad_actors(period_days:int=Query(365,ge=30,le=3650),site_id:Optional[int]=None,
+                           limit:int=Query(20,ge=1,le=100),user=Depends(current_user)):
+    with db() as conn:
+        actors,summary=_bad_actor_rows(conn,period_days,site_id,limit)
+        return {'period_days':period_days,'scope':{'site_id':site_id},'summary':summary,'assets':actors}
+
 def _site_reliability_rows(conn, period_days:int=365):
     assets=_asset_reliability_rows(conn,period_days,None);sites={}
     for a in assets:
