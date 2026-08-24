@@ -355,9 +355,25 @@ def test_corrective_wo_from_incident_context_keeps_audit_linkage():
 
 
 def test_export_hse_equivalence_scope_isolation_and_no_content_leak():
+    """CSV export must equal a freshly recomputed JSON snapshot.
+
+    Uses a unique site so no snapshot cached by an earlier test can serve
+    the export call: incidents seeded with backdated timestamps cannot
+    advance the source watermark, so a same-scope cache entry written
+    before those seeds would otherwise stay valid and report stale counts.
+    """
+    import uuid as _uuid
+
     _ensure_db()
-    site_id = _kpi_site()
-    _seed_incident(incident_no='HSE-KPI-EXP1', site_id=site_id,
+    suffix = _uuid.uuid4().hex[:8].upper()
+    with db() as conn:
+        site_cur = conn.execute(
+            '''INSERT INTO sites(site_code,name,region,city,site_type,status)
+               VALUES(?,?,?,?,?,?)''',
+            (f'KPI-HSE-EXP-{suffix}', f'KPI HSE export site {suffix}',
+             'Greater Cairo', 'Cairo', 'Operations Centre', 'Operating'))
+        site_id = int(site_cur.lastrowid)
+    _seed_incident(incident_no=f'HSE-KPI-EXP1-{suffix}', site_id=site_id,
                    severity=4, probability=3, status='Open', created_days_ago=2)
     with TestClient(app) as client:
         admin = auth(client)
