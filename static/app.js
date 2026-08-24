@@ -242,7 +242,7 @@ async function renderOpsCenter(){
       <td><span class="code">${esc(s.anchor_no)}</span><small>${esc(s.anchor_type)}</small></td>
       <td>${esc(s.started_at||'-')}${s.outage_duration_hours!=null?`<small>${fmt(s.outage_duration_hours)}h open</small>`:''}</td>
       <td>${(s.alarms||[]).length}</td>
-      <td>${(s.work_orders||[]).length}${blockers?` <span class="status bad">⛔ ${blockers} blocked</span>`:''}</td>
+      <td>${(s.work_orders||[]).length}${blockers?` <span class="status bad">⛔ ${blockers} blocked</span><button class="btn small" onclick="opsChain(${(s.material_blockers[0]||{}).wo_id})">Chain</button>`:''}</td>
       <td><progress class="ops-progress" max="100" value="${s.restoration.progress_pct}" aria-label="restoration ${s.restoration.progress_pct}%"></progress><small>${s.restoration.progress_pct}%</small></td>
       <td><button class="btn small" onclick="opsTimeline('${s.situation_key}')">Timeline</button></td>
     </tr>`});
@@ -270,7 +270,7 @@ async function renderOpsCenter(){
   </section>
   </div>
   <section class="panel" data-csp-style="mt14"><div class="panel-head"><div><h3>Blocked Recovery Work</h3><p>Work orders that cannot execute while required spares are unavailable</p></div></div>
-  ${(dash.material_blocked_work||[]).length?table(['WO','Title','Priority','Status','Short Lines'],dash.material_blocked_work.map(b=>[`<span class="code">${esc(b.wo_no)}</span>`,esc(b.title),status(b.priority),status(b.status),b.shortage_items])):empty('No material-blocked work')}
+  ${(dash.material_blocked_work||[]).length?table(['WO','Title','Priority','Status','Short Lines','Recovery Chain'],dash.material_blocked_work.map(b=>[`<span class="code">${esc(b.wo_no)}</span>`,esc(b.title),status(b.priority),status(b.status),b.shortage_items,`<button class="btn small" onclick="opsChain(${b.id})">View</button>`])):empty('No material-blocked work')}
   </section>`;
   if($('#ops-refresh'))$('#ops-refresh').onclick=()=>renderOpsCenter();
 }
