@@ -43,10 +43,10 @@
     return null;
   }
 
-  function moduleAvailable(module) {
-    if (!module || !nav) return false;
+  function navButtonFor(module) {
+    if (!module || !nav) return null;
     return [...nav.querySelectorAll('.nav-btn')]
-      .some(button => button.dataset.view === module);
+      .find(button => button.dataset.view === module) || null;
   }
 
   function signalFromCard(card, index) {
@@ -82,7 +82,7 @@
       signal.value,
       signal.hint,
       signal.explainable ? 'explainable' : '',
-      moduleAvailable(signal.module) ? signal.module : '',
+      navButtonFor(signal.module) ? signal.module : '',
     ].join('|')).join('||');
   }
 
@@ -96,8 +96,8 @@
   }
 
   function openModule(module) {
-    if (!module || typeof go !== 'function' || !moduleAvailable(module)) return;
-    Promise.resolve(go(module)).catch(() => {});
+    const button = navButtonFor(module);
+    if (button) button.click();
   }
 
   function explainSignal(signal) {
@@ -130,7 +130,7 @@
         () => explainSignal(signal)
       ));
     }
-    if (moduleAvailable(signal.module)) {
+    if (navButtonFor(signal.module)) {
       actions.append(actionButton(
         'Open module',
         'dashboard-attention-action',
