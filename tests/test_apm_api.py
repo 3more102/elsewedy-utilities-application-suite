@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -94,6 +96,7 @@ RELIABILITY_GETS = [
     '/api/reliability/cbm-recommendations',
     '/api/reliability/bad-actors',
     '/api/reliability/maintenance-effectiveness',
+    '/api/reliability/fmea',
 ]
 
 
@@ -588,4 +591,295 @@ def test_effectiveness_verdict_and_recurring_issue_detection():
             conn.execute('DELETE FROM work_orders WHERE id=?', (wo_id,))
             conn.execute('DELETE FROM telemetry_readings WHERE channel_id=?', (channel_id,))
             conn.execute('DELETE FROM telemetry_channels WHERE id=?', (channel_id,))
+            conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))
+
+
+# ---------------------------------------------------------------------------
+# Scope-isolated fixtures
+# ---------------------------------------------------------------------------
+def _make_scoped_site(conn, site_code: str) -> tuple[int, int]:
+    conn.execute('DELETE FROM sites WHERE site_code=?', (site_code,))
+    cur = conn.execute(
+        '''INSERT INTO sites(site_code,name,region,city,site_type)
+           VALUES(?,?, 'Greater Cairo', 'Cairo', 'Operations Centre')''',
+        (site_code, f'Scope probe site {site_code}'),
+    )
+    site_id = int(cur.lastrowid)
+    conn.execute('DELETE FROM locations WHERE location_code=?', (f'L-{site_code}',))
+    loc = conn.execute(
+        '''INSERT INTO locations(location_code,name,location_type,site_id)
+           VALUES(?,?, 'Area', ?)''',
+        (f'L-{site_code}', f'Scope bay {site_code}', site_id),
+    )
+    return site_id, int(loc.lastrowid)
+
+
+def _make_site_asset(conn, asset_no: str, location_id: int, *, condition='Good', criticality='Medium') -> int:
+    conn.execute('DELETE FROM assets WHERE asset_no=?', (asset_no,))
+    cur = conn.execute(
+        '''INSERT INTO assets(asset_no,name,category,criticality,condition,status,
+                              location_id,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?)''',
+        (asset_no, f'APM Scoped Asset {asset_no}', 'PUMP', criticality, condition, 'Operating',
+         location_id, now(), now()),
+    )
+    return int(cur.lastrowid)
+
+
+def _add_site_alarm(
+    conn, code: str, asset_id: int, channel_id: int, site_id: Optional[int], opened_at: str,
+    *, severity='Warning',
+) -> int:
+    conn.execute('DELETE FROM operational_alarms WHERE alarm_no=?', (code,))
+    cur = conn.execute(
+        '''INSERT INTO operational_alarms(
+             alarm_no,channel_id,asset_id,site_id,severity,status,alarm_type,message,
+             trigger_value,threshold_value,opened_at,last_seen_at,occurrence_count)
+           VALUES(?,?,?,?, 'Open','Threshold',?,?,?,?,?,?,1)''',
+        (code, channel_id, asset_id, site_id, severity, f'{code} message', 95.0, 80.0,
+         opened_at, opened_at),
+    )
+    return int(cur.lastrowid)
+
+
+# ---------------------------------------------------------------------------
+# Site scoping across reliability reads
+# ---------------------------------------------------------------------------
+def test_reliability_reads_honor_site_scope():
+    headers = _login('exec', 'Viewer@2026')
+    manager = _login('seif', 'EUAS@2026')
+
+    with db() as conn:
+        site_a, loc_a = _make_scoped_site(conn, 'SCOPE-A')
+        site_b, loc_b = _make_scoped_site(conn, 'SCOPE-B')
+        asset_a = _make_site_asset(conn, 'AST-SCOPE-A', loc_a)
+        asset_b = _make_site_asset(conn, 'AST-SCOPE-B', loc_b)
+        chan_a = _make_channel(conn, 'TEL-SCOPE-A', asset_a, warning_high=80)
+        chan_b = _make_channel(conn, 'TEL-SCOPE-B', asset_b, warning_high=80)
+        _add_readings(conn, chan_a, [55, 62, 68, 75, 82, 86])
+        _add_readings(conn, chan_b, [55, 62, 68, 75, 82, 86])
+        conn.commit()
+    try:
+        with TestClient(app) as client:
+            all_rows = client.get('/api/reliability/deterioration-watchlist', headers=headers)
+            assert all_rows.status_code == 200, all_rows.text
+            all_codes = {item['channel_code'] for item in all_rows.json()}
+            assert {'TEL-SCOPE-A', 'TEL-SCOPE-B'} <= all_codes
+
+            scoped_a = client.get(
+                f'/api/reliability/deterioration-watchlist?site_id={site_a}', headers=headers
+            )
+            assert scoped_a.status_code == 200, scoped_a.text
+            assert {item['channel_code'] for item in scoped_a.json()} == {'TEL-SCOPE-A'}
+
+            scoped_b = client.get(
+                f'/api/reliability/deterioration-watchlist?site_id={site_b}', headers=headers
+            )
+            assert {item['channel_code'] for item in scoped_b.json()} == {'TEL-SCOPE-B'}
+
+            actors_a = client.get(
+                f'/api/reliability/bad-actors?window_days=30&limit=100&site_id={site_a}',
+                headers=headers,
+            )
+            assert actors_a.status_code == 200, actors_a.text
+            actor_assets = {entry['asset_no'] for entry in actors_a.json()}
+            assert 'AST-SCOPE-A' in actor_assets
+            assert 'AST-SCOPE-B' not in actor_assets
+
+            evaluation = client.post('/api/reliability/cbm-evaluation', headers=manager)
+            assert evaluation.status_code == 200, evaluation.text
+
+            cbm_a = client.get(
+                f'/api/reliability/cbm-recommendations?site_id={site_a}', headers=headers
+            )
+            assert cbm_a.status_code == 200, cbm_a.text
+            cbm_a_assets = {row['asset_no'] for row in cbm_a.json()}
+            assert 'AST-SCOPE-A' in cbm_a_assets
+            assert 'AST-SCOPE-B' not in cbm_a_assets
+
+            cbm_by_asset = client.get(
+                f'/api/reliability/cbm-recommendations?asset_id={asset_b}', headers=headers
+            )
+            cbm_b_assets = {row['asset_no'] for row in cbm_by_asset.json()}
+            assert cbm_b_assets == {'AST-SCOPE-B'}
+    finally:
+        with db() as conn:
+            for asset_id in (asset_a, asset_b):
+                conn.execute('DELETE FROM cbm_recommendations WHERE asset_id=?', (asset_id,))
+            for channel in (chan_a, chan_b):
+                conn.execute('DELETE FROM telemetry_readings WHERE channel_id=?', (channel,))
+                conn.execute('DELETE FROM telemetry_channels WHERE id=?', (channel,))
+            for asset_id in (asset_a, asset_b):
+                conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))
+            for site_id in (site_a, site_b):
+                conn.execute('DELETE FROM locations WHERE site_id=?', (site_id,))
+                conn.execute('DELETE FROM sites WHERE id=?', (site_id,))
+
+
+# ---------------------------------------------------------------------------
+# Alarm correlation identifiers
+# ---------------------------------------------------------------------------
+def test_alarm_correlation_identifiers_stable_attributed_and_scoped():
+    from datetime import datetime, timedelta
+
+    headers = _login('exec', 'Viewer@2026')
+    base = datetime.now() - timedelta(minutes=30)
+    with db() as conn:
+        site_id, loc_id = _make_scoped_site(conn, 'COR-A')
+        other_site, _other_loc = _make_scoped_site(conn, 'COR-B')
+        asset_id = _make_site_asset(conn, 'AST-COR-A', loc_id)
+        ch1 = _make_channel(conn, 'TEL-COR-A-C1', asset_id)
+        ch2 = _make_channel(conn, 'TEL-COR-A-C2', asset_id)
+        storm_codes = [f'ALM-COR-STORM{i}' for i in range(3)] + \
+                      [f'ALM-COR-STORM-B{i}' for i in range(2)]
+        storm_ids = {}
+        for index in range(3):
+            opened = _iso(base + timedelta(minutes=index))
+            storm_ids[f'ALM-COR-STORM{index}'] = _add_site_alarm(
+                conn, f'ALM-COR-STORM{index}', asset_id, ch1, site_id, opened,
+                severity='Critical',
+            )
+        for index in range(2):
+            opened = _iso(base + timedelta(minutes=3 + index))
+            storm_ids[f'ALM-COR-STORM-B{index}'] = _add_site_alarm(
+                conn, f'ALM-COR-STORM-B{index}', asset_id, ch2, site_id, opened,
+            )
+        # One alarm at another site must never appear in site A correlations.
+        stray_id = _add_site_alarm(
+            conn, 'ALM-COR-STRAY', asset_id, ch1, other_site,
+            _iso(base + timedelta(minutes=1)),
+        )
+        conn.commit()
+    try:
+        with TestClient(app) as client:
+            def fetch(site):
+                url = '/api/reliability/alarm-correlation?hours=2&burst_threshold=5&burst_window_minutes=15'
+                if site is not None:
+                    url += f'&site_id={site}'
+                response = client.get(url, headers=headers)
+                assert response.status_code == 200, response.text
+                return response.json()
+
+            first = fetch(site_id)
+            burst = next(b for b in first['bursts'] if b['asset_no'] == 'AST-COR-A')
+            group = next(g for g in first['groups'] if g['asset_no'] == 'AST-COR-A')
+            recurrences = [
+                r for r in first['recurrence']
+                if r['channel_code'] in ('TEL-COR-A-C1', 'TEL-COR-A-C2')
+            ]
+
+            expected_ids = sorted(storm_ids.values())
+            for cluster in (burst, group):
+                assert cluster['primary_alarm_id'] == expected_ids[0]
+                assert cluster['related_alarm_ids'] == expected_ids[1:]
+                assert sorted(cluster['alarm_nos']) == sorted(storm_codes)
+                assert stray_id not in cluster['related_alarm_ids']
+                assert cluster['correlation_id'].startswith('COR-')
+            for entry in recurrences:
+                assert entry['correlation_id'].startswith('COR-')
+                assert entry['primary_alarm_id'] in storm_ids.values()
+
+            second = fetch(site_id)
+            burst_again = next(b for b in second['bursts'] if b['asset_no'] == 'AST-COR-A')
+            group_again = next(g for g in second['groups'] if g['asset_no'] == 'AST-COR-A')
+            assert burst_again['correlation_id'] == burst['correlation_id']
+            assert group_again['correlation_id'] == group['correlation_id']
+
+            elsewhere = fetch(other_site)
+            for cluster in elsewhere['bursts'] + elsewhere['groups']:
+                members = [cluster['primary_alarm_id'], *cluster['related_alarm_ids']]
+                assert stray_id not in members or cluster['asset_no'] != 'AST-COR-A'
+                if cluster['asset_no'] == 'AST-COR-A':
+                    continue
+                assert cluster['correlation_id'] != burst['correlation_id']
+
+            recurrence_a = [
+                r for r in first['recurrence'] if r['channel_code'] == 'TEL-COR-A-C1'
+            ][0]
+            assert stray_id not in [recurrence_a['primary_alarm_id'],
+                                    *recurrence_a['related_alarm_ids']]
+    finally:
+        with db() as conn:
+            conn.execute("DELETE FROM operational_alarms WHERE alarm_no LIKE 'ALM-COR-%'")
+            for channel in (ch1, ch2):
+                conn.execute('DELETE FROM telemetry_channels WHERE id=?', (channel,))
+            conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))
+            for sid in (site_id, other_site):
+                conn.execute('DELETE FROM locations WHERE site_id=?', (sid,))
+                conn.execute('DELETE FROM sites WHERE id=?', (sid,))
+
+
+# ---------------------------------------------------------------------------
+# FMEA catalog listing
+# ---------------------------------------------------------------------------
+def test_fmea_catalog_listing_filters_and_pagination():
+    admin = _login('omar', 'EUAS@2026')
+
+    with db() as conn:
+        asset_id = _make_asset(conn, 'AST-APM-FMEACAT')
+        conn.commit()
+    created_ids: list[int] = []
+    try:
+        with TestClient(app) as client:
+            for mode, occ in (('BearingSeizure', 3), ('SealLeak', 5)):
+                created = client.post('/api/reliability/fmea', headers=admin, json={
+                    'asset_id': asset_id,
+                    'function_text': 'Contain process fluid',
+                    'failure_mode': mode,
+                    'severity': 6, 'occurrence': occ, 'detection': 4,
+                })
+                assert created.status_code == 200, created.text
+                created_ids.append(created.json()['id'])
+
+            catalog = client.get(
+                f'/api/reliability/fmea?asset_id={asset_id}&limit=100', headers=admin
+            )
+            assert catalog.status_code == 200, catalog.text
+            payload = catalog.json()
+            assert payload['total'] == 2
+            assert payload['limit'] == 100 and payload['offset'] == 0
+            modes = [r['failure_mode'] for r in payload['records']]
+            assert modes == ['SealLeak', 'BearingSeizure']  # newest first
+            assert payload['records'][0]['asset_no'] == 'AST-APM-FMEACAT'
+            assert all(r['asset_id'] == asset_id for r in payload['records'])
+
+            page = client.get(
+                f'/api/reliability/fmea?asset_id={asset_id}&limit=1&offset=1', headers=admin
+            ).json()
+            assert page['total'] == 2
+            assert [r['failure_mode'] for r in page['records']] == ['BearingSeizure']
+
+            approved = client.post(
+                f"/api/reliability/fmea/{payload['records'][0]['id']}/approve", headers=admin
+            )
+            assert approved.status_code == 200
+
+            approved_view = client.get(
+                f'/api/reliability/fmea?asset_id={asset_id}&status=Approved', headers=admin
+            ).json()
+            assert approved_view['total'] == 1
+            assert approved_view['records'][0]['failure_mode'] == 'SealLeak'
+
+            draft_view = client.get(
+                f'/api/reliability/fmea?asset_id={asset_id}&status=Draft', headers=admin
+            ).json()
+            assert draft_view['total'] == 1
+            assert draft_view['records'][0]['failure_mode'] == 'BearingSeizure'
+
+            assert client.get(
+                '/api/reliability/fmea?limit=0', headers=admin
+            ).status_code == 422
+            assert client.get(
+                '/api/reliability/fmea?limit=501', headers=admin
+            ).status_code == 422
+            assert client.get(
+                '/api/reliability/fmea?offset=-1', headers=admin
+            ).status_code == 422
+            assert client.get(
+                '/api/reliability/fmea/99999999/observed-evidence', headers=admin
+            ).status_code == 404
+    finally:
+        with db() as conn:
+            for record_id in created_ids:
+                conn.execute('DELETE FROM fmea_records WHERE id=?', (record_id,))
             conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))

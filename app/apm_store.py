@@ -18,6 +18,7 @@ FMEA records are first-class persisted entities with their own workflow.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta
 from typing import Optional
@@ -257,17 +258,24 @@ def portfolio_risk_view(conn, site_id=None) -> dict:
 # ---------------------------------------------------------------------------
 # Deterioration watchlist
 # ---------------------------------------------------------------------------
-def deterioration_watchlist_view(conn, *, window_days: int = 30, min_points: int = 4) -> list[dict]:
+def deterioration_watchlist_view(
+    conn, *, window_days: int = 30, min_points: int = 4, site_id: Optional[int] = None
+) -> list[dict]:
     cutoff = _iso(datetime.now() - timedelta(days=window_days))
     watchlist = []
-    channels = _rows(conn.execute(
-        '''SELECT tc.*,a.asset_no,a.name asset_name,s.name site_name
-           FROM telemetry_channels tc
-           JOIN assets a ON a.id=tc.asset_id
-           LEFT JOIN locations l ON l.id=a.location_id
-           LEFT JOIN sites s ON s.id=l.site_id
-           WHERE tc.active=1 ORDER BY a.asset_no,tc.channel_code'''
-    ))
+    channels_sql = '''
+       SELECT tc.*,a.asset_no,a.name asset_name,s.name site_name
+       FROM telemetry_channels tc
+       JOIN assets a ON a.id=tc.asset_id
+       LEFT JOIN locations l ON l.id=a.location_id
+       LEFT JOIN sites s ON s.id=l.site_id
+       WHERE tc.active=1'''
+    channel_args: list = []
+    if site_id is not None:
+        channels_sql += ' AND s.id=?'
+        channel_args.append(site_id)
+    channels_sql += ' ORDER BY a.asset_no,tc.channel_code'
+    channels = _rows(conn.execute(channels_sql, channel_args))
     for channel in channels:
         values = [
             float(r['value']) for r in _rows(conn.execute(
@@ -307,25 +315,51 @@ def deterioration_watchlist_view(conn, *, window_days: int = 30, min_points: int
 # ---------------------------------------------------------------------------
 # Alarm correlation
 # ---------------------------------------------------------------------------
+def _correlation_id(kind: str, *parts) -> str:
+    """Stable content-derived identifier for one correlation cluster.
+
+    The id is a digest of the cluster's defining evidence (kind, asset,
+    channel and window bounds), so identical data always yields the same id
+    while any change to the underlying evidence yields a new one.
+    """
+    digest = hashlib.sha256(
+        '|'.join([kind, *(str(p) for p in parts)]).encode('utf-8')
+    ).hexdigest()[:16]
+    return f'COR-{digest}'
+
+
+def _cluster_attribution(alarms: list[dict]) -> dict:
+    ordered = sorted(alarms, key=lambda a: (str(a['opened_at']), int(a['id'])))
+    return {
+        'primary_alarm_id': int(ordered[0]['id']),
+        'related_alarm_ids': [int(a['id']) for a in ordered[1:]],
+        'alarm_nos': [a['alarm_no'] for a in ordered],
+    }
+
+
 def alarm_correlation_view(
     conn,
     *,
     hours: int = 24,
     burst_window_minutes: int = 15,
     burst_threshold: int = 5,
+    site_id: Optional[int] = None,
 ) -> dict:
     cutoff = _iso(datetime.now() - timedelta(hours=hours))
-    alarms = _rows(conn.execute(
-        '''SELECT oa.*,tc.channel_code,tc.name channel_name,a.asset_no,a.name asset_name,
+    alarm_sql = '''
+        SELECT oa.*,tc.channel_code,tc.name channel_name,a.asset_no,a.name asset_name,
                   s.name site_name
            FROM operational_alarms oa
            JOIN telemetry_channels tc ON tc.id=oa.channel_id
            JOIN assets a ON a.id=oa.asset_id
            LEFT JOIN sites s ON s.id=oa.site_id
-           WHERE oa.opened_at>=? OR (oa.last_seen_at>=?)
-           ORDER BY oa.opened_at ASC''',
-        (cutoff, cutoff),
-    ))
+           WHERE (oa.opened_at>=? OR oa.last_seen_at>=?)'''
+    alarm_args: list = [cutoff, cutoff]
+    if site_id is not None:
+        alarm_sql += ' AND oa.site_id=?'
+        alarm_args.append(site_id)
+    alarm_sql += ' ORDER BY oa.opened_at ASC'
+    alarms = _rows(conn.execute(alarm_sql, alarm_args))
 
     by_channel: dict[int, list[dict]] = {}
     by_asset: dict[int, list[dict]] = {}
@@ -338,7 +372,13 @@ def alarm_correlation_view(
         if len(group) < 2:
             continue
         sample = group[-1]
+        first_opened = min(str(a['opened_at']) for a in group)
+        last_seen = max(str(a['last_seen_at']) for a in group)
         recurrence.append({
+            'correlation_id': _correlation_id(
+                'recurrence', channel_id, sample['asset_id'], first_opened, last_seen
+            ),
+            **_cluster_attribution(group),
             'asset_id': sample['asset_id'],
             'asset_no': sample['asset_no'],
             'channel_id': channel_id,
@@ -358,8 +398,17 @@ def alarm_correlation_view(
     bursts = []
     window_seconds = burst_window_minutes * 60
     for asset_id, group in by_asset.items():
-        times = sorted(_parse_ts(a['opened_at']) for a in group)
-        times = [t for t in times if t]
+        timed = sorted(
+            (
+                (parsed, alarm)
+                for parsed, alarm in (
+                    (_parse_ts(entry['opened_at']), entry) for entry in group
+                )
+                if parsed
+            ),
+            key=lambda pair: (pair[0], int(pair[1]['id'])),
+        )
+        times = [t for t, _a in timed]
         i = 0
         while i < len(times):
             j = i
@@ -367,9 +416,14 @@ def alarm_correlation_view(
                 j += 1
             count = j - i + 1
             if count >= burst_threshold:
+                window_alarms = [a for _t, a in timed[i:j + 1]]
                 sample = group[0]
-                channels = sorted({a['channel_code'] for a in group[i:j + 1]})
+                channels = sorted({a['channel_code'] for a in window_alarms})
                 bursts.append({
+                    'correlation_id': _correlation_id(
+                        'burst', asset_id, sample['site_id'], _iso(times[i]), _iso(times[j])
+                    ),
+                    **_cluster_attribution(window_alarms),
                     'asset_id': asset_id,
                     'asset_no': sample['asset_no'],
                     'site_name': sample.get('site_name'),
@@ -392,7 +446,13 @@ def alarm_correlation_view(
         if len(group) < 3:
             continue
         sample = group[0]
+        first_opened = min(str(a['opened_at']) for a in group)
+        last_seen = max(str(a['last_seen_at']) for a in group)
         groups.append({
+            'correlation_id': _correlation_id(
+                'group', asset_id, sample['site_id'], first_opened, last_seen
+            ),
+            **_cluster_attribution(group),
             'asset_id': asset_id,
             'asset_no': sample['asset_no'],
             'asset_name': sample['asset_name'],
@@ -606,14 +666,22 @@ def convert_cbm_to_work_order(conn, recommendation_id: int, user: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Bad actors
 # ---------------------------------------------------------------------------
-def bad_actors_view(conn, *, window_days: int = 365, limit: int = 20) -> list[dict]:
+def bad_actors_view(conn, *, window_days: int = 365, limit: int = 20, site_id: Optional[int] = None) -> list[dict]:
     window_start = _iso(datetime.now() - timedelta(days=window_days))
     metrics_by_asset: dict[str, dict] = {}
     drilldown: dict[str, dict] = {}
 
-    asset_rows = _rows(conn.execute(
-        'SELECT id,asset_no,name,criticality FROM assets ORDER BY asset_no'
-    ))
+    asset_sql = (
+        "SELECT a.id,a.asset_no,a.name,a.criticality,s.name site_name "
+        "FROM assets a LEFT JOIN locations l ON l.id=a.location_id "
+        "LEFT JOIN sites s ON s.id=l.site_id WHERE 1=1"
+    )
+    asset_args: list = []
+    if site_id is not None:
+        asset_sql += ' AND s.id=?'
+        asset_args.append(site_id)
+    asset_sql += ' ORDER BY a.asset_no'
+    asset_rows = _rows(conn.execute(asset_sql, asset_args))
     operating_hours = max(float(window_days) * 24.0, 1.0)
 
     for asset in asset_rows:
@@ -795,13 +863,23 @@ def work_order_effectiveness(conn, wo_id: int, *, window_days: int = _EFFECTIVEN
     }
 
 
-def maintenance_effectiveness_list(conn, *, limit: int = 25, window_days: int = _EFFECTIVENESS_WINDOW_DAYS) -> list[dict]:
-    completed = _rows(conn.execute(
-        "SELECT id,wo_no,asset_id,actual_finish,work_type FROM work_orders "
-        "WHERE status IN ('Completed','Closed') AND actual_finish IS NOT NULL "
-        "ORDER BY actual_finish DESC LIMIT ?",
-        (limit,),
-    ))
+def maintenance_effectiveness_list(
+    conn, *, limit: int = 25, window_days: int = _EFFECTIVENESS_WINDOW_DAYS,
+    site_id: Optional[int] = None,
+) -> list[dict]:
+    completed_sql = (
+        "SELECT w.id,w.wo_no,w.asset_id,w.actual_finish,w.work_type "
+        "FROM work_orders w LEFT JOIN assets a ON a.id=w.asset_id "
+        "LEFT JOIN locations l ON l.id=a.location_id "
+        "WHERE w.status IN ('Completed','Closed') AND w.actual_finish IS NOT NULL"
+    )
+    completed_args: list = []
+    if site_id is not None:
+        completed_sql += ' AND l.site_id=?'
+        completed_args.append(site_id)
+    completed_sql += ' ORDER BY w.actual_finish DESC LIMIT ?'
+    completed_args.append(limit)
+    completed = _rows(conn.execute(completed_sql, completed_args))
     results = []
     for wo in completed:
         try:
@@ -809,6 +887,35 @@ def maintenance_effectiveness_list(conn, *, limit: int = 25, window_days: int = 
         except HTTPException:
             continue
     return results
+
+
+# ---------------------------------------------------------------------------
+# FMEA catalog
+# ---------------------------------------------------------------------------
+def fmea_list_view(
+    conn, *, asset_id: Optional[int] = None, status: str = '',
+    limit: int = 100, offset: int = 0,
+) -> dict:
+    where = ' WHERE 1=1'
+    args: list = []
+    if asset_id is not None:
+        where += ' AND f.asset_id=?'
+        args.append(asset_id)
+    if status:
+        where += ' AND f.status=?'
+        args.append(status)
+    total = int(conn.execute(
+        'SELECT COUNT(*) FROM fmea_records f' + where, args
+    ).fetchone()[0])
+    records = _rows(conn.execute(
+        '''SELECT f.*,a.asset_no,a.name asset_name,u.full_name created_by_name
+           FROM fmea_records f
+           LEFT JOIN assets a ON a.id=f.asset_id
+           LEFT JOIN users u ON u.id=f.created_by''' + where +
+        ' ORDER BY f.id DESC LIMIT ? OFFSET ?',
+        args + [limit, offset],
+    ))
+    return {'total': total, 'limit': limit, 'offset': offset, 'records': records}
 
 
 # ---------------------------------------------------------------------------
@@ -945,16 +1052,20 @@ def install_apm_routes() -> None:
     @app.get('/api/reliability/deterioration-watchlist')
     def deterioration_watchlist_route(
         window_days: int = _application.Query(30, ge=1, le=365),
+        site_id: Optional[int] = None,
         user=Depends(current_user),
     ):
         with db() as conn:
-            return deterioration_watchlist_view(conn, window_days=window_days)
+            return deterioration_watchlist_view(
+                conn, window_days=window_days, site_id=site_id
+            )
 
     @app.get('/api/reliability/alarm-correlation')
     def alarm_correlation_route(
         hours: int = _application.Query(24, ge=1, le=720),
         burst_window_minutes: int = _application.Query(15, ge=1, le=240),
         burst_threshold: int = _application.Query(5, ge=2, le=100),
+        site_id: Optional[int] = None,
         user=Depends(current_user),
     ):
         with db() as conn:
@@ -963,6 +1074,7 @@ def install_apm_routes() -> None:
                 hours=hours,
                 burst_window_minutes=burst_window_minutes,
                 burst_threshold=burst_threshold,
+                site_id=site_id,
             )
 
     @app.post('/api/reliability/cbm-evaluation')
@@ -973,17 +1085,29 @@ def install_apm_routes() -> None:
             return run_cbm_evaluation(conn, user)
 
     @app.get('/api/reliability/cbm-recommendations')
-    def cbm_list_route(status: str = '', user=Depends(current_user)):
+    def cbm_list_route(
+        status: str = '',
+        asset_id: Optional[int] = None,
+        site_id: Optional[int] = None,
+        user=Depends(current_user),
+    ):
         with db() as conn:
             sql = (
                 'SELECT r.*,a.asset_no,a.name asset_name,tc.channel_code '
                 'FROM cbm_recommendations r JOIN assets a ON a.id=r.asset_id '
-                'LEFT JOIN telemetry_channels tc ON tc.id=r.channel_id WHERE 1=1'
+                'LEFT JOIN telemetry_channels tc ON tc.id=r.channel_id '
+                'LEFT JOIN locations l ON l.id=a.location_id WHERE 1=1'
             )
             args: list = []
             if status:
                 sql += ' AND r.status=?'
                 args.append(status)
+            if asset_id is not None:
+                sql += ' AND r.asset_id=?'
+                args.append(asset_id)
+            if site_id is not None:
+                sql += ' AND l.site_id=?'
+                args.append(site_id)
             sql += ' ORDER BY CASE r.status WHEN \'Open\' THEN 0 WHEN \'Reviewed\' THEN 1 ELSE 2 END, r.id DESC LIMIT 200'
             return _rows(conn.execute(sql, args))
 
@@ -1017,10 +1141,11 @@ def install_apm_routes() -> None:
     def bad_actors_route(
         window_days: int = _application.Query(365, ge=30, le=1095),
         limit: int = _application.Query(20, ge=1, le=100),
+        site_id: Optional[int] = None,
         user=Depends(current_user),
     ):
         with db() as conn:
-            return bad_actors_view(conn, window_days=window_days, limit=limit)
+            return bad_actors_view(conn, window_days=window_days, limit=limit, site_id=site_id)
 
     @app.get('/api/work-orders/{wo_id}/effectiveness')
     def wo_effectiveness_route(
@@ -1032,9 +1157,29 @@ def install_apm_routes() -> None:
             return work_order_effectiveness(conn, wo_id, window_days=window_days)
 
     @app.get('/api/reliability/maintenance-effectiveness')
-    def effectiveness_list_route(user=Depends(current_user)):
+    def effectiveness_list_route(
+        window_days: int = _application.Query(_EFFECTIVENESS_WINDOW_DAYS, ge=7, le=180),
+        limit: int = _application.Query(25, ge=1, le=200),
+        site_id: Optional[int] = None,
+        user=Depends(current_user),
+    ):
         with db() as conn:
-            return maintenance_effectiveness_list(conn)
+            return maintenance_effectiveness_list(
+                conn, window_days=window_days, limit=limit, site_id=site_id
+            )
+
+    @app.get('/api/reliability/fmea')
+    def fmea_list_route(
+        asset_id: Optional[int] = None,
+        status: str = '',
+        limit: int = _application.Query(100, ge=1, le=500),
+        offset: int = _application.Query(0, ge=0),
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            return fmea_list_view(
+                conn, asset_id=asset_id, status=status, limit=limit, offset=offset
+            )
 
     @app.post('/api/reliability/fmea')
     def fmea_create_route(
