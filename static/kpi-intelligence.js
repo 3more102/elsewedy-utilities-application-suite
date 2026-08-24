@@ -5,20 +5,24 @@
   const pageTitle = document.querySelector('#page-title');
   if (!content) return;
 
-  // Only map cards whose visible dashboard concept has a canonical trend /
-  // explanation adapter. Similar-looking legacy cards are deliberately not
-  // mapped when their semantics differ (for example open outages vs period
-  // outage count, or low stock vs true stockout lines).
+  // Bind only when the visible legacy card and the canonical KPI have the
+  // same current-value semantics. Do not infer mappings from similar names.
+  // Examples intentionally excluded: Maintenance Cost (legacy lifetime/top-8
+  // work cost vs canonical windowed ledger cost), MTBF/MTTR (legacy 365-day
+  // reliability basis), live alarms/incidents (point-in-time state), and open
+  // work (point-in-time state cannot produce an honest historical trend).
   const METRICS = Object.freeze({
-    'Open Work Orders': {family: 'maintenance', metric: 'open_work_orders'},
-    'Overdue Work': {family: 'maintenance', metric: 'overdue_work_orders'},
-    'Emergency Work': {family: 'maintenance', metric: 'emergency_work_orders'},
-    'PM Compliance': {family: 'maintenance', metric: 'pm_compliance_pct'},
-    'MTBF': {family: 'maintenance', metric: 'mtbf_hours'},
-    'MTTR': {family: 'maintenance', metric: 'mttr_hours'},
-    'Active Alarms': {family: 'condition', metric: 'active_alarms'},
-    'Safety Incidents': {family: 'hse', metric: 'open_incidents'},
-    'Maintenance Cost': {family: 'cost', metric: 'maintenance_cost_window'}
+    'Overdue Work': {
+      family: 'maintenance',
+      metric: 'overdue_work_orders',
+      periodDays: 30
+    },
+    'PM Compliance': {
+      family: 'maintenance',
+      metric: 'pm_compliance_pct',
+      periodDays: 30,
+      portfolioOnly: true
+    }
   });
 
   let requestSequence = 0;
@@ -36,7 +40,7 @@
     const q = new URLSearchParams({
       family: meta.family,
       metric: meta.metric,
-      period_days: '30'
+      period_days: String(meta.periodDays || 30)
     });
     if (samples != null) q.set('samples', String(samples));
     if (typeof S !== 'undefined' && S.dashDate) q.set('period_end', S.dashDate);
@@ -60,11 +64,11 @@
 
   function trendChart(data) {
     const samples = data.samples || [];
-    const values = samples
+    const valid = samples
       .map((sample, index) => ({index, value: sample.value}))
       .filter(point => point.value != null && Number.isFinite(Number(point.value)));
 
-    if (!values.length) {
+    if (!valid.length) {
       return `<div class="kpi-intel-empty">${esc(data.missing_note || 'No computable trend values in the selected windows.')}</div>`;
     }
 
@@ -74,14 +78,35 @@
     const right = 16;
     const top = 18;
     const bottom = 32;
-    const min = Math.min(...values.map(point => Number(point.value)));
-    const max = Math.max(...values.map(point => Number(point.value)));
+    const min = Math.min(...valid.map(point => Number(point.value)));
+    const max = Math.max(...valid.map(point => Number(point.value)));
+    const isFlat = Math.abs(max - min) < 1e-12;
     const span = Math.max(max - min, 1e-9);
     const x = index => left + index * (width - left - right) / Math.max(samples.length - 1, 1);
-    const y = value => top + (max - Number(value)) * (height - top - bottom) / span;
-    const points = values.map(point => `${x(point.index).toFixed(2)},${y(point.value).toFixed(2)}`).join(' ');
+    const y = value => isFlat
+      ? top + (height - top - bottom) / 2
+      : top + (max - Number(value)) * (height - top - bottom) / span;
 
-    const circles = values.map(point => {
+    // Never draw a line across a missing bucket: a gap means missing evidence,
+    // not continuity. Single valid points remain visible as circles.
+    const segments = [];
+    let segment = [];
+    samples.forEach((sample, index) => {
+      if (sample.value != null && Number.isFinite(Number(sample.value))) {
+        segment.push({index, value: sample.value});
+      } else if (segment.length) {
+        segments.push(segment);
+        segment = [];
+      }
+    });
+    if (segment.length) segments.push(segment);
+
+    const polylines = segments
+      .filter(points => points.length > 1)
+      .map(points => `<polyline points="${points.map(point => `${x(point.index).toFixed(2)},${y(point.value).toFixed(2)}`).join(' ')}"></polyline>`)
+      .join('');
+
+    const circles = valid.map(point => {
       const sample = samples[point.index];
       const label = `${sample.period_end || 'Window'}: ${formatValue(point.value, data.unit)}`;
       return `<circle cx="${x(point.index).toFixed(2)}" cy="${y(point.value).toFixed(2)}" r="4"><title>${esc(label)}</title></circle>`;
@@ -96,13 +121,13 @@
     return `<svg class="kpi-intel-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(data.label)} trend across ${samples.length} windows">
       <line class="kpi-intel-gridline" x1="${left}" y1="${top}" x2="${width - right}" y2="${top}"></line>
       <line class="kpi-intel-gridline" x1="${left}" y1="${height - bottom}" x2="${width - right}" y2="${height - bottom}"></line>
-      <polyline points="${points}"></polyline>
-      ${circles}${labels}
+      ${polylines}${circles}${labels}
     </svg>`;
   }
 
-  function trendBody(data) {
+  function trendBody(data, meta) {
     const current = (data.samples || []).at(-1)?.value;
+    const periodDays = meta.periodDays || 30;
     return `<div class="kpi-intelligence-modal">
       <div class="kpi-intel-summary-grid">
         <div><span>Current</span><strong>${formatValue(current, data.unit)}</strong></div>
@@ -111,7 +136,7 @@
         <div><span>Maximum</span><strong>${formatValue(data.max, data.unit)}</strong></div>
       </div>
       <div class="kpi-intel-chart-wrap">${trendChart(data)}</div>
-      <p class="kpi-intel-footnote">Six chronological 30-day windows, oldest first. Values come from the canonical KPI computation for the selected dashboard scope and as-of date.</p>
+      <p class="kpi-intel-footnote">Six chronological ${periodDays}-day windows, oldest first. Missing buckets remain visually disconnected. Values come from the canonical KPI computation for the selected dashboard scope and as-of date.</p>
     </div>`;
   }
 
@@ -191,7 +216,7 @@
         : `/api/kpi/explanation?${queryFor(meta)}`;
       const data = await api(path);
       if (body.dataset.kpiIntelRequest !== requestId) return;
-      body.innerHTML = mode === 'trend' ? trendBody(data) : explanationBody(data);
+      body.innerHTML = mode === 'trend' ? trendBody(data, meta) : explanationBody(data);
       if (mode === 'why') bindDrills();
     } catch (error) {
       if (body.dataset.kpiIntelRequest !== requestId) return;
@@ -223,6 +248,7 @@
       const label = cardLabel(card);
       const spec = METRICS[label];
       if (!spec) return;
+      if (spec.portfolioOnly && typeof S !== 'undefined' && S.siteId) return;
 
       const meta = {...spec, label};
       card.dataset.kpiIntelligence = `${spec.family}/${spec.metric}`;
