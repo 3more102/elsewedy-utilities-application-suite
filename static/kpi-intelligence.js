@@ -5,35 +5,31 @@
   const pageTitle = document.querySelector('#page-title');
   if (!content) return;
 
-  // Bind only when the visible legacy card and the canonical KPI have the
-  // same current-value semantics. Do not infer mappings from similar names.
-  // Examples intentionally excluded: Maintenance Cost (legacy lifetime/top-8
-  // work cost vs canonical windowed ledger cost), MTBF/MTTR (legacy 365-day
-  // reliability basis), live alarms/incidents (point-in-time state), and open
-  // work (point-in-time state cannot produce an honest historical trend).
+  const KPI_ROLES = new Set([
+    'admin', 'maintenance_manager', 'executive', 'asset_manager', 'planner', 'supervisor'
+  ]);
+
+  // Bind only when the visible legacy card and canonical KPI have the same
+  // current-value semantics. Similar names are not enough.
   const METRICS = Object.freeze({
     'Overdue Work': {
-      family: 'maintenance',
-      metric: 'overdue_work_orders',
-      periodDays: 30
+      family: 'maintenance', metric: 'overdue_work_orders', periodDays: 30
     },
     'PM Compliance': {
-      family: 'maintenance',
-      metric: 'pm_compliance_pct',
-      periodDays: 30,
+      family: 'maintenance', metric: 'pm_compliance_pct', periodDays: 30,
       portfolioOnly: true
     }
   });
 
   let requestSequence = 0;
 
-  function executiveDashboardVisible() {
-    return pageTitle?.textContent?.trim() === 'Executive Dashboard'
-      && !!content.querySelector('.dashboard-kpi-grid');
+  function authorized() {
+    return typeof S !== 'undefined' && KPI_ROLES.has(S.user?.role);
   }
 
-  function cardLabel(card) {
-    return card.querySelector('.kpi-label')?.textContent?.trim() || '';
+  function dashboardVisible() {
+    return pageTitle?.textContent?.trim() === 'Executive Dashboard'
+      && !!content.querySelector('.dashboard-kpi-grid');
   }
 
   function queryFor(meta, samples = null) {
@@ -43,8 +39,8 @@
       period_days: String(meta.periodDays || 30)
     });
     if (samples != null) q.set('samples', String(samples));
-    if (typeof S !== 'undefined' && S.dashDate) q.set('period_end', S.dashDate);
-    if (typeof S !== 'undefined' && S.siteId) q.set('site_id', String(S.siteId));
+    if (S.dashDate) q.set('period_end', S.dashDate);
+    if (S.siteId) q.set('site_id', String(S.siteId));
     return q.toString();
   }
 
@@ -72,23 +68,17 @@
       return `<div class="kpi-intel-empty">${esc(data.missing_note || 'No computable trend values in the selected windows.')}</div>`;
     }
 
-    const width = 620;
-    const height = 180;
-    const left = 34;
-    const right = 16;
-    const top = 18;
-    const bottom = 32;
+    const width = 620, height = 180, left = 34, right = 16, top = 18, bottom = 32;
     const min = Math.min(...valid.map(point => Number(point.value)));
     const max = Math.max(...valid.map(point => Number(point.value)));
-    const isFlat = Math.abs(max - min) < 1e-12;
+    const flat = Math.abs(max - min) < 1e-12;
     const span = Math.max(max - min, 1e-9);
     const x = index => left + index * (width - left - right) / Math.max(samples.length - 1, 1);
-    const y = value => isFlat
+    const y = value => flat
       ? top + (height - top - bottom) / 2
       : top + (max - Number(value)) * (height - top - bottom) / span;
 
-    // Never draw a line across a missing bucket: a gap means missing evidence,
-    // not continuity. Single valid points remain visible as circles.
+    // Missing values create real visual gaps; they are never interpolated.
     const segments = [];
     let segment = [];
     samples.forEach((sample, index) => {
@@ -105,13 +95,11 @@
       .filter(points => points.length > 1)
       .map(points => `<polyline points="${points.map(point => `${x(point.index).toFixed(2)},${y(point.value).toFixed(2)}`).join(' ')}"></polyline>`)
       .join('');
-
     const circles = valid.map(point => {
       const sample = samples[point.index];
       const label = `${sample.period_end || 'Window'}: ${formatValue(point.value, data.unit)}`;
       return `<circle cx="${x(point.index).toFixed(2)}" cy="${y(point.value).toFixed(2)}" r="4"><title>${esc(label)}</title></circle>`;
     }).join('');
-
     const labels = samples.map((sample, index) => {
       const raw = String(sample.period_end || '');
       const label = raw.length >= 10 ? raw.slice(5, 10) : raw;
@@ -127,7 +115,6 @@
 
   function trendBody(data, meta) {
     const current = (data.samples || []).at(-1)?.value;
-    const periodDays = meta.periodDays || 30;
     return `<div class="kpi-intelligence-modal">
       <div class="kpi-intel-summary-grid">
         <div><span>Current</span><strong>${formatValue(current, data.unit)}</strong></div>
@@ -136,7 +123,7 @@
         <div><span>Maximum</span><strong>${formatValue(data.max, data.unit)}</strong></div>
       </div>
       <div class="kpi-intel-chart-wrap">${trendChart(data)}</div>
-      <p class="kpi-intel-footnote">Six chronological ${periodDays}-day windows, oldest first. Missing buckets remain visually disconnected. Values come from the canonical KPI computation for the selected dashboard scope and as-of date.</p>
+      <p class="kpi-intel-footnote">Six chronological ${meta.periodDays || 30}-day windows, oldest first. Missing buckets remain disconnected. Values come from the canonical KPI computation for the selected dashboard scope and as-of date.</p>
     </div>`;
   }
 
@@ -146,19 +133,15 @@
       : data.improved === false
         ? '<span class="kpi-intel-state bad">Worsened</span>'
         : '<span class="kpi-intel-state neutral">No directional result</span>';
-
     const drivers = data.drivers || [];
     const rows = drivers.map(driver => {
       const drill = driver.drill || {};
       const canDrill = drill.module && (drill.id != null || drill.record);
-      const drillButton = canDrill
-        ? `<button class="btn small kpi-intel-drill" data-module="${esc(drill.module)}" data-id="${esc(drill.id ?? '')}" data-record="${esc(drill.record ?? '')}">Open</button>`
-        : '—';
       return `<tr>
         <td><strong>${esc(driver.label || driver.kind || 'Evidence')}</strong><br><small>${esc(driver.kind || '')}</small></td>
         <td>${formatMagnitude(driver.magnitude, driver.unit)}</td>
         <td><span class="kpi-intel-attribution">${esc(driver.attribution || 'evidence')}</span></td>
-        <td>${drillButton}</td>
+        <td>${canDrill ? `<button class="btn small kpi-intel-drill" data-module="${esc(drill.module)}" data-id="${esc(drill.id ?? '')}">Open</button>` : '—'}</td>
       </tr>`;
     }).join('');
 
@@ -182,7 +165,6 @@
     const module = button.dataset.module;
     const id = Number(button.dataset.id || 0);
     closeModal();
-
     if (module === 'assets' && id && typeof assetDetail === 'function') {
       await go('assets');
       await assetDetail(id);
@@ -204,8 +186,10 @@
 
   async function openIntelligence(meta, mode) {
     const requestId = `kpi-intel-${++requestSequence}`;
-    const title = mode === 'trend' ? `${meta.label} — Trend` : `${meta.label} — WHY`;
-    openModal(title, '<div class="kpi-intel-loading">Loading measured KPI intelligence…</div>');
+    openModal(
+      mode === 'trend' ? `${meta.label} — Trend` : `${meta.label} — WHY`,
+      '<div class="kpi-intel-loading">Loading measured KPI intelligence…</div>'
+    );
     const body = document.querySelector('#modal-body');
     if (!body) return;
     body.dataset.kpiIntelRequest = requestId;
@@ -239,21 +223,19 @@
   }
 
   function decorateIntelligence() {
-    if (!executiveDashboardVisible()) return;
+    if (!authorized() || !dashboardVisible()) return;
     const grid = content.querySelector('.dashboard-kpi-grid');
     if (!grid) return;
 
     [...grid.children].forEach(card => {
       if (!card.classList.contains('kpi') || card.dataset.kpiIntelligence) return;
-      const label = cardLabel(card);
+      const label = card.querySelector('.kpi-label')?.textContent?.trim() || '';
       const spec = METRICS[label];
-      if (!spec) return;
-      if (spec.portfolioOnly && typeof S !== 'undefined' && S.siteId) return;
+      if (!spec || (spec.portfolioOnly && S.siteId)) return;
 
       const meta = {...spec, label};
       card.dataset.kpiIntelligence = `${spec.family}/${spec.metric}`;
       card.classList.add('kpi-has-intelligence');
-
       const actions = document.createElement('div');
       actions.className = 'kpi-intel-actions';
       actions.setAttribute('aria-label', `${label} intelligence actions`);
