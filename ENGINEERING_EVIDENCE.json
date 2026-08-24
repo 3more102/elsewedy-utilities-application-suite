@@ -1,10 +1,10 @@
 {
-  "api_route_methods": 170,
-  "api_routes": 152,
+  "api_route_methods": 171,
+  "api_routes": 153,
   "application_version": "3.9.0",
   "database_backend": "sqlite",
-  "explicit_indexes": 38,
-  "relational_tables": 62,
+  "explicit_indexes": 39,
+  "relational_tables": 63,
   "schema_version": 10,
-  "source_test_definitions": 194
+  "source_test_definitions": 206
 }

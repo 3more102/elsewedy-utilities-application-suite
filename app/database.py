@@ -534,6 +534,16 @@ def init_db(hash_password):
           head_hash TEXT NOT NULL DEFAULT '',
           record_count INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS kpi_snapshot(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          scope_key TEXT NOT NULL,
+          window_key TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          source_latest_at TEXT,
+          calculated_at TEXT NOT NULL,
+          UNIQUE(scope_key,window_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_kpi_snapshot_scope ON kpi_snapshot(scope_key,calculated_at);
         ''')
         _ensure_schema_columns(conn)
         _ensure_site_columns(conn)

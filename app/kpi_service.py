@@ -87,6 +87,228 @@ def _rows(cur):
     return [dict(r) for r in cur.fetchall()]
 
 
+OVERDUE_REQUISITION_DAYS = 7
+STALE_SOURCE_HOURS = 24
+SNAPSHOT_TTL_MINUTES = 15
+_IN_CLAUSE_CHUNK = 400
+
+
+def _chunked(items: list, size: int = _IN_CLAUSE_CHUNK):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _asset_health_map(conn, asset_ids: list[int]) -> dict[int, dict]:
+    """Set-based batch evaluation of the canonical per-asset health score.
+
+    Reproduces app.application._asset_health exactly (same penalty weights,
+    same caps, same banding) while replacing its per-asset query fan-out with
+    five grouped statements. The equivalence is enforced by regression tests.
+    """
+    from .application import _asset_health as _canonical  # noqa: F401 (equivalence reference)
+
+    unique_ids = sorted({int(a) for a in asset_ids})
+    if not unique_ids:
+        return {}
+    today_s = date.today().isoformat()
+    condition_penalty_map = {'Good': 0, 'Fair': 10, 'Warning': 25, 'Poor': 40, 'Critical': 55}
+    criticality_penalty_map = {'Low': 0, 'Medium': 3, 'High': 7, 'Critical': 12}
+
+    base: dict[int, dict] = {}
+    for chunk in _chunked(unique_ids):
+        placeholders = ','.join('?' * len(chunk))
+        for r in _rows(conn.execute(
+                f'SELECT id,condition,criticality,status FROM assets WHERE id IN ({placeholders})',
+                chunk)):
+            base[r['id']] = dict(r)
+
+    work_agg: dict[int, dict] = {}
+    for chunk in _chunked(unique_ids):
+        placeholders = ','.join('?' * len(chunk))
+        for r in _rows(conn.execute(
+                f'''SELECT asset_id,
+                      SUM(CASE WHEN priority IN ('Emergency','Critical','High') THEN 1 ELSE 0 END) high,
+                      SUM(CASE WHEN target_finish IS NOT NULL AND target_finish<? THEN 1 ELSE 0 END) overdue
+                    FROM work_orders
+                    WHERE status NOT IN ('Completed','Closed','Cancelled')
+                      AND asset_id IN ({placeholders}) GROUP BY asset_id''',
+                [today_s] + chunk)):
+            work_agg[r['asset_id']] = {
+                'high': int(r['high'] or 0), 'overdue': int(r['overdue'] or 0)}
+
+    failed_inspections: dict[int, int] = {}
+    sla_breaches: dict[int, int] = {}
+    alarm_agg: dict[int, dict] = {}
+    for chunk in _chunked(unique_ids):
+        placeholders = ','.join('?' * len(chunk))
+        for r in _rows(conn.execute(
+                f"SELECT asset_id, COUNT(*) c FROM inspections"
+                f" WHERE result='Fail' AND asset_id IN ({placeholders}) GROUP BY asset_id", chunk)):
+            failed_inspections[r['asset_id']] = int(r['c'])
+        for r in _rows(conn.execute(
+                f'''SELECT w.asset_id, COUNT(*) c FROM work_order_sla s
+                      JOIN work_orders w ON w.id=s.work_order_id
+                     WHERE (s.response_status='Breached' OR s.resolution_status='Breached')
+                       AND w.asset_id IN ({placeholders}) GROUP BY w.asset_id''', chunk)):
+            sla_breaches[r['asset_id']] = int(r['c'])
+        for r in _rows(conn.execute(
+                f"""SELECT asset_id, COUNT(*) total,
+                           SUM(CASE WHEN severity='Critical' THEN 1 ELSE 0 END) critical
+                      FROM operational_alarms
+                     WHERE status IN ('Open','Acknowledged') AND asset_id IN ({placeholders})
+                     GROUP BY asset_id""", chunk)):
+            alarm_agg[r['asset_id']] = {'total': int(r['total']), 'critical': int(r['critical'] or 0)}
+
+    out: dict[int, dict] = {}
+    for asset_id in unique_ids:
+        row = base.get(asset_id)
+        if row is None:
+            continue
+        condition = row.get('condition')
+        criticality = row.get('criticality')
+        status = row.get('status')
+        work = work_agg.get(asset_id, {'high': 0, 'overdue': 0})
+        alarms = alarm_agg.get(asset_id, {'total': 0, 'critical': 0})
+        penalties = {
+            'condition': condition_penalty_map.get(condition, 15),
+            'criticality': criticality_penalty_map.get(criticality, 3),
+            'status': 0 if status in ('Operating', 'Standby') else (
+                10 if status in ('Under Maintenance', 'Restricted') else 25),
+            'priority_work': min(25, work['high'] * 7),
+            'overdue_work': min(20, work['overdue'] * 5),
+            'failed_inspections': min(16, int(failed_inspections.get(asset_id, 0)) * 8),
+            'sla_breaches': min(10, int(sla_breaches.get(asset_id, 0)) * 5),
+            'operational_alarms': min(18, alarms['total'] * 5 + alarms['critical'] * 5),
+        }
+        score = max(0, min(100, 100 - sum(penalties.values())))
+        band = ('Healthy' if score >= 85 else 'Monitor' if score >= 70
+                else 'Warning' if score >= 50 else 'Critical')
+        out[asset_id] = {
+            'asset_id': asset_id, 'score': round(score, 1), 'risk_band': band,
+            'factors': penalties,
+            'open_priority_work': work['high'], 'overdue_work': work['overdue'],
+            'failed_inspections': int(failed_inspections.get(asset_id, 0)),
+            'sla_breaches': int(sla_breaches.get(asset_id, 0)),
+            'condition': condition, 'criticality': criticality, 'status': status,
+        }
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# KPI snapshot materialization
+# --------------------------------------------------------------------------- #
+
+def _snapshot_scope_key(f: ExecutiveFilters) -> str:
+    return '|'.join([
+        f"site={f.site_id}", f"region={f.region}",
+        f"class={f.asset_type_id}", f"crit={f.criticality}"])
+
+
+def _snapshot_window_key(f: ExecutiveFilters) -> str:
+    w = f.window()
+    return f"{w['period_start']}..{w['period_end']}#{w['period_days']}"
+
+
+def source_watermark(conn) -> Optional[str]:
+    """Latest mutation timestamp across every table feeding executive KPIs.
+
+    Used for snapshot invalidation: a stored snapshot whose calculated_at is
+    older than this watermark was computed before at least one relevant
+    mutation and must be recomputed. audit_logs covers every audited business
+    mutation; the remaining columns cover machine-driven paths that bypass the
+    audit trail (telemetry ingestion, alarm state transitions).
+    """
+    return conn.execute(
+        '''SELECT MAX(ts) FROM (
+             SELECT MAX(created_at) ts FROM audit_logs
+             UNION ALL SELECT MAX(updated_at) FROM asset_outages
+             UNION ALL SELECT MAX(start_at) FROM asset_outages
+             UNION ALL SELECT MAX(opened_at) FROM operational_alarms
+             UNION ALL SELECT MAX(last_seen_at) FROM operational_alarms
+             UNION ALL SELECT MAX(captured_at) FROM telemetry_readings
+             UNION ALL SELECT MAX(ingested_at) FROM telemetry_readings
+             UNION ALL SELECT MAX(updated_at) FROM telemetry_channels
+             UNION ALL SELECT MAX(reserved_at) FROM inventory_reservations
+             UNION ALL SELECT MAX(issued_at) FROM work_order_materials
+             UNION ALL SELECT MAX(created_at) FROM purchase_requisitions
+             UNION ALL SELECT MAX(approved_at) FROM purchase_requisitions
+             UNION ALL SELECT MAX(actual_receipt) FROM purchase_orders
+             UNION ALL SELECT MAX(created_at) FROM technician_absences
+             UNION ALL SELECT MAX(created_at) FROM inventory_transactions
+             UNION ALL SELECT MAX(posted_at) FROM maintenance_cost_ledger
+           )''').fetchone()[0]
+
+
+def _parse_ts(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)[:19])
+    except (TypeError, ValueError):
+        return None
+
+
+def read_snapshot(conn, f: ExecutiveFilters) -> Optional[dict]:
+    """Return a still-valid cached snapshot payload, or None when unusable."""
+    row = conn.execute(
+        'SELECT payload_json, calculated_at, source_latest_at FROM kpi_snapshot'
+        ' WHERE scope_key=? AND window_key=?',
+        (_snapshot_scope_key(f), _snapshot_window_key(f))).fetchone()
+    if row is None:
+        return None
+    import json as _json
+    try:
+        payload = _json.loads(row['payload_json'])
+    except (TypeError, ValueError):
+        return None
+    calculated_at = _parse_ts(row['calculated_at'])
+    if calculated_at is None:
+        return None
+    age_seconds = max(0.0, (datetime.now() - calculated_at).total_seconds())
+    if age_seconds > SNAPSHOT_TTL_MINUTES * 60:
+        return None  # TTL bounds staleness from unwatermarked mutations
+    watermark_now = _parse_ts(source_watermark(conn))
+    watermark_then = _parse_ts(row['source_latest_at']) or calculated_at
+    # Strict comparison: any tracked mutation strictly after the stored
+    # watermark forces recomputation. Sub-second mutation races are bounded by
+    # the TTL above rather than pretending second-level precision.
+    if watermark_now and watermark_now > watermark_then:
+        return None
+    payload.setdefault('snapshot', {})
+    payload['snapshot'] = {
+        'served_from_cache': True,
+        'calculated_at': row['calculated_at'],
+        'age_seconds': round(age_seconds, 1),
+        'ttl_minutes': SNAPSHOT_TTL_MINUTES,
+    }
+    return payload
+
+
+def write_snapshot(conn, f: ExecutiveFilters, payload: dict) -> bool:
+    """Atomically upsert one scoped snapshot; never partially visible.
+
+    Returns False (without raising) on storage problems so callers fall back to
+    live computation — e.g. legacy databases where the table has not migrated.
+    """
+    import json as _json
+    watermark = source_watermark(conn)
+    try:
+        conn.execute(
+            '''INSERT INTO kpi_snapshot(scope_key,window_key,payload_json,
+                                        source_latest_at,calculated_at)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(scope_key,window_key) DO UPDATE SET
+                 payload_json=excluded.payload_json,
+                 source_latest_at=excluded.source_latest_at,
+                 calculated_at=excluded.calculated_at''',
+            (_snapshot_scope_key(f), _snapshot_window_key(f),
+             _json.dumps(payload, ensure_ascii=False, default=str),
+             watermark, datetime.now().isoformat(timespec='seconds')))
+        return True
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Reliability (SAIDI / SAIFI / CAIDI / availability / outages)
 # --------------------------------------------------------------------------- #
@@ -123,6 +345,10 @@ def compute_reliability(conn, f: ExecutiveFilters) -> dict:
         if f.site_id is not None:
             o_sql += ' AND o.site_id=?'
             o_args.append(f.site_id)
+        if f.region:
+            # Region scoping rides on the sites join already present in o_sql.
+            o_sql += ' AND s.region=?'
+            o_args.append(f.region)
         for row in _rows(conn.execute(o_sql, o_args)):
             hours = _outage_overlap_hours(row['start_at'], row.get('end_at'), win_start, win_end)
             if hours <= 0:
@@ -204,8 +430,6 @@ def compute_reliability(conn, f: ExecutiveFilters) -> dict:
 # --------------------------------------------------------------------------- #
 
 def compute_asset_kpis(conn, f: ExecutiveFilters) -> dict:
-    from .application import _asset_health  # deferred: single canonical scorer
-
     scope_sql, scope_args = _asset_scope(f)
     counts = _rows(conn.execute(
         'SELECT COUNT(*) total,'
@@ -219,11 +443,19 @@ def compute_asset_kpis(conn, f: ExecutiveFilters) -> dict:
         scope_args,
     ))[0]
 
-    health_rows = [_asset_health(conn, r['id'])
-                   for r in _rows(conn.execute(
-                       'SELECT a.id FROM assets a LEFT JOIN locations l ON l.id=a.location_id'
-                       ' LEFT JOIN sites s ON s.id=l.site_id WHERE 1=1' + scope_sql,
-                       scope_args))]
+    scoped_ids = [r['id'] for r in _rows(conn.execute(
+        'SELECT a.id FROM assets a LEFT JOIN locations l ON l.id=a.location_id'
+        ' LEFT JOIN sites s ON s.id=l.site_id WHERE 1=1' + scope_sql, scope_args))]
+    identity: dict[int, dict] = {}
+    for chunk in _chunked(scoped_ids):
+        for r in _rows(conn.execute(
+                'SELECT id,asset_no,name FROM assets WHERE id IN (%s)'
+                % ','.join('?' * len(chunk)), chunk)):
+            identity[r['id']] = dict(r)
+    health_rows = []
+    for asset_id, h in _asset_health_map(conn, scoped_ids).items():
+        ident = identity.get(asset_id, {})
+        health_rows.append({**ident, **h})
     distribution = {'Healthy': 0, 'Monitor': 0, 'Warning': 0, 'Critical': 0}
     for h in health_rows:
         distribution[h['risk_band']] = distribution.get(h['risk_band'], 0) + 1
@@ -440,38 +672,85 @@ def compute_condition_kpis(conn, f: ExecutiveFilters) -> dict:
 # --------------------------------------------------------------------------- #
 
 def compute_inventory_procurement_kpis(conn, f: ExecutiveFilters) -> dict:
+    """Inventory/procurement KPIs honoring site/region scope where real
+    dimensions exist (warehouses carry site; requisitions carry site).
+
+    Parts-blocked work is reservation-engine-exact: a requirement is blocked
+    only when remaining_required > reserved_for_work + free_stock, mirroring
+    _work_order_parts_readiness (required minus issued, reservations with
+    status Reserved/Partially Issued, and unreserved free stock).
+    Purchase-order metrics are organization-wide: purchase_orders carry no
+    site dimension in the schema.
+    """
     w = f.window()
+    inv_scope_sql, inv_scope_args = ('', [])
+    if f.site_id is not None:
+        inv_scope_sql += ' AND s.id=?'
+        inv_scope_args.append(f.site_id)
+    if f.region:
+        inv_scope_sql += ' AND s.region=?'
+        inv_scope_args.append(f.region)
+
     stockouts = _rows(conn.execute(
         'SELECT i.id, i.item_no, i.name, i.current_stock, i.reserved_stock, i.reorder_point,'
         ' w.name warehouse_name FROM inventory_items i'
-        ' LEFT JOIN warehouses w ON w.id=i.warehouse_id'
-        ' WHERE i.current_stock-i.reserved_stock<=0 ORDER BY i.item_no LIMIT 50'))
+        ' JOIN warehouses w ON w.id=i.warehouse_id LEFT JOIN sites s ON s.id=w.site_id'
+        ' WHERE i.current_stock-i.reserved_stock<=0' + inv_scope_sql +
+        ' ORDER BY i.item_no LIMIT 50', inv_scope_args))
     reserved_value = conn.execute(
         'SELECT COALESCE(SUM(i.reserved_stock*i.unit_price),0) FROM inventory_items i'
-    ).fetchone()[0] or 0
+        ' JOIN warehouses wh ON wh.id=i.warehouse_id LEFT JOIN sites s ON s.id=wh.site_id'
+        ' WHERE 1=1' + inv_scope_sql, inv_scope_args).fetchone()[0] or 0
     ati_value = conn.execute(
         'SELECT COALESCE(SUM((i.current_stock-i.reserved_stock)*i.unit_price),0)'
-        ' FROM inventory_items i').fetchone()[0] or 0
+        ' FROM inventory_items i JOIN warehouses wh ON wh.id=i.warehouse_id'
+        ' LEFT JOIN sites s ON s.id=wh.site_id WHERE 1=1' + inv_scope_sql,
+        inv_scope_args).fetchone()[0] or 0
 
-    blocked = int(conn.execute(
-        'SELECT COUNT(DISTINCT r.work_order_id) FROM work_order_requirements r'
-        ' JOIN inventory_items i ON i.id=r.inventory_item_id'
-        ' JOIN work_orders w ON w.id=r.work_order_id'
-        " WHERE r.status<>'Cancelled' AND " + _OPEN_WO +
-        ' AND (i.current_stock-i.reserved_stock)<r.quantity').fetchone()[0])
-    blocked_high_risk = int(conn.execute(
-        'SELECT COUNT(DISTINCT r.work_order_id) FROM work_order_requirements r'
-        ' JOIN inventory_items i ON i.id=r.inventory_item_id'
-        ' JOIN work_orders w ON w.id=r.work_order_id'
-        " WHERE r.status<>'Cancelled' AND " + _OPEN_WO +
-        " AND w.priority IN ('Emergency','Critical','High')"
-        ' AND (i.current_stock-i.reserved_stock)<r.quantity').fetchone()[0])
+    def _blocked(extra_priority: str = '') -> int:
+        sql = (
+            'SELECT COUNT(DISTINCT r.work_order_id) FROM work_order_requirements r'
+            ' JOIN inventory_items i ON i.id=r.inventory_item_id'
+            ' JOIN work_orders w ON w.id=r.work_order_id'
+            ' LEFT JOIN locations l ON l.id=w.location_id LEFT JOIN sites s ON s.id=l.site_id'
+            ' LEFT JOIN (SELECT work_order_id ao, inventory_item_id ai, SUM(quantity) issued'
+            '   FROM work_order_materials GROUP BY work_order_id,inventory_item_id) m'
+            '   ON m.ao=r.work_order_id AND m.ai=r.inventory_item_id'
+            ' LEFT JOIN (SELECT work_order_id ro, inventory_item_id ri,'
+            '   SUM(quantity-issued_quantity) reserved FROM inventory_reservations'
+            "   WHERE status IN ('Reserved','Partially Issued')"
+            '   GROUP BY work_order_id,inventory_item_id) rv'
+            '   ON rv.ro=r.work_order_id AND rv.ri=r.inventory_item_id'
+            " WHERE r.status<>'Cancelled' AND " + _OPEN_WO +
+            ' AND (r.quantity-COALESCE(m.issued,0)) >'
+            ' (COALESCE(rv.reserved,0)'
+            ' + CASE WHEN i.current_stock-i.reserved_stock>0'
+            '   THEN i.current_stock-i.reserved_stock ELSE 0 END)' + extra_priority)
+        args: list = []
+        if f.site_id is not None:
+            sql += ' AND s.id=?'
+            args.append(f.site_id)
+        if f.region:
+            sql += ' AND s.region=?'
+            args.append(f.region)
+        return int(conn.execute(sql, args).fetchone()[0])
 
+    blocked = _blocked()
+    blocked_high_risk = _blocked(" AND w.priority IN ('Emergency','Critical','High')")
+
+    pr_scope_sql, pr_scope_args = '', []
+    if f.site_id is not None:
+        pr_scope_sql += ' LEFT JOIN sites ps ON ps.id=pr.site_id WHERE 1=1 AND pr.site_id=?'
+        pr_scope_args.append(f.site_id)
+    elif f.region:
+        pr_scope_sql += ' LEFT JOIN sites ps ON ps.id=pr.site_id WHERE 1=1 AND ps.region=?'
+        pr_scope_args.append(f.region)
     overdue_prs = _rows(conn.execute(
         'SELECT pr.id, pr.pr_no, pr.title, pr.created_at FROM purchase_requisitions pr'
-        " WHERE pr.status='Submitted' AND pr.created_at<?"
+        + (pr_scope_sql if pr_scope_args else ' WHERE 1=1') +
+        " AND pr.status='Submitted' AND pr.created_at<?"
         ' ORDER BY pr.created_at LIMIT 20',
-        [(datetime.now() - timedelta(days=OVERDUE_REQUISITION_DAYS)).isoformat(timespec='seconds')]))
+        pr_scope_args + [(datetime.now() - timedelta(days=OVERDUE_REQUISITION_DAYS)).isoformat(timespec='seconds')]))
     overdue_pos = int(conn.execute(
         "SELECT COUNT(*) FROM purchase_orders po WHERE po.expected_delivery IS NOT NULL"
         " AND po.expected_delivery<? AND po.status NOT IN ('Received','Cancelled')",
@@ -610,8 +889,6 @@ def risk_score_work_order(row: dict) -> tuple[float, dict]:
 
 
 def risk_weighted_backlog(conn, f: ExecutiveFilters, limit: int = 25) -> dict:
-    from .application import _asset_health, _work_order_parts_readiness  # deferred
-
     scope_sql, scope_args = _wo_scope(f)
     rows_ = _rows(conn.execute(
         'SELECT w.id, w.wo_no, w.title, w.priority, w.work_type, w.status, w.target_finish,'
@@ -620,6 +897,54 @@ def risk_weighted_backlog(conn, f: ExecutiveFilters, limit: int = 25) -> dict:
         ' FROM work_orders w LEFT JOIN assets a ON a.id=w.asset_id'
         ' LEFT JOIN locations l ON l.id=w.location_id LEFT JOIN sites s ON s.id=l.site_id'
         ' WHERE ' + _OPEN_WO + scope_sql, scope_args))
+    wo_asset_ids = [r['asset_id'] for r in rows_ if r['asset_id']]
+    health_map = _asset_health_map(conn, wo_asset_ids)
+    wo_ids = [r['id'] for r in rows_]
+
+    # Batched lookups replace four per-work-order queries (alarms, outages,
+    # SLA state, parts shortages); identical inputs to the per-row form.
+    alarm_counts: dict[int, int] = {}
+    open_outage_assets: set[int] = set()
+    for chunk in _chunked(wo_asset_ids):
+        placeholders = ','.join('?' * len(chunk))
+        for r in _rows(conn.execute(
+                f"""SELECT asset_id, COUNT(*) c FROM operational_alarms
+                     WHERE status IN ('Open','Acknowledged') AND asset_id IN ({placeholders})
+                     GROUP BY asset_id""", chunk)):
+            alarm_counts[r['asset_id']] = int(r['c'])
+        for r in _rows(conn.execute(
+                f"SELECT DISTINCT asset_id FROM asset_outages"
+                f" WHERE status='Open' AND asset_id IN ({placeholders})", chunk)):
+            open_outage_assets.add(int(r['asset_id']))
+    sla_state: dict[int, dict] = {}
+    for chunk in _chunked(wo_ids):
+        placeholders = ','.join('?' * len(chunk))
+        for r in _rows(conn.execute(
+                f'''SELECT work_order_id, response_status, resolution_status
+                      FROM work_order_sla WHERE work_order_id IN ({placeholders})''', chunk)):
+            sla_state[r['work_order_id']] = dict(r)
+    blocked_wo_ids: set[int] = set()
+    for chunk in _chunked(wo_ids):
+        placeholders = ','.join('?' * len(chunk))
+        for r in _rows(conn.execute(
+                f'''SELECT DISTINCT r.work_order_id wid FROM work_order_requirements r
+                      JOIN inventory_items i ON i.id=r.inventory_item_id
+                      LEFT JOIN (SELECT work_order_id ao, inventory_item_id ai,
+                        SUM(quantity) issued FROM work_order_materials
+                        GROUP BY work_order_id,inventory_item_id) m
+                        ON m.ao=r.work_order_id AND m.ai=r.inventory_item_id
+                      LEFT JOIN (SELECT work_order_id ro, inventory_item_id ri,
+                        SUM(quantity-issued_quantity) reserved FROM inventory_reservations
+                        WHERE status IN ('Reserved','Partially Issued')
+                        GROUP BY work_order_id,inventory_item_id) rv
+                        ON rv.ro=r.work_order_id AND rv.ri=r.inventory_item_id
+                     WHERE r.status<>'Cancelled' AND r.work_order_id IN ({placeholders})
+                       AND (r.quantity-COALESCE(m.issued,0)) >
+                       (COALESCE(rv.reserved,0)
+                        + CASE WHEN i.current_stock-i.reserved_stock>0
+                          THEN i.current_stock-i.reserved_stock ELSE 0 END)''', chunk)):
+            blocked_wo_ids.add(int(r['wid']))
+
     today_s = date.today().isoformat()
     scored: list[dict] = []
     critical_count = 0
@@ -629,23 +954,15 @@ def risk_weighted_backlog(conn, f: ExecutiveFilters, limit: int = 25) -> dict:
         if wo.get('target_finish') and str(wo['target_finish'])[:10] < today_s:
             delta = date.today() - date.fromisoformat(str(wo['target_finish'])[:10])
             wo['overdue_days'] = delta.days
-        wo['active_alarms'] = int(conn.execute(
-            "SELECT COUNT(*) FROM operational_alarms WHERE asset_id=? AND status IN ('Open','Acknowledged')",
-            (wo['asset_id'],)).fetchone()[0]) if wo['asset_id'] else 0
-        wo['open_outage'] = bool(conn.execute(
-            "SELECT id FROM asset_outages WHERE asset_id=? AND status='Open'",
-            (wo['asset_id'],)).fetchone()) if wo['asset_id'] else False
+        wo['active_alarms'] = alarm_counts.get(wo['asset_id'], 0) if wo['asset_id'] else 0
+        wo['open_outage'] = bool(wo['asset_id'] and wo['asset_id'] in open_outage_assets)
         wo['safety_relevant'] = bool(str(wo.get('safety_requirements') or '').strip()) or \
             wo.get('priority') == 'Emergency'
-        readiness = _work_order_parts_readiness(conn, wo['id'])
-        wo['parts_blocked'] = readiness['state'] == 'Shortage'
-        sla = conn.execute(
-            'SELECT response_status,resolution_status FROM work_order_sla WHERE work_order_id=?',
-            (wo['id'],)).fetchone()
-        sla = dict(sla) if sla else {}
+        wo['parts_blocked'] = wo['id'] in blocked_wo_ids
+        sla = sla_state.get(wo['id'], {})
         wo['response_breached'] = sla.get('response_status') == 'Breached'
         wo['resolution_breached'] = sla.get('resolution_status') == 'Breached'
-        health = _asset_health(conn, wo['asset_id']) if wo['asset_id'] else None
+        health = health_map.get(wo['asset_id']) if wo['asset_id'] else None
         wo['health_score'] = health['score'] if health else None
         wo['health_band'] = health['risk_band'] if health else 'Unknown'
         score, components = risk_score_work_order(wo)
@@ -1058,7 +1375,7 @@ def compute_freshness(conn, f: ExecutiveFilters, sections: dict) -> dict:
     }
 
 
-def executive_snapshot(conn, f: ExecutiveFilters) -> dict:
+def _compute_live_snapshot(conn, f: ExecutiveFilters) -> dict:
     reliability = compute_reliability(conn, f)
     assets = compute_asset_kpis(conn, f)
     maintenance = compute_maintenance_kpis(conn, f)
@@ -1073,7 +1390,7 @@ def executive_snapshot(conn, f: ExecutiveFilters) -> dict:
         'condition': condition,
         'inventory_procurement': inventory,
     }
-    payload = {
+    return {
         'window': f.window(),
         'filters_applied': {
             'site_id': f.site_id, 'region': f.region, 'asset_type_id': f.asset_type_id,
@@ -1091,4 +1408,37 @@ def executive_snapshot(conn, f: ExecutiveFilters) -> dict:
         'top_risk_contributors': backlog['rows'][:10],
         'explanations': explain_kpi_changes(conn, f),
     }
+
+
+def executive_snapshot(conn, f: ExecutiveFilters, *, use_cache: bool = True) -> dict:
+    """Scoped executive snapshot with safe materialization.
+
+    Cache correctness contract:
+    - scope key covers every filter that changes results (site, region, asset
+      class, criticality); window key covers the full calculation window.
+    - a cached payload is served only when no tracked source table mutated
+      after its calculation AND it is younger than SNAPSHOT_TTL_MINUTES. The
+      TTL bounds staleness from mutations without reliable timestamps.
+    - storage failures fall back to live computation; snapshots are written in
+      a single atomic upsert so no partial payload is ever visible.
+    """
+    if not use_cache:
+        payload = _compute_live_snapshot(conn, f)
+        payload['snapshot'] = {'served_from_cache': False}
+        return payload
+    try:
+        cached = read_snapshot(conn, f)
+    except Exception:
+        cached = None
+    if cached is not None:
+        return cached
+    payload = _compute_live_snapshot(conn, f)
+    payload['snapshot'] = {'served_from_cache': False}
+    stored = False
+    try:
+        stored = write_snapshot(conn, f, payload)
+    except Exception:
+        stored = False
+    payload.setdefault('snapshot', {})
+    payload['snapshot']['materialized'] = bool(stored)
     return payload

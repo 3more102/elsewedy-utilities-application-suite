@@ -62,32 +62,49 @@ def _seed_outage(ids, *, asset_id, site_id, start, end, outage_type='Forced', co
 
 
 def test_saidi_saifi_caidi_formulas_match_customer_weighting():
-    ids = _ids()
-    # Configure served customers: NCS-01 = 8000, CAI-OPS = 2000 -> total 10000.
-    with db() as conn:
-        conn.execute('UPDATE sites SET customers_served=8000 WHERE id=?', (ids['ncs'],))
-        conn.execute('UPDATE sites SET customers_served=2000 WHERE id=?', (ids['cai'],))
+    _ensure_db()
     now = datetime.now()
-    # One 2-hour forced outage affecting all 8000 NCS customers.
-    _seed_outage(
-        ids, asset_id=ids['tr'], site_id=ids['ncs'],
-        start=(now - timedelta(days=1)).isoformat(timespec='seconds'),
-        end=(now - timedelta(days=1) + timedelta(hours=2)).isoformat(timespec='seconds'),
-        code_suffix='S1',
-    )
+    # Dedicated site/asset so the exact-formula assertions are immune to
+    # outages seeded by other suites on shared seed records.
+    with db() as conn:
+        cur = conn.execute(
+            '''INSERT INTO sites(site_code,name,region,city,site_type,status,customers_served)
+               VALUES('KPI-SAI','KPI Reliability Site','Greater Cairo','Cairo',
+                      'Operations Centre','Operating',10000)''')
+        site_id = int(cur.lastrowid)
+        loc_cur = conn.execute(
+            '''INSERT INTO locations(location_code,name,location_type,site_id)
+               VALUES('KPI-SAI-LOC','KPI Reliability Location','Site',?)''', (site_id,))
+        asset_cur = conn.execute(
+            '''INSERT INTO assets(asset_no,name,category,criticality,condition,status,
+                 location_id,created_at,updated_at)
+               VALUES('BENCH-KPI-SAI','KPI Reliability Asset','Transformer','Critical',
+                      'Good','Operating',?,?,?)''',
+            (int(loc_cur.lastrowid), now.isoformat(timespec='seconds'),
+             now.isoformat(timespec='seconds')))
+        asset_id = int(asset_cur.lastrowid)
+        admin = int(conn.execute("SELECT id FROM users WHERE username='omar'").fetchone()[0])
+        start = (now - timedelta(days=1)).isoformat(timespec='seconds')
+        end = (now - timedelta(days=1) + timedelta(hours=2)).isoformat(timespec='seconds')
+        conn.execute(
+            '''INSERT INTO asset_outages(outage_no,asset_id,site_id,outage_type,status,start_at,
+                 end_at,reported_by,created_at,updated_at)
+               VALUES('OUT-KPI-SAI',?,?,'Forced','Closed',?,?,?,?,?)''',
+            (asset_id, site_id, start, end, admin, start, start))
 
-    f = ExecutiveFilters(period_days=7)
+    f = ExecutiveFilters(site_id=site_id, period_days=7)
     with db() as conn:
         rel = compute_reliability(conn, f)
 
     assert rel['customers_basis'] == 'configured'
-    # SAIDI = 2h * 60 * 8000 / 10000 = 96 minutes.
-    assert rel['saidi_minutes'] == 96.0
-    # SAIFI = 8000 interruptions / 10000 customers = 0.8.
-    assert rel['saifi'] == 0.8
+    assert rel['customers_served_total'] == 10000
+    # SAIDI = 2h * 60 * 10000 / 10000 = 120 minutes.
+    assert rel['saidi_minutes'] == 120.0
+    # SAIFI = 10000 interruptions / 10000 customers = 1.0.
+    assert rel['saifi'] == 1.0
     # CAIDI = SAIDI / SAIFI = 120 minutes.
     assert rel['caidi_minutes'] == 120.0
-    assert rel['unplanned_outages'] >= 1
+    assert rel['unplanned_outages'] == 1
 
 
 def test_zero_data_behavior_is_well_defined():

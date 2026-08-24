@@ -181,7 +181,7 @@ async function uploadDocument(work=null){const assets=S.cache.assets||await api(
 
 window.downloadDoc=async(id,name)=>{try{const r=await fetch(`/api/documents/${id}/download`,{headers:{Authorization:'Bearer '+S.token}});if(!r.ok)throw new Error('Download failed');const b=await r.blob(),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download=name;a.click();URL.revokeObjectURL(u)}catch(e){toast(e.message)}}
 
-const KPI_STATE={days:30,siteId:'',typeId:'',crit:''};
+const KPI_STATE={days:30,siteId:'',typeId:'',crit:'',region:''};
 
 function kpiDelta(cur,prev,unit='',lowerIsBetter=false){
   if(cur==null||prev==null)return '';
@@ -207,6 +207,7 @@ async function renderAnalytics(){
   if(siteId)qp.set('site_id',siteId);
   if(KPI_STATE.typeId)qp.set('asset_type_id',KPI_STATE.typeId);
   if(KPI_STATE.crit)qp.set('criticality',KPI_STATE.crit);
+  if(KPI_STATE.region)qp.set('region',KPI_STATE.region);
   const [k,deter]=await Promise.all([api('/api/kpi/executive?'+qp),api('/api/kpi/deterioration?'+qp).catch(()=>null)]);
   const ref=S.ref||await api('/api/reference');
   const rel=k.reliability,as=k.assets,m=k.maintenance,c=k.condition,ip=k.inventory_procurement,wf=k.workforce,fresh=k.freshness;
@@ -220,9 +221,11 @@ async function renderAnalytics(){
     <p>Drill from enterprise KPIs to assets, work and alarms. <span class="status ${freshCls}">Calculated ${esc(fresh.calculated_at)} · source ${fresh.state}</span></p></div>
     <div class="hero-actions">
       <select id="kpi-days" class="btn">${[7,30,90,365].map(d=>`<option value="${d}" ${d==KPI_STATE.days?'selected':''}>Last ${d} days</option>`).join('')}</select>
-      <select id="kpi-site" class="btn"><option value="">All Sites</option>${ref.sites.map(s=>`<option value="${s.id}" ${String(s.id)===String(siteId)?'selected':''}>${esc(s.name)}</option>`).join('')}</select>
+      <select id="kpi-region" class="btn"><option value="">All Regions</option>${[...new Set(ref.sites.map(s=>s.region))].sort().map(rg=>`<option value="${esc(rg)}" ${rg===KPI_STATE.region?'selected':''}>${esc(rg)}</option>`).join('')}</select>
+      <select id="kpi-site" class="btn"><option value="">All Sites</option>${ref.sites.filter(s=>!KPI_STATE.region||s.region===KPI_STATE.region).map(s=>`<option value="${s.id}" ${String(s.id)===String(siteId)?'selected':''}>${esc(s.name)}</option>`).join('')}</select>
       <select id="kpi-type" class="btn"><option value="">All Asset Classes</option>${ref.asset_types.map(t=>`<option value="${t.id}" ${String(t.id)===KPI_STATE.typeId?'selected':''}>${esc(t.name)}</option>`).join('')}</select>
       <select id="kpi-crit" class="btn"><option value="">All Criticality</option>${['Critical','High','Medium','Low'].map(x=>`<option value="${x}" ${x===KPI_STATE.crit?'selected':''}>${x}</option>`).join('')}</select>
+      ${roleIn('admin')?`<button class="btn" id="kpi-customers">Customer Population</button>`:''}
     </div></div>
 
   <h3 class="section-sub">Reliability</h3>
@@ -299,9 +302,11 @@ async function renderAnalytics(){
 
   const reload=()=>render();
   $('#kpi-days').onchange=e=>{KPI_STATE.days=Number(e.target.value);reload()};
+  $('#kpi-region').onchange=e=>{KPI_STATE.region=e.target.value;const sel=$('#kpi-site');const valid=[...sel.options].some(o=>o.value===String(KPI_STATE.siteId));if(!valid)KPI_STATE.siteId='';reload()};
   $('#kpi-site').onchange=e=>{KPI_STATE.siteId=e.target.value;S.siteId=e.target.value;reload()};
   $('#kpi-type').onchange=e=>{KPI_STATE.typeId=e.target.value;reload()};
   $('#kpi-crit').onchange=e=>{KPI_STATE.crit=e.target.value;reload()};
+  if($('#kpi-customers'))$('#kpi-customers').onclick=()=>customersModal(ref.sites);
   $$('#content .drill-row').forEach(row=>{
     row.onclick=async()=>{
       const kind=row.dataset.kind,id=row.dataset.id;
@@ -313,8 +318,27 @@ async function renderAnalytics(){
   });
 }
 
-async function assetKpiDossier(assetId){
-  const p=await api('/api/kpi/assets/'+assetId);
+function customersModal(sites){
+  openModal('Customer Population (Reliability Indices)',`
+    <p class="section-sub">SAIDI, SAIFI and CAIDI require the number of customers served per site. Leave 0 for sites without a configured customer population; those sites are excluded from customer-weighted indices.</p>
+    <div class="form-grid">${sites.map(s=>`<label class="field"><span style="font-size:10px;color:var(--muted)">${esc(s.name)} — current: ${Number(s.customers_served||0)}</span><input type="number" min="0" step="1" id="cust-${s.id}" value="${Number(s.customers_served||0)}"></label>`).join('')}</div>
+    <div class="form-actions"><button class="btn" id="cust-cancel">Cancel</button><button class="btn primary" id="cust-save">Save</button></div>`);
+  $('#cust-cancel').onclick=closeModal;
+  $('#cust-save').onclick=async()=>{
+    try{
+      for(const s of sites){
+        const el=$('#cust-'+s.id);if(!el)continue;
+        const val=Math.max(0,parseInt(el.value||'0',10));
+        if(val!==Number(s.customers_served||0)){
+          await api('/api/sites/'+s.id,{method:'PATCH',body:JSON.stringify({customers_served:val})});
+        }
+      }
+      closeModal();S.ref=await api('/api/reference');toast('Customer population saved');await render();
+    }catch(err){toast(err.message)}
+  };
+}
+
+async function assetKpiDossier(assetId){  const p=await api('/api/kpi/assets/'+assetId);
   const rel=p.reliability;
   const rows=[
     ['Availability',fmt(rel.availability_pct)+'%'],

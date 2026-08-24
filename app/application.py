@@ -955,18 +955,21 @@ def kpi_executive(
     region: Optional[str] = None,
     asset_type_id: Optional[int] = None,
     criticality: Optional[str] = None,
+    refresh: bool = False,
     user=Depends(require_roles(*_KPI_ROLES)),
 ):
     """Maximo-class executive utilities snapshot with drillable sections.
 
     Every section aggregates the same filtered scope so numbers stay consistent
     across cards, tables and drill-downs. Freshness metadata states when the
-    KPI was calculated and whether its newest source record is stale.
+    KPI was calculated and whether its newest source record is stale. Results
+    are materialized per (scope, window) and served only while no tracked
+    source mutated after calculation; ``refresh=true`` forces live recomputation.
     """
     f = _kpi_filters(period_end, period_days, site_id, region, asset_type_id, criticality)
     from .kpi_service import executive_snapshot
     with db() as conn:
-        return executive_snapshot(conn, f)
+        return executive_snapshot(conn, f, use_cache=not refresh)
 
 
 @app.get('/api/kpi/backlog/risk')
@@ -1018,6 +1021,27 @@ def kpi_asset_profile(
     if not profile:
         raise HTTPException(404, 'Asset not found')
     return profile
+
+class SiteCustomersIn(BaseModel):
+    customers_served: int = Field(ge=0, le=100_000_000)
+
+
+@app.patch('/api/sites/{site_id}')
+def update_site_customers(site_id: int, body: SiteCustomersIn, user=Depends(require_roles('admin'))):
+    """Configure the customer population used for SAIDI/SAIFI normalization.
+
+    SAIDI/SAIFI/CAIDI stay unavailable for sites without a configured customer
+    population; zero clears the configuration. The mutation is audited.
+    """
+    with db() as conn:
+        site = get_or_404(conn, 'SELECT * FROM sites WHERE id=?', (site_id,), 'Site not found')
+        old = {'customers_served': int(site['customers_served'] or 0)}
+        conn.execute('UPDATE sites SET customers_served=? WHERE id=?',
+                     (int(body.customers_served), site_id))
+        audit(conn, user['id'], 'UPDATE', 'Administration', site['site_code'], old,
+              {'customers_served': body.customers_served})
+        return {'id': site_id, 'site_code': site['site_code'],
+                'customers_served': body.customers_served}
 
 # ---------- launchpad / dashboard ----------@app.get('/api/launchpad')
 def launchpad(user=Depends(current_user)):
