@@ -1196,7 +1196,9 @@ def _validate_kpi_scope(scope:dict):
         if v is not None and not isinstance(v,int): raise HTTPException(422,f'Scope {k} must be an integer id')
 
 @app.get('/api/kpis')
-def kpi_list(category:str='',domain:str='',include_inactive:bool=False,user=Depends(require_roles(*KPI_READ_ROLES))):
+def kpi_list(category:str='',domain:str='',include_inactive:bool=False,
+             include_trend:bool=False,samples:int=Query(12,ge=2,le=60),
+             user=Depends(require_roles(*KPI_READ_ROLES))):
     with db() as conn:
         sql='SELECT * FROM kpi_definitions WHERE 1=1';args=[]
         if category:sql+=' AND category=?';args.append(category)
@@ -1204,7 +1206,21 @@ def kpi_list(category:str='',domain:str='',include_inactive:bool=False,user=Depe
         if not include_inactive:sql+=' AND active=1'
         sql+=' ORDER BY code'
         defs=[d for d in rows(conn.execute(sql,args)) if _kpi_visible(d,user['role'])]
-        return {'kpis':[_kpi_payload(conn,d) for d in defs]}
+        # Batched trend sampling: one query powers every dashboard sparkline so
+        # the KPI strip never degenerates into one-request-per-card.
+        trends={}
+        if include_trend:
+            for s in rows(conn.execute('''SELECT kpi_id,value,status,calculated_at FROM kpi_snapshots
+                ORDER BY id DESC LIMIT 2000''')):
+                bucket=trends.setdefault(s['kpi_id'],[])
+                if len(bucket)<samples:bucket.append({'value':s['value'],'status':s['status'],'calculated_at':s['calculated_at']})
+            for bucket in trends.values():bucket.reverse()
+        payload=[]
+        for d in defs:
+            p=_kpi_payload(conn,d)
+            p['trend']=trends.get(d['id'],[]) if include_trend else None
+            payload.append(p)
+        return {'kpis':payload}
 
 @app.get('/api/kpis/sources')
 def kpi_sources(user=Depends(require_roles(*KPI_READ_ROLES))):
@@ -1369,7 +1385,7 @@ def list_workflow_events(module:str='',record_type:str='',record_id:Optional[int
 @app.get('/api/launchpad')
 def launchpad(user=Depends(current_user)):
     apps=[
-      ('assets','Asset Management','Enterprise asset registry & hierarchy','AS'),('work','Work Management','Plan, assign and execute work','WO'),('maintenance','Preventive Maintenance','Calendar, meter and condition plans','PM'),('workforce','Workforce Planning','Crafts, shifts, absences and capacity','WF'),('inventory','Inventory','Spares, warehouses and transactions','IN'),('procurement','Procurement','PR, approval, PO and receipt','PO'),('approvals','Approval Center','Unified operational approval queue','AP'),('operations','Utilities Operations','Electrical, water and infrastructure','OP'),('telemetry','Telemetry & Alarms','SCADA-style readings, thresholds and alarm response','TM'),('field','Field Service','Technician mobile workspace','FS'),('dispatch','Technician Dispatch','Dispatch board, ETA and field arrival','DP'),('map','GIS / Locations','Sites, assets, work and alerts','GI'),('inspections','Inspection Management','Digital inspection forms','IP'),('hse','Safety & HSE','Incidents, hazards and actions','HS'),('contracts','Contracts','Utility service and supply agreements','CT'),('vendors','Vendors','Supplier and OEM management','VN'),('projects','Projects','Budgets, progress and milestones','PJ'),('documents','Documents','Technical records and attachments','DC'),('analytics','Analytics','Reliability, cost and performance','AN'),('automation','Automation & Reports','Scheduled controls, exports, backups and observability','AU'),('administration','Administration','Users, RBAC and audit','AD')]
+      ('assets','Asset Management','Enterprise asset registry & hierarchy','AS'),('work','Work Management','Plan, assign and execute work','WO'),('maintenance','Preventive Maintenance','Calendar, meter and condition plans','PM'),('intelligence','Operational Intelligence','KPI command center with causal explanations and drill-down','IQ'),('workforce','Workforce Planning','Crafts, shifts, absences and capacity','WF'),('inventory','Inventory','Spares, warehouses and transactions','IN'),('procurement','Procurement','PR, approval, PO and receipt','PO'),('approvals','Approval Center','Unified operational approval queue','AP'),('operations','Utilities Operations','Electrical, water and infrastructure','OP'),('telemetry','Telemetry & Alarms','SCADA-style readings, thresholds and alarm response','TM'),('field','Field Service','Technician mobile workspace','FS'),('dispatch','Technician Dispatch','Dispatch board, ETA and field arrival','DP'),('map','GIS / Locations','Sites, assets, work and alerts','GI'),('inspections','Inspection Management','Digital inspection forms','IP'),('hse','Safety & HSE','Incidents, hazards and actions','HS'),('contracts','Contracts','Utility service and supply agreements','CT'),('vendors','Vendors','Supplier and OEM management','VN'),('projects','Projects','Budgets, progress and milestones','PJ'),('documents','Documents','Technical records and attachments','DC'),('analytics','Analytics','Reliability, cost and performance','AN'),('automation','Automation & Reports','Scheduled controls, exports, backups and observability','AU'),('administration','Administration','Users, RBAC and audit','AD')]
     return [{'code':a[0],'name':a[1],'description':a[2],'icon':a[3]} for a in apps]
 
 @app.get('/api/dashboard')

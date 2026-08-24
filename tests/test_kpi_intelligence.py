@@ -157,3 +157,21 @@ def test_unknown_kpi_ids_return_404_not_leaked_data():
         for path in ('history', 'trend', 'explanation', 'drilldown'):
             r = client.get(f'/api/kpis/999999/{path}', headers=admin)
             assert r.status_code == 404
+
+
+def test_list_include_trend_batches_samples_in_one_request():
+    """The dashboard strip must be powered by a single list request."""
+    with TestClient(app) as client:
+        admin = auth(client)
+        kpi = _overdue_kpi(client, admin)
+        client.post(f"/api/kpis/{kpi['id']}/recalculate", headers=admin)
+        payload = client.get('/api/kpis', headers=admin,
+                             params={'include_trend': True, 'samples': 5}).json()['kpis']
+        me = next(k for k in payload if k['id'] == kpi['id'])
+        assert isinstance(me['trend'], list) and len(me['trend']) >= 1
+        stamps = [s['calculated_at'] for s in me['trend']]
+        assert stamps == sorted(stamps)  # chronological (oldest first)
+        # Without the flag no trend payload is shipped.
+        plain = next(k for k in client.get('/api/kpis', headers=admin).json()['kpis']
+                     if k['id'] == kpi['id'])
+        assert plain['trend'] is None

@@ -1,7 +1,7 @@
 const S={token:localStorage.getItem('euas_token')||'',user:null,view:'home',ref:null,siteId:'',cache:{},fieldTab:'assigned',dashDate:new Date().toISOString().slice(0,10)};
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-const NAV=[['home','⌂','Home'],['dashboard','▦','Dashboard'],['assets','◫','Assets'],['work','✓','Work'],['maintenance','↻','Maintenance'],['workforce','♙','Workforce'],['inventory','▤','Inventory'],['procurement','¤','Procurement'],['approvals','◉','Approvals'],['contracts','▥','Contracts'],['vendors','◇','Vendors'],['operations','⚡','Operations'],['telemetry','⌁','Telemetry'],['map','⌖','Map'],['field','▣','Field Service'],['dispatch','↯','Dispatch'],['inspections','☑','Inspections'],['hse','⚠','HSE'],['projects','◆','Projects'],['documents','▧','Documents'],['analytics','⌁','Analytics'],['automation','◎','Automation'],['administration','⚙','Administration']];
-const TITLES={home:'Home',dashboard:'Executive Dashboard',assets:'Asset Management',work:'Work Management',maintenance:'Preventive Maintenance',workforce:'Workforce Planning',inventory:'Inventory Management',procurement:'Procurement',approvals:'Approval Center',contracts:'Contracts',vendors:'Vendors',operations:'Utilities Operations',telemetry:'Telemetry & Alarms',map:'GIS / Locations',field:'Field Service',dispatch:'Technician Dispatch',inspections:'Inspection Management',hse:'Safety & HSE',projects:'Projects',documents:'Document Management',analytics:'Analytics',automation:'Automation & Reports',administration:'Administration'};
+const NAV=[['home','⌂','Home'],['dashboard','▦','Dashboard'],['assets','◫','Assets'],['work','✓','Work'],['maintenance','↻','Maintenance'],['intelligence','\u25C8','Intelligence'],['workforce','♙','Workforce'],['inventory','▤','Inventory'],['procurement','¤','Procurement'],['approvals','◉','Approvals'],['contracts','▥','Contracts'],['vendors','◇','Vendors'],['operations','⚡','Operations'],['telemetry','⌁','Telemetry'],['map','⌖','Map'],['field','▣','Field Service'],['dispatch','↯','Dispatch'],['inspections','☑','Inspections'],['hse','⚠','HSE'],['projects','◆','Projects'],['documents','▧','Documents'],['analytics','⌁','Analytics'],['automation','◎','Automation'],['administration','⚙','Administration']];
+const TITLES={home:'Home',dashboard:'Executive Dashboard',assets:'Asset Management',work:'Work Management',maintenance:'Preventive Maintenance',intelligence:'Operational Intelligence',workforce:'Workforce Planning',inventory:'Inventory Management',procurement:'Procurement',approvals:'Approval Center',contracts:'Contracts',vendors:'Vendors',operations:'Utilities Operations',telemetry:'Telemetry & Alarms',map:'GIS / Locations',field:'Field Service',dispatch:'Technician Dispatch',inspections:'Inspection Management',hse:'Safety & HSE',projects:'Projects',documents:'Document Management',analytics:'Analytics',automation:'Automation & Reports',administration:'Administration'};
 const esc=s=>String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const fmtMoney=n=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0}).format(Number(n||0));
 const fmt=n=>new Intl.NumberFormat('en-US',{maximumFractionDigits:1}).format(Number(n||0));
@@ -37,7 +37,7 @@ async function logout(call=true){if(call&&S.token){try{await api('/api/auth/logo
 $('#login-form').onsubmit=async e=>{e.preventDefault();$('#login-error').textContent='';const d=Object.fromEntries(new FormData(e.target));try{await login(d.username,d.password)}catch(err){$('#login-error').textContent=err.message}};$('#logout-btn').onclick=()=>logout();$('#profile-btn').onclick=()=>profileModal();$('#help-btn').onclick=()=>openModal('EUAS Help',`<p class="section-sub">Use the left navigation or Application Launchpad to open a module. Global Search finds connected assets, work orders, documents and inspections. Select a site to focus portfolio views. Field Service is role-aware and works best with the technician demo account.</p><div class="detail-grid"><div class="detail-box"><span>Management Demo</span><strong>omar / EUAS@2026</strong></div><div class="detail-box"><span>Technician Demo</span><strong>tech1 / Tech@2026</strong></div></div>`);
 $('#site-selector').onchange=async e=>{S.siteId=e.target.value;await render()};$('#mobile-menu').onclick=()=>$('.sidebar').classList.toggle('open');
 async function go(view){S.view=view;$$('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.view===view));$('#page-title').textContent=TITLES[view]||view;$('#breadcrumb').textContent=`EUAS / ${TITLES[view]?.toUpperCase()||view.toUpperCase()}`;$('.sidebar').classList.remove('open');await render()}
-async function render(){const fn={home:renderHome,dashboard:renderDashboard,assets:renderAssets,work:renderWork,maintenance:renderMaintenance,workforce:renderWorkforce,inventory:renderInventory,procurement:renderProcurement,approvals:renderApprovals,contracts:renderContracts,vendors:renderVendors,operations:renderOperations,telemetry:renderTelemetry,map:renderMap,field:renderField,dispatch:renderDispatch,inspections:renderInspections,hse:renderHSE,projects:renderProjects,documents:renderDocuments,analytics:renderAnalytics,automation:renderAutomation,administration:renderAdmin}[S.view];if(fn){$('#content').innerHTML='<div class="empty">Loading…</div>';try{await fn()}catch(e){$('#content').innerHTML=empty(e.message)}}}
+async function render(){const fn={home:renderHome,dashboard:renderDashboard,intelligence:renderIntelligence,assets:renderAssets,work:renderWork,maintenance:renderMaintenance,workforce:renderWorkforce,inventory:renderInventory,procurement:renderProcurement,approvals:renderApprovals,contracts:renderContracts,vendors:renderVendors,operations:renderOperations,telemetry:renderTelemetry,map:renderMap,field:renderField,dispatch:renderDispatch,inspections:renderInspections,hse:renderHSE,projects:renderProjects,documents:renderDocuments,analytics:renderAnalytics,automation:renderAutomation,administration:renderAdmin}[S.view];if(fn){$('#content').innerHTML='<div class="empty">Loading…</div>';try{await fn()}catch(e){$('#content').innerHTML=empty(e.message)}}}
 
 let searchTimer;$('#global-search').oninput=e=>{clearTimeout(searchTimer);const q=e.target.value.trim();if(q.length<2){$('#search-results').classList.add('hidden');return}searchTimer=setTimeout(async()=>{try{const r=await api('/api/search?q='+encodeURIComponent(q));$('#search-results').innerHTML=r.length?r.map(x=>`<div class="search-item" data-module="${x.module}" data-id="${x.id}"><span class="code">${esc(x.code)}</span><div><strong>${esc(x.title)}</strong><small>${esc(x.subtitle)}</small></div></div>`).join(''):empty('No results');$('#search-results').classList.remove('hidden');$$('.search-item').forEach(i=>i.onclick=()=>{const m=i.dataset.module;$('#search-results').classList.add('hidden');$('#global-search').value='';go(m);setTimeout(()=>{if(m==='assets')assetDetail(Number(i.dataset.id));if(m==='work')workDetail(Number(i.dataset.id))},250)})}catch{}},250)};document.addEventListener('click',e=>{if(!e.target.closest('.search-wrap'))$('#search-results').classList.add('hidden')});
 async function refreshNotifications(){if(!S.user)return;const n=await api('/api/notifications');S.cache.notifications=n;const unread=n.filter(x=>!x.is_read).length;$('#notif-count').textContent=unread;$('#notif-count').classList.toggle('hidden',!unread)}
@@ -205,3 +205,76 @@ async function newUser(){const roles=await api('/api/admin/roles');formModal('Cr
 
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
 restore();
+
+// ---------- operational intelligence (KPI command center) ----------
+const KPI_STATUS_CLS={GREEN:'good',AMBER:'warn',RED:'bad',UNKNOWN:''};
+function sparkline(samples){const vals=(samples||[]).map(x=>x.value);if(vals.filter(v=>v!=null).length<2)return'';const w=120,h=26,min=Math.min(...vals),max=Math.max(...vals),rng=(max-min)||1;const pts=vals.map((v,i)=>v==null?null:`${(i*(w/(vals.length-1))).toFixed(1)},${(h-3-(v-min)/rng*(h-6)).toFixed(1)}`).filter(Boolean).join(' ');return `<svg class="spark" viewBox="0 0 ${w} ${h}" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>`}
+function varianceChip(k){
+  const dv=k.variance_absolute;
+  if(dv==null||dv===0)return '<span class="variance flat">no change</span>';
+  const improved=(dv>0&&k.direction==='higher_is_better')||(dv<0&&k.direction==='lower_is_better');
+  const pct=k.variance_pct!=null?` ${fmt(Math.abs(k.variance_pct))}%`:'';
+  return `<span class="variance ${improved?'good':'bad'}">${improved?'\u25B2':'\u25BC'} ${fmt(Math.abs(dv))}${pct} vs prev period</span>`;
+}
+async function renderIntelligence(){
+  const siteQs=S.siteId?`&site_id=${S.siteId}`:'';
+  const [data,backlog,actors]=await Promise.all([
+    api('/api/kpis?include_trend=true&samples=14'),
+    api('/api/backlog/risk-weighted?limit=12'+siteQs),
+    api('/api/reliability/bad-actors?limit=8'+(siteQs?siteQs.slice(1):''))
+  ]);
+  const kpis=data.kpis||[];
+  const order={RED:0,AMBER:1,GREEN:2,UNKNOWN:3};
+  const strip=[...kpis].sort((a,b)=>((order[a.latest?.status]??3)-(order[b.latest?.status]??3)));
+  const staleCount=strip.filter(k=>k.stale).length;
+  $('#content').innerHTML=`<div class="hero"><div><h1>Operational Intelligence</h1><p>${S.siteId?'KPI command center for the selected site.':'Portfolio-wide KPI command center.'} Every number drills down to its source records.</p></div><div class="hero-actions"><button class="btn" id="intel-recalc">Recalculate All</button></div></div>${staleCount?`<div class="panel" style="margin-bottom:12px"><div class="panel-body">${empty(staleCount+' KPI(s) have no fresh calculation yet. Use Recalculate All or wait for the scheduled automation refresh.')}</div></div>`:''}<div class="kpi-grid intel-strip">${strip.map(intelKpiCard).join('')}</div>
+<div class="panel-grid" style="margin-top:14px">
+<section class="panel"><div class="panel-head"><div><h3>Risk-Weighted Backlog</h3><p>${esc(backlog.model||'Transparent risk model')}</p></div></div><div class="panel-body">${backlog.items?.length?table(['WO','Title','Priority','Risk','Exposure','Asset'],backlog.items.map(i=>[`<a href="#" onclick="workDetail(${i.work_order_id});return false">${i.wo_no}</a>`,esc(i.title),status(i.priority),`<span class="risk-bar"><span style="width:${Math.min(100,i.risk_score)}%"></span></span> ${fmt(i.risk_score)}`,i.days_overdue?`${i.days_overdue}d overdue`:'-',i.asset_no||'-'])):empty('No open work in scope.')}</div></section>
+<section class="panel"><div class="panel-head"><div><h3>Bad Actors</h3><p>Assets disproportionately driving failures, downtime and cost</p></div></div><div class="panel-body">${actors.assets?.length?table(['Asset','Name','Failures','Downtime h','Cost','Evidence','Flagged'],actors.assets.map(a=>[`<a href="#" onclick="assetDetail(${a.asset_id});return false">${a.asset_no}</a>`,esc(a.name),fmt(a.failures),fmt(a.downtime_hours),fmtMoney(a.maintenance_cost),`${fmt(a.evidence_share)}%`,a.bad_actor?status('Bad Actor'):'-'])):empty(actors.summary?.methodology||'No failure evidence in the window.')}</div></section>
+</div>`;
+  $$('.intel-kpi').forEach(c=>c.onclick=()=>kpiDetail(Number(c.dataset.kpi)));
+  if($('#intel-recalc'))$('#intel-recalc').onclick=async()=>{try{const d=await api('/api/kpis/recalculate-all',{method:'POST'});toast(`${d.recalculated.length} KPI(s) recalculated`);renderIntelligence()}catch(e){toast(e.message)}};
+}
+function intelKpiCard(k){
+  const s=k.latest,st=s?s.status:'UNKNOWN';
+  const cls=KPI_STATUS_CLS[st]||'';
+  const unit=k.unit==='%'?'%':k.unit?` ${esc(k.unit)}`:'';
+  const value=s&&s.value!=null?`<strong>${fmt(s.value)}</strong><span class="unit">${unit}</span>`:'<strong>--</strong>';
+  return `<button class="kpi intel-kpi ${cls}" data-kpi="${k.id}" title="${esc(k.description||'')}">
+    <div class="kpi-top"><span class="kpi-label">${esc(k.name)}</span><span>${k.stale?'<span class="stale-dot" title="Stale: awaiting fresh calculation"></span>':''}${status(st)}</span></div>
+    <div class="kpi-value">${value}${sparkline(k.trend)}</div>
+    <div class="kpi-hint">${varianceChip(k)}${s&&s.target_value!=null?`<span class="target">target ${fmt(s.target_value)}${unit}</span>`:''}</div>
+  </button>`;
+}
+async function kpiDetail(id){
+  openModal('KPI Intelligence','Loading.');
+  try{
+    const [k,expl,dd]=await Promise.all([api('/api/kpis/'+id),api('/api/kpis/'+id+'/explanation'),api('/api/kpis/'+id+'/drilldown')]);
+    const s=k.latest;
+    const contributors=(dd.drilldown?.contributors)||[];
+    const rows=contributors.slice(0,25).map(c=>[status(c.record_type),c.record_code||('#'+c.record_id),esc(c.label||''),esc(c.detail||'')]);
+    const newRows=(expl.new_contributors||[]).map(c=>[status(c.record_type),c.record_code||('#'+c.record_id),esc(c.label||''),esc(c.detail||'')]);
+    $('#modal-title').textContent=`KPI Intelligence - ${k.code}`;
+    $('#modal-body').innerHTML=`
+      <div class="detail-grid">
+        <div class="detail-box"><span>Current</span><strong>${expl.value==null?'No data':fmt(expl.value)+' '+(k.unit==='%'?'%':k.unit||'')}</strong></div>
+        <div class="detail-box"><span>Previous window</span><strong>${expl.previous_value==null?'No data':fmt(expl.previous_value)}</strong></div>
+        <div class="detail-box"><span>Change</span><strong>${expl.delta==null?'-':(expl.delta>0?'+':'')+fmt(expl.delta)+(expl.pct_change!=null?' ('+(expl.pct_change>0?'+':'')+fmt(expl.pct_change)+'%)':'')}</strong></div>
+        <div class="detail-box"><span>Status</span>${status(s?s.status:'UNKNOWN')}</div>
+      </div>
+      <p class="section-sub">${esc(expl.summary||'')}</p>
+      <p class="formula">${esc(expl.formula||k.formula||'')}</p>
+      <h4>New contributor records vs previous window</h4>
+      ${newRows.length?table(['Type','Record','Label','Evidence'],newRows):empty('No new contributing records versus the previous window.')}
+      <h4 style="margin-top:10px">Current source records behind this value</h4>
+      ${rows.length?table(['Type','Record','Label','Detail'],rows):empty('No individual source records; metric has no drill-down evidence.')}
+      <p class="disclaimer">${esc(expl.disclaimer||'')}</p>
+      <div class="action-row">
+        <button class="btn small" onclick="closeModal();go('work')">Open Work Management</button>
+        <button class="btn small" onclick="closeModal();go('operations')">Open Operations</button>
+        <button class="btn small" onclick="recalcOne(${id})">Recalculate</button>
+      </div>`;
+    $$('#modal-body a[href="#"]').forEach(a=>a.onclick=e=>{e.preventDefault()});
+  }catch(e){$('#modal-body').innerHTML=empty(e.message)}
+}
+async function recalcOne(id){try{await api('/api/kpis/'+id+'/recalculate',{method:'POST',body:'{}'});toast('KPI recalculated');closeModal()}catch(e){toast(e.message)}}
