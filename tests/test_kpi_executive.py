@@ -9,6 +9,7 @@ from app.auth import hash_password
 from app.database import db, init_db
 from app.kpi_service import (
     ExecutiveFilters,
+    compute_asset_kpi_profile,
     compute_deterioration_signals,
     compute_freshness,
     compute_reliability,
@@ -353,3 +354,50 @@ def test_site_scoping_changes_reliability_not_leak_other_sites():
     # CAI-OPS has no outage in this window; its own downtime stays clean even
     # though NCS-01 events exist portfolio-wide.
     assert other['outage_count'] == 0
+
+
+def test_asset_kpi_profile_traces_every_number_to_records():
+    ids = _ids()
+    now = datetime.now()
+    outage_start = now - timedelta(days=3)
+    _seed_outage(ids, asset_id=ids['tr'], site_id=ids['ncs'],
+                 start=outage_start.isoformat(timespec='seconds'),
+                 end=(outage_start + timedelta(hours=4)).isoformat(timespec='seconds'),
+                 code_suffix='AP1')
+    wo = _make_wo(ids, wo_no='WO-KPI-ASSET', asset_id=ids['tr'], priority='Critical',
+                  status='In Progress')
+    f = ExecutiveFilters(period_days=30)
+    with db() as conn:
+        profile = compute_asset_kpi_profile(conn, ids['tr'], f)
+    assert profile['asset']['asset_no'] == 'TR-001'
+    rel = profile['reliability']
+    # The 4-hour forced outage must appear inside the window (the shared
+    # regression database may legitimately hold additional TR-001 outages
+    # seeded by other tests in this module).
+    assert rel['outage_count'] >= 1
+    assert rel['downtime_hours'] >= 4.0 - 0.01
+    assert abs(rel['mttr_hours'] - round(rel['downtime_hours'] / rel['outage_count'], 2)) < 0.05
+    expected_avail = round(100 * (30 * 24) / (30 * 24), 2)
+    assert rel['availability_pct'] < expected_avail
+    # Open critical work is drillable and flagged.
+    open_nos = [x['wo_no'] for x in profile['open_work']]
+    assert 'WO-KPI-ASSET' in open_nos
+    # Unknown assets are empty (endpoint maps this to 404).
+    with db() as conn:
+        assert compute_asset_kpi_profile(conn, 999999999, f) == {}
+
+
+def test_asset_kpi_profile_api_permissions_and_404():
+    ids = _ids()
+    with TestClient(app) as client:
+        admin = auth(client)
+        tech = auth(client, 'tech1', 'Tech@2026')
+        assert client.get(f'/api/kpi/assets/{ids["tr"]}', headers=tech).status_code == 403
+        missing = client.get('/api/kpi/assets/999999999', headers=admin)
+        assert missing.status_code == 404
+        r = client.get(f'/api/kpi/assets/{ids["tr"]}', headers=admin, params={'period_days': 7})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body['asset']['id'] == ids['tr']
+        assert body['window']['period_days'] == 7
+        assert 'health' in body and 'calculated_at' in body

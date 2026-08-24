@@ -911,6 +911,126 @@ def _channel_level(channel: dict, value: float) -> tuple[Optional[str], Optional
 
 
 # --------------------------------------------------------------------------- #
+# Asset-level KPI dossier (drill target: Enterprise -> ... -> Asset -> ...)
+# --------------------------------------------------------------------------- #
+
+def compute_asset_kpi_profile(conn, asset_id: int, f: Optional[ExecutiveFilters] = None) -> dict:
+    """Single-asset operational depth: every number traces to source records."""
+    from .application import _asset_health  # deferred canonical scorer
+
+    f = f or ExecutiveFilters(period_days=90)
+    w = f.window()
+    asset = get_asset_row(conn, asset_id)
+    if asset is None:
+        return {}
+
+    win_start_dt = datetime.fromisoformat(w['period_start'] + 'T00:00:00')
+    win_end_dt = datetime.fromisoformat(w['period_end'] + 'T23:59:59')
+    window_hours = max(1.0, (win_end_dt - win_start_dt).total_seconds() / 3600.0)
+
+    outages = []
+    for row in _rows(conn.execute(
+            'SELECT * FROM asset_outages WHERE asset_id=? AND start_at<=?'
+            ' AND (end_at IS NULL OR end_at>=?) ORDER BY start_at',
+            [asset_id, w['period_end'] + 'T23:59:59', w['period_start']])):
+        hours = _outage_overlap_hours(row['start_at'], row.get('end_at'), win_start_dt, win_end_dt)
+        if hours > 0:
+            row['overlap_hours'] = round(hours, 2)
+            outages.append(row)
+    downtime = round(sum(x['overlap_hours'] for x in outages), 2)
+    forced = [x for x in outages if x.get('outage_type') == 'Forced']
+    availability = round(100 * max(0.0, window_hours - downtime) / window_hours, 2)
+
+    corrective = _rows(conn.execute(
+        '''SELECT id,wo_no,title,status,priority,actual_hours,actual_cost,
+                  COALESCE(actual_finish,created_at) finished FROM work_orders
+             WHERE asset_id=? AND status IN ('Completed','Closed')
+               AND work_type LIKE 'Corrective%'
+               AND COALESCE(actual_finish,created_at)>=?
+             ORDER BY finished DESC''',
+        (asset_id, (date.today() - timedelta(days=90)).isoformat())))
+    open_wo = _rows(conn.execute(
+        '''SELECT w.id,w.wo_no,w.title,w.priority,w.status,w.target_finish FROM work_orders w
+             WHERE w.asset_id=? AND '''+_OPEN_WO+' ORDER BY '+_PRIORITY_ORDER, (asset_id,)))
+    overdue_open = [x for x in open_wo if x.get('target_finish')
+                    and str(x['target_finish'])[:10] < date.today().isoformat()]
+
+    alarms_active = int(conn.execute(
+        "SELECT COUNT(*) FROM operational_alarms WHERE asset_id=? AND status IN ('Open','Acknowledged')",
+        (asset_id,)).fetchone()[0])
+    alarms_recent = _rows(conn.execute(
+        '''SELECT oa.alarm_no,oa.severity,oa.status,oa.message,oa.occurrence_count,oa.opened_at,tc.channel_code
+             FROM operational_alarms oa LEFT JOIN telemetry_channels tc ON tc.id=oa.channel_id
+            WHERE oa.asset_id=? AND oa.opened_at>=? ORDER BY oa.opened_at DESC LIMIT 10''',
+        (asset_id, w['period_start'])))
+
+    materials = _rows(conn.execute(
+        '''SELECT m.quantity,m.unit_cost,i.item_no,i.name item_name,w.wo_no
+             FROM work_order_materials m JOIN inventory_items i ON i.id=m.inventory_item_id
+             JOIN work_orders w ON w.id=m.work_order_id
+            WHERE w.asset_id=? AND m.issued_at>=? ORDER BY m.issued_at DESC LIMIT 20''',
+        (asset_id, w['period_start'])))
+    material_value = round(sum(float(x['quantity']) * float(x['unit_cost'] or 0) for x in materials), 2)
+
+    technicians = _rows(conn.execute(
+        '''SELECT u.id user_id,u.full_name name,COUNT(*) wo_count,
+                  COALESCE(SUM(l.hours),0) hours
+             FROM labor_entries l JOIN users u ON u.id=l.user_id
+            WHERE l.work_order_id IN (SELECT id FROM work_orders WHERE asset_id=?)
+              AND l.work_date>=?
+            GROUP BY u.id ORDER BY hours DESC LIMIT 10''',
+        (asset_id, w['period_start'])))
+
+    health = _asset_health(conn, asset_id)
+    channels = _rows(conn.execute(
+        'SELECT id, channel_code, name FROM telemetry_channels WHERE asset_id=?', (asset_id,)))
+    channel_signals = []
+    if channels:
+        payload = compute_deterioration_signals(conn, f, limit=100)
+        by_code = {s['code']: s for s in payload['signals']}
+        channel_signals = [by_code[c['channel_code']] for c in channels if c['channel_code'] in by_code]
+
+    return {
+        'asset': {'id': asset['id'], 'asset_no': asset['asset_no'], 'name': asset['name'],
+                  'criticality': asset['criticality'], 'condition': asset['condition'],
+                  'status': asset['status'], 'site_name': asset['site_name']},
+        'health': health,
+        'window': w,
+        'reliability': {
+            'availability_pct': availability,
+            'outage_count': len(forced),
+            'downtime_hours': downtime,
+            'mtbf_hours': round(max(0.0, window_hours - downtime) / len(forced), 2) if forced else None,
+            'mttr_hours': round(downtime / len(forced), 2) if forced else None,
+            'outages': [
+                {'record': x['outage_no'], 'type': x.get('outage_type'),
+                 'start_at': x['start_at'], 'end_at': x.get('end_at'),
+                 'hours': x['overlap_hours'], 'work_order_id': x.get('work_order_id')}
+                for x in outages],
+        },
+        'failures_90d': [
+            {'wo_no': x['wo_no'], 'title': x['title'], 'hours': float(x['actual_hours'] or 0),
+             'finished': x['finished']} for x in corrective],
+        'repeat_failure_count': len(corrective),
+        'open_work': [{'wo_no': x['wo_no'], 'title': x['title'], 'priority': x['priority'],
+                       'status': x['status'], 'overdue': x in overdue_open} for x in open_wo],
+        'alarms': {'active': alarms_active, 'recent': alarms_recent},
+        'materials_consumed': {'lines': materials, 'value': material_value},
+        'technicians': technicians,
+        'deterioration_signals': channel_signals,
+        'calculated_at': datetime.now().isoformat(timespec='seconds'),
+    }
+
+
+def get_asset_row(conn, asset_id: int) -> Optional[dict]:
+    rows_ = _rows(conn.execute(
+        '''SELECT a.*, s.name site_name FROM assets a
+             LEFT JOIN locations l ON l.id=a.location_id
+             LEFT JOIN sites s ON s.id=l.site_id WHERE a.id=?''', (asset_id,)))
+    return rows_[0] if rows_ else None
+
+
+# --------------------------------------------------------------------------- #
 # Freshness + snapshot assembly
 # --------------------------------------------------------------------------- #
 

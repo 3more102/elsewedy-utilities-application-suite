@@ -200,6 +200,7 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('GET', '/api/kpi/executive'): 'analytics.executive.read',
     ('GET', '/api/kpi/backlog/risk'): 'analytics.executive.read',
     ('GET', '/api/kpi/deterioration'): 'analytics.executive.read',
+    ('GET', '/api/kpi/assets/{asset_id}'): 'analytics.executive.read',
     ('POST', '/api/assets'): 'assets.create',
     ('PATCH', '/api/assets/{asset_id}'): 'assets.update',
     ('DELETE', '/api/assets/{asset_id}'): 'assets.delete',

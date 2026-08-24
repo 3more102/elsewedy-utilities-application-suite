@@ -249,9 +249,11 @@ async function renderAnalytics(){
     ${kpiCard('Critical Active Alarms',c.critical_active_alarms,'AL',`${c.unacknowledged_alarms} unacknowledged`,c.critical_active_alarms?'warn':'good')}
   </div>
   <div class="panel-grid">
-    <section class="panel"><div class="panel-head"><div><h3>Risk Heat — Daily Downtime</h3><p>Decision: which days need investigation</p></div></div><div class="panel-body">${heatGrid(heatCells)}</div></section>
+    <section class="panel"><div class="panel-head"><div><h3>High-Risk Assets</h3><p>Lowest health scores — click for the KPI dossier</p></div></div><div class="panel-body">
+      ${as.high_risk_assets.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Asset</th><th>Band</th><th>Score</th></tr></thead><tbody>${as.high_risk_assets.slice(0,8).map(h=>`<tr class="drill-row" data-kind="asset-kpi" data-id="${h.id}" style="cursor:pointer"><td>${esc(h.asset_no)} — ${esc(h.name)}</td><td>${status(h.band==='Healthy'?'Healthy':h.band)}</td><td><strong>${fmt(h.score)}</strong></td></tr>`).join('')}</tbody></table></div>`:empty('No assets in scope')}
+    </div></section>
     <section class="panel"><div class="panel-head"><div><h3>Deterioration Signals</h3><p>Trend / anomaly labels only — no failure probabilities claimed</p></div></div><div class="panel-body">
-      ${(deter?.signals||[]).length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Kind</th><th>Subject</th><th>Evidence</th></tr></thead><tbody>${(deter.signals||[]).slice(0,8).map(s=>`<tr class="drill-row" data-kind="${s.subject_type}" data-id="${s.link.asset_id||s.id}" data-code="${esc(s.code)}"><td><span class="status ${s.kind==='deterioration'||s.kind==='anomaly'?'Critical':'Warning'}">${esc(s.kind)}</span></td><td>${esc(s.label)}</td><td style="font-size:10px">${esc(JSON.stringify(s.detail))}</td></tr>`).join('')}</tbody></table></div>`:empty('No deterioration signals in window')}
+      ${(deter?.signals||[]).length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Kind</th><th>Subject</th><th>Evidence</th></tr></thead><tbody>${(deter.signals||[]).slice(0,8).map(s=>`<tr class="drill-row" data-kind="${s.subject_type==='asset'?'asset-kpi':'channel'}" data-id="${s.link.asset_id||s.id}" data-code="${esc(s.code)}" style="cursor:pointer"><td><span class="status ${s.kind==='deterioration'||s.kind==='anomaly'?'Critical':'Warning'}">${esc(s.kind)}</span></td><td>${esc(s.label)}</td><td style="font-size:10px">${esc(JSON.stringify(s.detail))}</td></tr>`).join('')}</tbody></table></div>`:empty('No deterioration signals in window')}
     </div></section>
   </div>
 
@@ -305,9 +307,37 @@ async function renderAnalytics(){
       const kind=row.dataset.kind,id=row.dataset.id;
       if(kind==='work'&&id){await go('work');setTimeout(()=>workDetail(Number(id)),250)}
       else if(kind==='asset'&&id){await go('assets');setTimeout(()=>assetDetail(Number(id)),250)}
+      else if(kind==='asset-kpi'&&id){await assetKpiDossier(Number(id))}
       else if(kind==='channel'){await go('telemetry')}
     };
   });
+}
+
+async function assetKpiDossier(assetId){
+  const p=await api('/api/kpi/assets/'+assetId);
+  const rel=p.reliability;
+  const rows=[
+    ['Availability',fmt(rel.availability_pct)+'%'],
+    ['Forced outages (window)',rel.outage_count],
+    ['Downtime',fmt(rel.downtime_hours)+' h'],
+    ['MTBF',rel.mtbf_hours!=null?fmt(rel.mtbf_hours)+' h':'—'],
+    ['MTTR',rel.mttr_hours!=null?fmt(rel.mttr_hours)+' h':'—'],
+    ['Repeat failures (90d)',p.repeat_failure_count],
+    ['Open work orders',p.open_work.length],
+    ['Active alarms',p.alarms.active],
+    ['Materials consumed (window)',fmtMoney(p.materials_consumed.value)],
+    ['Health score',fmt(p.health.score)+' ('+esc(p.health.risk_band)+')']];
+  const det=(p.deterioration_signals||[]).map(s=>`<tr><td><span class="status ${s.kind==='deterioration'||s.kind==='anomaly'?'Critical':'Warning'}">${esc(s.kind)}</span></td><td>${esc(s.label)}</td></tr>`).join('');
+  openModal(`${esc(p.asset.asset_no)} — Operational KPI Dossier`,`
+    <div class="detail-grid">
+      <div class="detail-box"><span>Asset</span><strong>${esc(p.asset.name)}</strong></div>
+      <div class="detail-box"><span>Site</span><strong>${esc(p.asset.site_name||'—')}</strong></div>
+    </div>
+    <div class="table-wrap" style="margin-top:10px"><table class="data-table"><tbody>
+      ${rows.map(r=>`<tr><td>${r[0]}</td><td><strong>${r[1]}</strong></td></tr>`).join('')}
+    </tbody></table></div>
+    ${det?`<h3 class="section-sub">Condition signals</h3><div class="table-wrap"><table class="data-table"><thead><tr><th>Kind</th><th>Signal</th></tr></thead><tbody>${det}</tbody></table></div>`:''}
+    <p class="section-sub">Calculated ${esc(p.calculated_at)} · window ${esc(p.window.period_start)} → ${esc(p.window.period_end)}. Every value traces to outage, work-order, alarm, labor and material records.</p>`);
 }
 
 async function renderAutomation(){

@@ -1004,6 +1004,21 @@ def kpi_deterioration(
     with db() as conn:
         return compute_deterioration_signals(conn, f, limit=limit)
 
+@app.get('/api/kpi/assets/{asset_id}')
+def kpi_asset_profile(
+    asset_id: int,
+    period_days: int = Query(90, ge=1, le=365),
+    user=Depends(require_roles(*_KPI_ROLES)),
+):
+    """Per-asset KPI dossier completing the drill chain down to materials."""
+    f = _kpi_filters(period_days=period_days)
+    from .kpi_service import compute_asset_kpi_profile
+    with db() as conn:
+        profile = compute_asset_kpi_profile(conn, asset_id, f)
+    if not profile:
+        raise HTTPException(404, 'Asset not found')
+    return profile
+
 # ---------- launchpad / dashboard ----------@app.get('/api/launchpad')
 def launchpad(user=Depends(current_user)):
     apps=[
