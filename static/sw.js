@@ -15,6 +15,7 @@ const ASSETS=[
   '/static/report-security.js',
   '/static/csp-action-bridge.js',
   '/static/ux-enhancements.js',
+  '/static/dashboard-canonical-snapshot.js',
   '/static/dashboard-enhancements.js',
   '/static/dashboard-attention.js',
   '/static/productivity-enhancements.js',
