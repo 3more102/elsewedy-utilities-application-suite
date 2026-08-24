@@ -46,12 +46,35 @@ _TREND_FAMILIES: dict[str, dict] = {
                                     'unit': 'work orders',
                                     'direction': 'lower_is_better',
                                     'path': 'overdue_wo'},
+            'emergency_work_orders': {'label': 'Emergency Work Orders',
+                                      'unit': 'work orders',
+                                      'direction': 'lower_is_better',
+                                      'path': 'emergency_wo'},
+            'high_risk_overdue_work_orders': {
+                'label': 'High-Risk Overdue Work Orders', 'unit': 'work orders',
+                'direction': 'lower_is_better', 'path': 'high_risk_overdue_wo'},
+            'unassigned_critical_work_orders': {
+                'label': 'Unassigned Critical Work Orders', 'unit': 'work orders',
+                'direction': 'lower_is_better', 'path': 'unassigned_critical_wo'},
             'backlog_hours': {'label': 'Backlog Hours', 'unit': 'hours',
                               'direction': 'lower_is_better',
                               'path': 'backlog_hours'},
+            'backlog_weeks': {'label': 'Backlog Weeks', 'unit': 'weeks',
+                              'direction': 'lower_is_better',
+                              'path': 'backlog_weeks'},
             'pm_compliance_pct': {'label': 'PM Compliance', 'unit': '%',
                                   'direction': 'higher_is_better',
                                   'path': 'pm_compliance_pct'},
+            'schedule_compliance_pct': {'label': 'Schedule Compliance', 'unit': '%',
+                                        'direction': 'higher_is_better',
+                                        'path': 'schedule_compliance_pct'},
+            'mtbf_hours': {'label': 'MTBF', 'unit': 'hours',
+                           'direction': 'higher_is_better', 'path': 'mtbf_hours'},
+            'mttr_hours': {'label': 'MTTR', 'unit': 'hours',
+                           'direction': 'lower_is_better', 'path': 'mttr_hours'},
+            'repeat_failure_rate_pct': {'label': 'Repeat Failure Rate', 'unit': '%',
+                                        'direction': 'lower_is_better',
+                                        'path': 'repeat_failure_rate_pct'},
         },
     },
     'inventory': {
@@ -300,7 +323,10 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
 
     if family == 'reliability':
         drivers = _reliability_outage_drivers(conn, f)
-    elif family == 'maintenance':
+    elif family == 'maintenance' and metric in {
+            'open_work_orders', 'overdue_work_orders', 'emergency_work_orders',
+            'high_risk_overdue_work_orders', 'unassigned_critical_work_orders',
+            'backlog_hours', 'backlog_weeks'}:
         drivers = _maintenance_overdue_drivers(conn, f)
     elif family == 'condition':
         # Contributors come straight from the canonical condition computation:
