@@ -145,7 +145,13 @@ def test_maintenance_trends_extract_existing_canonical_values_only():
             assert payload['samples'][-1]['value'] == canonical[canonical_key]
 
 
-def test_maintenance_why_does_not_attach_unrelated_backlog_drivers():
+def test_maintenance_why_attaches_only_schedule_shortfall_drivers():
+    """Schedule compliance explains itself through its own population.
+
+    The seeded open job (target five days ago) is counted in ``scheduled``
+    but not in ``met``, so it is exactly the shortfall evidence returned —
+    while unrelated backlog/overdue driver kinds stay excluded.
+    """
     with TestClient(app) as client:
         headers = _auth(client)
         with db() as conn:
@@ -165,7 +171,13 @@ def test_maintenance_why_does_not_attach_unrelated_backlog_drivers():
         payload = response.json()
         assert payload['unit'] == '%'
         assert payload['direction'] == 'higher_is_better'
-        assert payload['drivers'] == []
+        assert payload['drivers'], 'expected shortfall contributor'
+        for driver in payload['drivers']:
+            assert driver['kind'] == 'schedule_shortfall'
+            assert driver['classification'] == 'unfinished'
+            assert driver['source_type'] == 'work_order'
+        assert not any(d['kind'] == 'overdue_backlog'
+                       for d in payload['drivers'])
         assert 'correlation is not asserted as cause' in payload['disclaimer']
 
 

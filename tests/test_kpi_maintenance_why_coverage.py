@@ -119,6 +119,7 @@ def test_schedule_compliance_explains_late_completions():
 
         late_title = f"LATE-{seed['suffix']}"
         ontime_title = f"ONTIME-{seed['suffix']}"
+        open_title = f"OPEN-{seed['suffix']}"
         with db() as conn:
             # Met on time.
             _insert_work_order(conn, seed, title=ontime_title,
@@ -126,6 +127,11 @@ def test_schedule_compliance_explains_late_completions():
             # Completed but two days late; still inside the window.
             _insert_work_order(conn, seed, title=late_title,
                                target_days_ago=5, actual_days_ago=3)
+            # Scheduled inside the window but still unfinished: counted in
+            # `scheduled`, not in `met`.
+            _insert_work_order(conn, seed, title=open_title,
+                               target_days_ago=2, actual_days_ago=None,
+                               status='In Progress')
 
         with db() as conn:
             canonical = compute_maintenance_kpis(
@@ -142,17 +148,21 @@ def test_schedule_compliance_explains_late_completions():
         assert response.status_code == 200, response.text
         payload = response.json()
 
-        # One of two scheduled jobs finished late, so the scoped rate is
-        # 50%; the late completion is exactly the contributor explaining it.
+        # One of three scheduled jobs met its target; the rate is 33.3% and
+        # both shortfall classes must appear as contributors.
         assert payload['value'] == canonical['schedule_compliance_pct']
-        assert canonical['schedule_compliance_pct'] == 50.0
-        assert payload['drivers']
+        assert canonical['schedule_compliance_pct'] == 33.3
+        classifications = {}
+        for driver in payload['drivers']:
+            assert driver['kind'] == 'schedule_shortfall'
+            assert driver['attribution'] == 'contributor'
+            assert driver['source_type'] == 'work_order'
+            classifications[driver['classification']] = driver
+        assert set(classifications) == {'late', 'unfinished'}
+
         titles = set()
         with db() as conn:
             for driver in payload['drivers']:
-                assert driver['kind'] == 'late_completion'
-                assert driver['attribution'] == 'contributor'
-                assert driver['source_type'] == 'work_order'
                 row = conn.execute(
                     'SELECT wo_no,title FROM work_orders WHERE id=?',
                     (driver['source_id'],)).fetchone()
@@ -160,4 +170,5 @@ def test_schedule_compliance_explains_late_completions():
                 titles.add(str(row['title']))
                 assert driver['drill']['record'] == str(row['wo_no'])
         assert any(late_title in t for t in titles), titles
+        assert any(open_title in t for t in titles), titles
         assert not any(ontime_title in t for t in titles), titles

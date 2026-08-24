@@ -619,19 +619,32 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         scope_args + [w['period_start'], w['period_end'] + 'T23:59:59']).fetchone()[0])
     schedule_compliance = round(100 * met / scheduled, 1) if scheduled else 100.0
 
-    # Late completions share the exact joins, scope and window predicates of
-    # the schedule-compliance counts above, so cited work orders are always
-    # part of the population the rate measured.
-    late_completed = _rows(conn.execute(
-        'SELECT w.id,w.wo_no,w.title,w.priority,w.target_finish,w.actual_finish,'
-        'CAST(julianday(w.actual_finish) - julianday(w.target_finish) AS INT)'
-        ' delay_days' + base +
-        " AND w.status IN ('Completed','Closed')"
-        ' AND w.actual_finish IS NOT NULL AND w.target_finish IS NOT NULL'
+    # Unmet scheduled jobs share the exact joins, scope and window
+    # predicates of the scheduled/met counts above, so cited work orders are
+    # always part of the population the rate measured. Shortfall comes from
+    # both late completions and still-unfinished jobs; both classes appear.
+    unmet_scheduled_workorders = _rows(conn.execute(
+        'SELECT w.id,w.wo_no,w.title,w.priority,w.target_finish,'
+        'w.actual_finish,w.status,'
+        'CASE WHEN w.actual_finish IS NOT NULL'
+        '     THEN CAST(julianday(w.actual_finish)'
+        '          - julianday(w.target_finish) AS INT)'
+        '     ELSE CAST(julianday(?) - julianday(w.target_finish) AS INT)'
+        'END overdue_days' + base +
+        " AND w.status<>'Cancelled'"
         ' AND w.target_finish>=? AND w.target_finish<?'
-        ' AND w.actual_finish>w.target_finish' +
-        ' ORDER BY delay_days DESC, w.wo_no LIMIT 10',
-        scope_args + [w['period_start'], w['period_end'] + 'T23:59:59']))
+        ' AND NOT (w.status IN (\'Completed\',\'Closed\')'
+        ' AND w.actual_finish IS NOT NULL'
+        ' AND w.actual_finish<=w.target_finish)' +
+        ' ORDER BY CASE w.priority WHEN \'Emergency\' THEN 5'
+        " WHEN 'Critical' THEN 4 WHEN 'High' THEN 3"
+        " WHEN 'Medium' THEN 2 ELSE 1 END DESC,"
+        ' overdue_days DESC, w.wo_no LIMIT 10',
+        # Bind order follows placeholder order: the CASE anchor date comes
+        # first (SELECT clause), then the scope fragments inside ``base``,
+        # then the window bounds.
+        [w['period_end']] + scope_args + [w['period_start'],
+                                          w['period_end'] + 'T23:59:59']))
 
     rel_failures = int(conn.execute(
         'SELECT COUNT(*)' + base +
@@ -697,7 +710,7 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         'pm_compliance_pct': pm_compliance,
         'pm_overdue_plans': pm_overdue_plans,
         'schedule_compliance_pct': schedule_compliance,
-        'late_completed_workorders': late_completed,
+        'unmet_scheduled_workorders': unmet_scheduled_workorders,
         'backlog_hours': round(backlog_hours, 1),
         'backlog_weeks': round(backlog_hours / weekly_capacity, 1) if weekly_capacity else None,
         'weekly_capacity_hours': round(weekly_capacity, 1),
@@ -1808,8 +1821,9 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
         'previous': maint_prev['emergency_wo'],
         'delta': maint_now['emergency_wo'] - maint_prev['emergency_wo'],
     }
-    # Late completions are measured by the same population as the rate; each
-    # cited work order is part of what schedule compliance evaluated.
+    # Unmet scheduled jobs are measured by the same population as the rate;
+    # each cited work order is part of what schedule compliance evaluated.
+    # Classification distinguishes late completions from unfinished jobs.
     explanations['schedule_compliance'] = {
         'current': maint_now['schedule_compliance_pct'],
         'previous': maint_prev['schedule_compliance_pct'],
@@ -1817,15 +1831,19 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
                        - maint_prev['schedule_compliance_pct'], 1),
         'drivers': [
             {
-                'kind': 'late_completion',
+                'kind': 'schedule_shortfall',
+                'classification': (
+                    'late' if r['status'] in ('Completed', 'Closed')
+                    and r['actual_finish'] is not None else 'unfinished'),
                 'label': (
-                    f"{r['wo_no']} finished {max(int(r['delay_days'] or 0), 0)} d late"
+                    f"{r['wo_no']} scheduled job overdue "
+                    f"{max(int(r['overdue_days'] or 0), 0)} d"
                 ),
-                'delay_days': max(int(r['delay_days'] or 0), 0),
+                'overdue_days': max(int(r['overdue_days'] or 0), 0),
                 'priority': r['priority'],
                 'link': {'module': 'work', 'record': r['wo_no'], 'id': r['id']},
             }
-            for r in maint_now.get('late_completed_workorders', [])
+            for r in maint_now.get('unmet_scheduled_workorders', [])
         ],
     }
     # Chronic bad actors come straight from the canonical maintenance

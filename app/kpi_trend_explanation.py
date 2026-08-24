@@ -358,10 +358,11 @@ def _pm_compliance_drivers(conn, f, limit: int = 10) -> list[dict]:
 
 
 def _schedule_compliance_drivers(conn, f, limit: int = 10) -> list[dict]:
-    """Late-completion contributors for schedule compliance.
+    """Unmet-schedule contributors for schedule compliance.
 
     Consumes the canonical ``schedule_compliance`` explanation section; each
-    cited work order was measured by the rate itself.
+    cited work order was measured by the rate itself (late completions and
+    unfinished jobs alike).
     """
     from .kpi_service import explain_kpi_changes
 
@@ -371,10 +372,11 @@ def _schedule_compliance_drivers(conn, f, limit: int = 10) -> list[dict]:
     for driver in (section.get('drivers') or [])[:limit]:
         link = driver.get('link') or {}
         drivers.append({
-            'kind': 'late_completion',
+            'kind': 'schedule_shortfall',
+            'classification': driver.get('classification'),
             'label': driver.get('label'),
-            'magnitude': driver.get('delay_days'),
-            'unit': 'days late',
+            'magnitude': driver.get('overdue_days'),
+            'unit': 'days overdue',
             'attribution': 'contributor',
             'source_type': 'work_order',
             'source_id': link.get('id'),
