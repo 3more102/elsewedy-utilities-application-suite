@@ -243,13 +243,20 @@ def test_as_of_window_moves_reliability_indices():
                 'UPDATE sites SET customer_count=400 WHERE id=?', (site_id,)
             )
 
-        today_view = client.get('/api/kpis/reliability', headers=headers).json()
+        today_view = client.get(
+            '/api/kpis/reliability',
+            headers=headers,
+            params={'site_id': site_id},
+        ).json()
         past_view = client.get(
             '/api/kpis/reliability',
             headers=headers,
-            params={'as_of': (anchor - timedelta(days=40)).date().isoformat()},
+            params={'as_of': (anchor - timedelta(days=40)).date().isoformat(),
+                    'site_id': site_id},
         ).json()
-        # The interruption sits inside today's 30-day window...
+        # The interruption sits inside today's 30-day window. The lookup is
+        # scoped to this probe's site so concurrent suites' portfolio-wide
+        # seeds cannot crowd the contributor ranking.
         assert today_view['kpis']['saifi']['value'] >= 0
         contributors = today_view['contributors']
         assert contributors and contributors[0]['duration_hours'] == 2.0
