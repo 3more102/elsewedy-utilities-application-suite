@@ -4,32 +4,41 @@
 
 **Developed by Omar & Seif**
 
-EUAS is an original **suite of integrated enterprise applications** for asset management, maintenance, utility operations, field service, inventory, procurement, HSE, projects, governance and operational intelligence across electrical, water, infrastructure and facilities environments. It is a runnable multi-app reference suite—not one monolithic application—and includes authentication, relational data, business workflows, APIs, responsive UI, realistic demo data, automated regression coverage and container/local deployment paths.
+EUAS is an original **suite of integrated enterprise applications** for asset management, maintenance, utility operations, field service, inventory, procurement, HSE, projects, governance and operational intelligence across electrical, water, infrastructure and facilities environments.
 
-> EUAS uses its own branding, data model, UI, workflows and source implementation. It is not based on proprietary EAM/CMMS source code.
+It is a runnable multi-app reference suite—not one monolithic application—and includes authentication, relational data, business workflows, APIs, responsive UI, realistic demo data, automated regression coverage, and local/container deployment paths.
+
+> EUAS uses its own branding, data model, UI, workflows, and source implementation. It is not based on proprietary EAM/CMMS source code.
 
 ---
 
 ## Current Engineering Status
 
-The latest **verified implementation checkpoint represented by this README** is:
+The latest verified implementation checkpoint on `main` is:
 
 ```text
-56796502e4e5be61ea612a7d63e7ea24428cf7f1
+1f1e3ee32b99f10f452a90d8050593527f79f575
 ```
 
-This is the merge of **PR #143 — expand canonical maintenance trend and WHY adapters**, validated on exact PR head `bb8892f64aedfaec06cfdf7924bc7e9825908170` by **EUAS CI #415** and **EUAS Security #380** before merge.
+This is the merge of **PR #145 — expand canonical reliability operational trend intelligence**, validated on exact PR head:
 
-Immediately preceding production hardening on `main` also includes:
+```text
+b17a905f705ffa8ba4c2b20ed658a8173b3776b0
+```
 
-- **PR #144 — canonicalize production request IDs**: preserves one compact valid client `X-Request-ID`; missing, duplicated, overlong or malformed values are replaced with a server-generated 128-bit hexadecimal ID.
+The merge record identifies **EUAS CI #420** and **EUAS Security #385** as the exact-head validation gates for that PR.
+
+Immediately preceding integrated work includes:
+
+- **PR #144 — canonicalize production request IDs**: preserves one compact valid client `X-Request-ID`; missing, duplicated, overlong, or malformed values are replaced with a server-generated 128-bit hexadecimal ID.
+- **PR #143 — expand canonical maintenance trend and WHY adapters**: exposes canonical maintenance KPIs through the trend/explanation adapter without duplicating formulas and restricts overdue-work contributors to relevant maintenance metrics.
 - **PR #142 — complete production cross-origin isolation**: adds COEP `require-corp` and `Origin-Agent-Cluster: ?1` alongside same-origin COOP/CORP policy.
 - **PR #141 — hide FastAPI introspection routes in production**: Swagger/OpenAPI/OAuth introspection surfaces return non-cacheable `404` responses in production while development documentation remains available.
-- **PR #139 — post-reconciliation operations integration**: DR/audit hardening, expedite bridge, command strip and scoped executive export integration.
+- **PR #139 — post-reconciliation operations integration**: DR/audit hardening, expedite bridge, command strip, and scoped executive export integration.
 
 ### Generated engineering evidence
 
-The repository-generated `ENGINEERING_EVIDENCE.json` at this checkpoint reports:
+The repository-generated `ENGINEERING_EVIDENCE.json` on current `main` reports:
 
 | Evidence | Current value |
 |---|---:|
@@ -39,7 +48,7 @@ The repository-generated `ENGINEERING_EVIDENCE.json` at this checkpoint reports:
 | Relational tables | `67` |
 | Explicit indexes | `45` |
 | Schema version | `12` |
-| Source test definitions | `391` |
+| Source test definitions | `393` |
 | Reference database backend | `sqlite` |
 
 These values are generated from the repository tree; they are not manually estimated release claims.
@@ -50,25 +59,27 @@ These values are generated from the repository tree; they are not manually estim
 |---|---|
 | Authentication | Digest-only bearer storage, legacy-session migration, persistent login throttling, password-hash upgrades, session metadata/revocation |
 | Authorization | Capability overlays that can only narrow historical route-role access; structural mutation-contract coverage across migrated domains |
-| Inventory | Lost-update protection, guarded stock issue, CAS adjustment, reservation serialization, deadlock-safe warehouse transfer and transfer idempotency |
-| Audit | Serialized tamper-evident SHA-256 audit-chain appends, replay/verification support and PostgreSQL bootstrap protection |
-| Procurement | Atomic requisition approval, PO creation and PO receipt; direct/unified approval coordination |
+| Inventory | Lost-update protection, guarded stock issue, CAS adjustment, reservation serialization, deadlock-safe warehouse transfer, and transfer idempotency |
+| Audit | Serialized tamper-evident SHA-256 audit-chain appends, replay/verification support, and PostgreSQL bootstrap protection |
+| Procurement | Atomic requisition approval, PO creation, and PO receipt; direct/unified approval coordination |
 | Work / Dispatch | Atomic workflow transitions, one active technician dispatch, redispatch generation protection |
 | Preventive Maintenance | Serialized due-plan generation with one generated work order/approval/workflow/audit side-effect set |
 | Alarm → Work | One corrective work order per alarm, with globally serialized work-order number allocation |
 | Inspections | Terminal/idempotent inspection submission and one corrective work order for concurrent failing submissions |
 | Alarm Lifecycle | Atomic acknowledge/close transitions that cannot regress a closed alarm or duplicate close evidence |
-| Business Numbers | Global deadlock-safe generated-number coordinator protecting `WO-`, `JOB-`, `PM-`, `APR-` and other `next_no()` families |
-| Integration Outbox | Exact-generation delivery claims, generation-aware retry, post-commit webhook dispatch and explicit at-least-once crash semantics |
-| Production HTTP | Request-ID canonicalization, production introspection suppression, security headers and cross-origin isolation |
+| Business Numbers | Global deadlock-safe generated-number coordinator protecting `WO-`, `JOB-`, `PM-`, `APR-`, and other `next_no()` families |
+| Integration Outbox | Exact-generation delivery claims, generation-aware retry, post-commit webhook dispatch, and explicit at-least-once crash semantics |
+| Production HTTP | Request-ID canonicalization, production introspection suppression, security headers, and cross-origin isolation |
 
-`main` is the canonical integrated branch. Feature branches are promoted only after their exact heads pass the required validation gates and are merged.
+`main` is the canonical integrated branch. Feature branches are promoted after validation and merge.
 
 ---
 
 ## Executive & Maximo-Style KPI Intelligence
 
-EUAS exposes one canonical executive KPI computation layer and reuses it across snapshots, drill-downs, trend views, WHY/explanation surfaces and exports. Adapter layers do **not** duplicate KPI formulas.
+EUAS exposes one canonical executive KPI computation layer and reuses it across snapshots, drill-downs, trend views, WHY/explanation surfaces, and exports.
+
+Adapter layers do **not** duplicate KPI formulas.
 
 ### Canonical executive KPI surface
 
@@ -104,9 +115,23 @@ The canonical maintenance family currently includes adapter coverage for:
 
 Maintenance contributor logic is restricted to metrics where overdue-work drivers are semantically relevant, preventing misleading explanations for unrelated KPI families.
 
-### Scope consistency
+### Reliability operational trend intelligence
 
-Executive filters are consistently applied across the canonical KPI service:
+PR #145 exposes five already-computed reliability metrics through the existing canonical KPI trend adapter:
+
+- total downtime hours
+- outage count
+- average outage duration
+- planned outages
+- unplanned outages
+
+Trend values are extracted from the canonical `compute_reliability` result; the adapter does not introduce a second reliability formula set.
+
+Reliability WHY/contributor responses use outage records as correlation evidence and retain the explicit correlation-not-causation disclaimer.
+
+### Scope model and known Reliability WHY limitation
+
+The canonical KPI computation layer supports executive filtering by:
 
 ```text
 period/window
@@ -116,13 +141,20 @@ asset type
 criticality
 ```
 
-Snapshot, trend, explanation and export paths reuse the same scoped computation contracts so management cards and drill-downs do not silently diverge.
+Snapshot and trend values are computed through the scoped canonical KPI contracts.
+
+**Known limitation on current `main` after PR #145:** two review findings on the reliability WHY contributor adapter remain unresolved:
+
+1. reliability contributor records are not yet guaranteed to be filtered by every requested `site`, `region`, `asset type`, or `criticality` scope;
+2. the `planned_outages` explanation path can reuse forced-outage driver records rather than planned-outage records.
+
+Therefore, reliability WHY contributors should currently be treated as diagnostic correlation evidence, not as fully scope-faithful causal attribution for filtered or planned-outage explanation requests.
 
 ---
 
 ## Verified CI / Security Gates
 
-Every promoted hardening PR is validated against its exact head before merge. The required matrix includes:
+Promoted hardening PRs are validated against exact heads. The required matrix includes:
 
 - SQLite full regression on Python 3.11
 - SQLite full regression on Python 3.12
@@ -177,37 +209,38 @@ The screenshots are representative management-demo captures from the EUAS v3.x i
 
 ## Application Suite
 
-EUAS is organized as a **launchpad of integrated applications** sharing identity, authorization, data, workflows, audit, notifications and reporting while retaining distinct operational responsibilities.
+EUAS is organized as a **launchpad of integrated applications** sharing identity, authorization, data, workflows, audit, notifications, and reporting while retaining distinct operational responsibilities.
 
 The suite currently includes:
 
 - **Home / Application Launchpad** — unified entry point for all EUAS apps.
-- **Executive Dashboard** — assets, availability, work, PM, inventory, procurement, HSE, cost, MTBF, MTTR and operational-risk KPIs.
-- **Asset Management** — asset hierarchy, condition, criticality, location, vendor, warranty, meter data, health score/history, maintenance history, lifecycle timeline and dossier snapshots.
-- **Work Management** — corrective, preventive, emergency, inspection and project work with lifecycle, assignment, checklists, labor, materials, notes, attachments and signatures.
-- **Preventive Maintenance & Planning** — calendar, meter/runtime and condition-oriented plans, automatic due-work generation and workload/capacity forecasting.
-- **Workforce Planning** — technician profiles, crafts, shifts, absences, productive-efficiency factors and weekly capacity.
-- **Inventory** — warehouses, available/reserved stock, reorder controls, issue/return/receipt/adjustment/transfer and transaction history.
-- **Procurement** — requisitions, approvals, RFQ/quotation stage, purchase orders and receipt into stock.
-- **Approval Center** — unified work-order and procurement approval queue with delegation, comments and workflow history.
-- **Automation & Reports** — PM/reorder/alert/SLA routines, run history, protected exports, observability and governance evidence.
-- **Governance & Lifecycle** — linked SHA-256 audit records, retention preview, backup evidence, cost ledger, timeline and tamper-evident report snapshots.
-- **Service Levels** — priority-based response/resolution policies, due clocks, compliance states, breach events and escalation alerts.
+- **Executive Dashboard** — assets, availability, work, PM, inventory, procurement, HSE, cost, MTBF, MTTR, reliability, and operational-risk KPIs.
+- **Asset Management** — asset hierarchy, condition, criticality, location, vendor, warranty, meter data, health score/history, maintenance history, lifecycle timeline, and dossier snapshots.
+- **Work Management** — corrective, preventive, emergency, inspection, and project work with lifecycle, assignment, checklists, labor, materials, notes, attachments, and signatures.
+- **Preventive Maintenance & Planning** — calendar, meter/runtime, and condition-oriented plans, automatic due-work generation, and workload/capacity forecasting.
+- **Workforce Planning** — technician profiles, crafts, shifts, absences, productive-efficiency factors, and weekly capacity.
+- **Inventory** — warehouses, available/reserved stock, reorder controls, issue/return/receipt/adjustment/transfer, and transaction history.
+- **Procurement** — requisitions, approvals, RFQ/quotation stage, purchase orders, and receipt into stock.
+- **Approval Center** — unified work-order and procurement approval queue with delegation, comments, and workflow history.
+- **Automation & Reports** — PM/reorder/alert/SLA routines, run history, protected exports, observability, and governance evidence.
+- **Governance & Lifecycle** — linked SHA-256 audit records, retention preview, backup evidence, cost ledger, timeline, and tamper-evident report snapshots.
+- **Service Levels** — priority-based response/resolution policies, due clocks, compliance states, breach events, and escalation alerts.
 - **Integration Event Outbox** — durable workflow/SLA events with retry state and optional signed webhook delivery.
-- **Utilities Operations** — portfolio-level operational view across electrical, water and infrastructure domains.
-- **Telemetry & Alarms** — asset telemetry channels, timestamped readings, threshold evaluation, alarm lifecycle and corrective-work generation.
-- **Condition Intelligence** — deterministic condition and deterioration views connected to assets, maintenance risk and executive KPI context.
+- **Utilities Operations** — portfolio-level operational view across electrical, water, and infrastructure domains.
+- **Telemetry & Alarms** — asset telemetry channels, timestamped readings, threshold evaluation, alarm lifecycle, and corrective-work generation.
+- **Condition Intelligence** — deterministic condition and deterioration views connected to assets, maintenance risk, and executive KPI context.
+- **Reliability Intelligence** — outage-based availability, downtime, outage-count/duration, planned/unplanned outage metrics, trend adapters, and correlation-oriented WHY evidence.
 - **GIS / Locations** — Region → City → Site → Building → Floor → Room → Asset hierarchy.
-- **Field Service** — mobile/tablet technician queue with lifecycle actions, readings, condition updates, parts, notes, checklist, attachments and signature.
+- **Field Service** — mobile/tablet technician queue with lifecycle actions, readings, condition updates, parts, notes, checklist, attachments, and signature.
 - **Inspections** — configurable digital inspection forms with optional automatic corrective-work generation.
-- **Safety & HSE** — hazards, incidents, near misses, inspections/corrective actions and risk scoring.
-- **Projects** — project manager, dates, budget, actual cost, progress and tasks.
+- **Safety & HSE** — hazards, incidents, near misses, inspections/corrective actions, and risk scoring.
+- **Projects** — project manager, dates, budget, actual cost, progress, and tasks.
 - **Vendors & Contracts** — supplier/OEM master and linked commercial agreements.
-- **Documents** — documents linked to assets, work orders, locations, projects and vendors.
-- **Analytics** — MTBF, MTTR, availability, backlog, schedule/PM compliance, workforce capacity, maintenance cost, procurement spend, inventory health, approvals and HSE analytics.
-- **Notifications** — user, role and global notifications with unread tracking.
+- **Documents** — documents linked to assets, work orders, locations, projects, and vendors.
+- **Analytics** — MTBF, MTTR, availability, downtime, outage counts/duration, backlog, schedule/PM compliance, workforce capacity, maintenance cost, procurement spend, inventory health, approvals, and HSE analytics.
+- **Notifications** — user, role, and global notifications with unread tracking.
 - **Global Search** — connected results across assets and related operational records.
-- **Administration** — users, roles, permissions and audit trail.
+- **Administration** — users, roles, permissions, and audit trail.
 
 ---
 
@@ -221,9 +254,13 @@ EUAS includes SCADA-style API telemetry ingestion with:
 - operational alarm lifecycle: `Open → Acknowledged → Cleared → Closed`
 - active-alarm occurrence tracking
 - alarm → corrective work-order generation
-- operational KPIs, search and CSV exports
+- operational KPIs, search, and CSV exports
 
-The included interface is **SCADA-style API ingestion**, not a live OPC-UA, Modbus, IEC 61850 or vendor-SCADA connector. Threshold evaluation is deterministic rules-based logic, not ML anomaly detection. See [UTILITY_INTELLIGENCE.md](UTILITY_INTELLIGENCE.md).
+The included interface is **SCADA-style API ingestion**, not a live OPC-UA, Modbus, IEC 61850, or vendor-SCADA connector.
+
+Threshold evaluation is deterministic rules-based logic, not ML anomaly detection.
+
+See [UTILITY_INTELLIGENCE.md](UTILITY_INTELLIGENCE.md).
 
 ---
 
@@ -233,7 +270,7 @@ The execution layer includes:
 
 - work-order material reservations with partial issue/release lifecycle
 - reserved-stock protection
-- technician dispatch with ETA, acceptance, en-route and on-site milestones
+- technician dispatch with ETA, acceptance, en-route, and on-site milestones
 - one-active-dispatch-per-technician enforcement
 - technician assignment checks for material consumption
 - planned/forced asset outages
@@ -285,11 +322,13 @@ The data is connected across Dashboard → GIS → Asset → Work → Field Serv
 └──────────────────────────────────────────────────────────┘
 ```
 
-The current reference implementation deploys the integrated apps through one shared web/API runtime, but the **product model is a suite of apps**, not one application. The shared runtime provides common identity, permissions, data consistency, audit, workflows and integrations across those apps.
+The current reference implementation deploys the integrated apps through one shared web/API runtime, but the **product model is a suite of apps**, not one application.
+
+The shared runtime provides common identity, permissions, data consistency, audit, workflows, and integrations across those apps.
 
 EUAS defaults to **SQLite** for zero-infrastructure local use. Setting `EUAS_DATABASE_URL` selects the PostgreSQL runtime adapter. The repository includes a PostgreSQL Docker Compose deployment and required live PostgreSQL 16 CI validation.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md), [DATABASE.md](DATABASE.md), [OPERATIONS.md](OPERATIONS.md), [GOVERNANCE.md](GOVERNANCE.md), [AUTHORIZATION.md](AUTHORIZATION.md) and [SECURITY.md](SECURITY.md).
+See [ARCHITECTURE.md](ARCHITECTURE.md), [DATABASE.md](DATABASE.md), [OPERATIONS.md](OPERATIONS.md), [GOVERNANCE.md](GOVERNANCE.md), [AUTHORIZATION.md](AUTHORIZATION.md), and [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -312,7 +351,9 @@ Structural tests verify migrated mutation routes remain covered and that permiss
 
 ## Concurrency / Transaction Integrity
 
-Production hardening deliberately targets PostgreSQL read-committed races and multi-session behavior. Important invariants include:
+Production hardening deliberately targets PostgreSQL read-committed races and multi-session behavior.
+
+Important invariants include:
 
 - conditional state-transition claims instead of stale read → unconditional write
 - canonical database lock ordering for multi-row mutations
@@ -335,7 +376,7 @@ The regression suite contains both deterministic SQLite tests and real PostgreSQ
 Production-mode behavior includes:
 
 - canonical `X-Request-ID` handling with generated fallback for malformed/missing values
-- production suppression of `/api/docs`, OpenAPI and OAuth introspection surfaces
+- production suppression of `/api/docs`, OpenAPI, and OAuth introspection surfaces
 - same-origin cross-origin policies plus COEP `require-corp`
 - `Origin-Agent-Cluster: ?1`
 - non-cacheable blocked introspection responses
@@ -390,7 +431,7 @@ Supplier RFQ / Quotations
  Inventory increase
 ```
 
-Requisition submission/approval, PO creation and PO receipt use atomic transition claims so stock and workflow side effects cannot be duplicated by concurrent requests.
+Requisition submission/approval, PO creation, and PO receipt use atomic transition claims so stock and workflow side effects cannot be duplicated by concurrent requests.
 
 ---
 
@@ -453,7 +494,7 @@ PostgreSQL stack:
 docker compose -f docker-compose.postgres.yml up --build
 ```
 
-Production deployments should place EUAS behind TLS/WAF, replace demo credentials, use managed secrets/object storage and integrate enterprise identity/observability.
+Production deployments should place EUAS behind TLS/WAF, replace demo credentials, use managed secrets/object storage, and integrate enterprise identity/observability.
 
 ---
 
@@ -539,7 +580,17 @@ See `.env.example` for the complete configuration surface.
 
 ## Production Roadmap
 
-Remaining enterprise-level work includes corporate OIDC/SAML + MFA, managed object storage/malware scanning, API gateway/TLS/distributed controls, production migration tooling, HA/background-worker topology, external observability, enterprise GIS/SCADA adapters, controlled DR/retention procedures and environment-promotion pipelines.
+Remaining enterprise-level work includes:
+
+- corporate OIDC/SAML + MFA
+- managed object storage and malware scanning
+- API gateway/TLS/distributed controls
+- production migration tooling
+- HA/background-worker topology
+- external observability
+- enterprise GIS/SCADA adapters
+- controlled DR/retention procedures
+- environment-promotion pipelines
 
 The hardening program continues to prioritize demonstrated integrity/security defects and operational-intelligence gaps with exact-head CI evidence before merge.
 
@@ -547,4 +598,6 @@ The hardening program continues to prioritize demonstrated integrity/security de
 
 ## Independence / Branding
 
-EUAS is an independent **suite of integrated applications**. It does not contain proprietary source code, protected graphics, proprietary text or copied layouts from other commercial EAM/CMMS products. Its architecture, data model, workflows, branding and source implementation are original to this project.
+EUAS is an independent **suite of integrated applications**. It does not contain proprietary source code, protected graphics, proprietary text, or copied layouts from other commercial EAM/CMMS products.
+
+Its architecture, data model, workflows, branding, and source implementation are original to this project.
