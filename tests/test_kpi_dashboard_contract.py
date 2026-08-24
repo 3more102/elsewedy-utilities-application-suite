@@ -176,11 +176,13 @@ def test_app_js_consumes_backend_families_without_client_recomputation():
     assert '/api/kpis/reliability' in source
     assert '/api/kpis/inventory' in source
     assert '/api/kpis/maintenance' in source
+    assert '/api/kpis/workforce' in source
     assert '/api/sites/' in source
     # ...expose drill-downs backed by contributor data...
-    for handler in ('kpiContributorDetail', 'kpiItemDetail', 'kpiWoDetail',
+    for handler in ('kpiContributorDetail', 'kpiItemDetail', 'kpiWoDetail', 'kpiWfDetail',
                     'openCustomerCounts', 'saveCustomerCount',
-                    'reliabilityPanel', 'inventoryPanel', 'maintenancePanel'):
+                    'reliabilityPanel', 'inventoryPanel', 'maintenancePanel',
+                    'workforcePanel'):
         assert handler in source, handler
     # ...and never recompute utility indices in the browser.
     lowered = source.lower()

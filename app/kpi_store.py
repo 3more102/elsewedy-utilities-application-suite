@@ -824,7 +824,239 @@ def compute_maintenance_kpis(
     }
 
 
+WORKFORCE_KPI_DEFINITIONS: dict[str, dict] = {
+    'active_technicians': {
+        'name': 'Active Technicians',
+        'definition': 'Active user accounts with the technician role.',
+        'formula': "count(active users with role='technician')",
+        'unit': 'technicians',
+        'direction': 'higher_is_better',
+        'target': None,
+        'warning_threshold': None,
+        'critical_threshold': None,
+        'sources': ['users', 'roles'],
+    },
+    'dispatched_technicians': {
+        'name': 'Dispatched Technicians',
+        'definition': (
+            'Technicians currently inside an active dispatch lifecycle '
+            '(dispatched, accepted, en route or on site).'
+        ),
+        'formula': "count(distinct technicians with dispatch status IN ('Dispatched','Accepted','En Route','On Site'))",
+        'unit': 'technicians',
+        'direction': 'lower_is_better',
+        'target': None,
+        'warning_threshold': None,
+        'critical_threshold': None,
+        'sources': ['dispatch_assignments'],
+    },
+    'utilisation_pct_30d': {
+        'name': 'Labour Utilisation (30d)',
+        'definition': (
+            'Logged labour hours over the last 30 days against declared '
+            'weekly capacity of active technicians; unavailable when no '
+            'capacity is declared.'
+        ),
+        'formula': 'logged hours (30d) / (active technicians x weekly_hours x 30/7) x 100',
+        'unit': '%',
+        'direction': 'higher_is_better',
+        'target': 80.0,
+        'warning_threshold': 60.0,
+        'critical_threshold': 40.0,
+        'sources': ['labor_entries', 'technician_profiles'],
+    },
+    'unassigned_critical_work': {
+        'name': 'Unassigned Critical Work',
+        'definition': (
+            'Open emergency/critical work orders with no assigned '
+            'technician — direct execution risk.'
+        ),
+        'formula': "count(open work orders, priority IN ('Emergency','Critical') and assigned_to IS NULL)",
+        'unit': 'work orders',
+        'direction': 'lower_is_better',
+        'target': 0.0,
+        'warning_threshold': 2.0,
+        'critical_threshold': 5.0,
+        'sources': ['work_orders'],
+    },
+    'avg_response_hours_30d': {
+        'name': 'Average Response Time (30d)',
+        'definition': (
+            'Mean hours from work-order creation to first actual start, for '
+            'orders started in the window; unavailable when nothing started.'
+        ),
+        'formula': 'avg(actual_start - created_at) over work orders started in window',
+        'unit': 'hours',
+        'direction': 'lower_is_better',
+        'target': 24.0,
+        'warning_threshold': 72.0,
+        'critical_threshold': 168.0,
+        'sources': ['work_orders'],
+    },
+}
+
+_DISPATCH_ACTIVE_STATUSES = ('Dispatched', 'Accepted', 'En Route', 'On Site')
+
+
+def compute_workforce_kpis(conn, period_days: int = 30) -> dict:
+    today = date.today()
+    window_start = datetime.combine(today - timedelta(days=period_days), datetime.min.time())
+    cutoff = window_start.isoformat(timespec='seconds')
+
+    active_techs = [
+        dict(row)
+        for row in conn.execute(
+            """SELECT u.id,u.full_name FROM users u JOIN roles r ON r.id=u.role_id
+               WHERE r.code='technician' AND u.active=1 ORDER BY u.full_name"""
+        ).fetchall()
+    ]
+    tech_ids = [t['id'] for t in active_techs]
+
+    dispatched_marks = ', '.join('?' * len(_DISPATCH_ACTIVE_STATUSES))
+    if tech_ids:
+        placeholders = ','.join('?' * len(tech_ids))
+        dispatched_rows = conn.execute(
+            f'''SELECT DISTINCT d.technician_user_id FROM dispatch_assignments d
+                WHERE d.status IN ({dispatched_marks}) AND d.technician_user_id IN ({placeholders})''',
+            list(_DISPATCH_ACTIVE_STATUSES) + tech_ids,
+        ).fetchall()
+        dispatched = len(dispatched_rows)
+    else:
+        dispatched = 0
+
+    capacity_row = conn.execute(
+        '''SELECT COUNT(*),COALESCE(SUM(tp.weekly_hours),0) FROM technician_profiles tp
+           JOIN users u ON u.id=tp.user_id WHERE tp.active=1 AND u.active=1'''
+    ).fetchone()
+    capacity_weeks = float(capacity_row[1] or 0)
+
+    labour_row = conn.execute(
+        'SELECT COALESCE(SUM(hours),0) FROM labor_entries WHERE work_date>=?',
+        (window_start.date().isoformat(),),
+    ).fetchone()
+    logged_hours = float(labour_row[0] or 0)
+
+    utilisation = None
+    if capacity_weeks > 0:
+        utilisation = round(
+            100.0 * logged_hours / (capacity_weeks * max(period_days / 7.0, 1.0)), 2
+        )
+
+    unassigned_critical = int(conn.execute(
+        """SELECT COUNT(*) FROM work_orders
+           WHERE priority IN ('Emergency','Critical') AND assigned_to IS NULL
+             AND status NOT IN ('Completed','Closed','Cancelled')"""
+    ).fetchone()[0])
+
+    # Guard against corrupt records where actual_start precedes creation:
+    # negative durations are excluded rather than allowed to poison the mean.
+    started = conn.execute(
+        '''SELECT COUNT(t.h),AVG(t.h) FROM (
+             SELECT (julianday(actual_start)-julianday(created_at))*24.0 AS h
+             FROM work_orders
+             WHERE actual_start IS NOT NULL AND actual_start>=?
+               AND created_at IS NOT NULL
+           ) t WHERE t.h>=0''',
+        (cutoff,),
+    ).fetchone()
+
+    resolved = conn.execute(
+        '''SELECT COUNT(*) FROM work_orders
+           WHERE status IN ('Completed','Closed')
+             AND COALESCE(actual_finish,updated_at)>=?''',
+        (cutoff,),
+    ).fetchone()[0]
+    still_open = conn.execute(
+        f"""SELECT COUNT(*) FROM work_orders
+            WHERE status NOT IN ({','.join('?' * len(_OPEN_WO_EXCLUSION))})""",
+        list(_OPEN_WO_EXCLUSION),
+    ).fetchone()[0]
+    completion_rate = None
+    denominator = int(resolved or 0) + int(still_open or 0)
+    if denominator:
+        completion_rate = round(100.0 * int(resolved or 0) / denominator, 2)
+
+    # Workload contributors: open assignments + recent logged hours per tech.
+    workload = []
+    if tech_ids:
+        placeholders = ','.join('?' * len(tech_ids))
+        open_counts = {
+            int(row['assigned_to']): int(row['open_count'])
+            for row in conn.execute(
+                f'''SELECT assigned_to,COUNT(*) open_count FROM work_orders
+                    WHERE assigned_to IS NOT NULL AND status NOT IN ({','.join('?' * len(_OPEN_WO_EXCLUSION))})
+                    GROUP BY assigned_to''',
+                list(_OPEN_WO_EXCLUSION),
+            ).fetchall()
+        }
+        hour_rows = conn.execute(
+            f'''SELECT user_id,COALESCE(SUM(hours),0) logged FROM labor_entries
+                WHERE work_date>=? AND user_id IN ({placeholders})
+                GROUP BY user_id''',
+            [window_start.date().isoformat()] + tech_ids,
+        ).fetchall()
+        logged_by_tech = {int(row['user_id']): float(row['logged']) for row in hour_rows}
+        for tech in active_techs:
+            workload.append({
+                'user_id': int(tech['id']),
+                'full_name': tech['full_name'],
+                'open_assigned': open_counts.get(int(tech['id']), 0),
+                'logged_hours_30d': round(logged_by_tech.get(int(tech['id']), 0.0), 2),
+            })
+    workload.sort(key=lambda w: (-w['open_assigned'], -w['logged_hours_30d']))
+
+    values = {
+        'active_technicians': float(len(active_techs)),
+        'dispatched_technicians': float(dispatched),
+        'utilisation_pct_30d': utilisation,
+        'unassigned_critical_work': float(unassigned_critical),
+        'avg_response_hours_30d': (
+            round(float(started[1]), 2) if started[1] is not None else None
+        ),
+    }
+
+    kpis = {}
+    for kpi_id, definition in WORKFORCE_KPI_DEFINITIONS.items():
+        kpis[kpi_id] = {**definition, 'id': kpi_id, 'value': values[kpi_id]}
+
+    return {
+        'kpi_family': 'workforce_execution',
+        'as_of': today.isoformat(),
+        'period_days': period_days,
+        'available_technicians': max(len(active_techs) - dispatched, 0),
+        'logged_hours_30d': round(logged_hours, 2),
+        'kpis': kpis,
+        'contributors': workload[:5],
+        'data_freshness': {'generated_at': _application.now()},
+    }
+
+
 def install_inventory_kpi_routes(app) -> None:
+    @app.get('/api/kpis/workforce')
+    def workforce_kpis_route(
+        period_days: int = Query(30, ge=7, le=365),
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            return compute_workforce_kpis(conn, period_days)
+
+    @app.get('/api/kpis/workforce.csv')
+    def workforce_kpis_csv_route(
+        period_days: int = Query(30, ge=7, le=365),
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            result = compute_workforce_kpis(conn, period_days)
+        rows_out = [
+            [kpi['id'], kpi['name'], kpi['value'], kpi['unit'], kpi['direction']]
+            for kpi in result['kpis'].values()
+        ]
+        return _application.csv_response(
+            'EUAS_workforce_kpis.csv',
+            ['KPI', 'Name', 'Value', 'Unit', 'Direction'],
+            rows_out,
+        )
+
     @app.get('/api/kpis/maintenance')
     def maintenance_kpis_route(
         period_days: int = Query(90, ge=30, le=3650),
