@@ -269,3 +269,21 @@ def test_shortage_expedite_bridge_contract():
     # Role gating mirrors the backend requisition-create whitelist.
     for role in ('storekeeper', 'maintenance_manager', 'procurement', 'planner'):
         assert role in source
+
+
+def test_command_strip_consumes_canonical_endpoints_without_recomputation():
+    """The dashboard command strip must render HSE and PM capacity signals
+    straight from the canonical endpoints - no JS-side formula rewrites."""
+    source = APP_JS.read_text(encoding='utf-8')
+    assert '/api/kpi/hse' in source
+    assert '/api/planning/maintenance-forecast' in source
+    assert '/api/kpi/pm-risk' in source
+    assert 'commandStripHtml' in source
+    assert 'data-strip-drill' in source
+    # Strip renders backend fields directly.
+    for field in ('open_incidents', 'high_risk_open', 'days_since_last_high_risk',
+                  'capacity_state', 'utilization_pct', 'craft_states'):
+        assert field in source, field
+    lowered = source.lower()
+    for forbidden in ('saidi=', 'saifi=', 'caidi='):
+        assert forbidden not in lowered
