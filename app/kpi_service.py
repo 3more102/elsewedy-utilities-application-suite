@@ -398,13 +398,27 @@ def compute_reliability(conn, f: ExecutiveFilters) -> dict:
     ).fetchone()[0])
 
     durations = sorted((x['overlap_hours'] for x in current['outages']), reverse=True)
+
+    def _week_bucket(ts_value) -> str:
+        try:
+            d = datetime.fromisoformat(str(ts_value)[:19]).date()
+        except (TypeError, ValueError):
+            d = date.today()
+        return (d - timedelta(days=d.weekday())).isoformat()
+
     weekly: dict[str, dict] = {}
     for x in current['outages']:
-        bucket = str(x['start_at'])[:10]
-        b = weekly.setdefault(bucket, {'period': bucket, 'outages': 0, 'downtime_hours': 0.0})
+        b = weekly.setdefault(_week_bucket(x['start_at']),
+                              {'period': None, 'outages': 0, 'downtime_hours': 0.0,
+                               'mttr_hours': 0.0})
         b['outages'] += 1
         b['downtime_hours'] = round(b['downtime_hours'] + x['overlap_hours'], 2)
-    trend = sorted(weekly.values(), key=lambda x: x['period'])
+    trend = []
+    for key in sorted(weekly):
+        b = weekly[key]
+        b['period'] = key
+        b['mttr_hours'] = round(b['downtime_hours'] / b['outages'], 2) if b['outages'] else 0.0
+        trend.append(b)
 
     return {
         'availability_pct': current['availability_pct'],
@@ -590,6 +604,28 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         'SELECT w.priority, COUNT(*) count' + base + ' AND ' + _OPEN_WO +
         ' GROUP BY w.priority ORDER BY ' + _PRIORITY_ORDER, scope_args))
 
+    # Overdue aging: where is backlog stuck longest? (decision: triage order)
+    today_d = date.today()
+    age_buckets = {'1-7d': 0, '8-30d': 0, '31-90d': 0, '90d+': 0}
+    for r in _rows(conn.execute(
+            'SELECT w.target_finish' + base +
+            f' AND {_OPEN_WO} AND w.target_finish IS NOT NULL AND w.target_finish<?',
+            scope_args + [w['period_end']])):
+        try:
+            overdue_days = (today_d - date.fromisoformat(str(r['target_finish'])[:10])).days
+        except (TypeError, ValueError):
+            continue
+        if overdue_days <= 0:
+            continue
+        if overdue_days <= 7:
+            age_buckets['1-7d'] += 1
+        elif overdue_days <= 30:
+            age_buckets['8-30d'] += 1
+        elif overdue_days <= 90:
+            age_buckets['31-90d'] += 1
+        else:
+            age_buckets['90d+'] += 1
+
     return {
         'open_wo': open_wo,
         'overdue_wo': overdue_wo,
@@ -605,6 +641,7 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         'mttr_hours': mttr,
         'repeat_failure_rate_pct': repeat_failure_rate,
         'by_priority': by_priority,
+        'overdue_by_age_bucket': age_buckets,
     }
 
 
@@ -991,6 +1028,71 @@ def risk_weighted_backlog(conn, f: ExecutiveFilters, limit: int = 25) -> dict:
             'blocked_high_risk': blocked_high_risk,
         },
         'rows': scored[:limit],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Maintenance cost roll-ups
+# --------------------------------------------------------------------------- #
+
+def compute_cost_kpis(conn, f: ExecutiveFilters) -> dict:
+    """Maintenance cost for the window vs the previous window.
+
+    Costs are attributed through maintenance_cost_ledger -> asset scope.
+    Ledger entries without an asset belong to organization-wide totals and are
+    excluded from site/region/class/criticality-scoped views (schema reality,
+    stated explicitly rather than silently misattributed).
+    """
+    w = f.window()
+    scope_sql, scope_args = _asset_scope(f)
+    base_join = (
+        ' FROM maintenance_cost_ledger c'
+        ' LEFT JOIN assets a ON a.id=c.asset_id'
+        ' LEFT JOIN locations l ON l.id=a.location_id'
+        ' LEFT JOIN sites s ON s.id=l.site_id')
+
+    def _window_total(win_start: str, win_end: str) -> float:
+        return float(conn.execute(
+            'SELECT COALESCE(SUM(c.amount),0)' + base_join +
+            ' WHERE 1=1' + scope_sql +
+            ' AND c.posted_at>=? AND c.posted_at<?',
+            scope_args + [win_start + 'T00:00:00', win_end + 'T23:59:59']).fetchone()[0] or 0)
+
+    current_total = round(_window_total(w['period_start'], w['period_end']), 2)
+    previous_total = round(_window_total(w['previous_start'], w['previous_end']), 2)
+
+    by_site = _rows(conn.execute(
+        'SELECT s.id site_id, s.site_code, s.name site_name,'
+        ' COALESCE(SUM(c.amount),0) amount' + base_join +
+        ' WHERE 1=1' + scope_sql +
+        ' AND c.posted_at>=? AND c.posted_at<? AND s.id IS NOT NULL'
+        ' GROUP BY s.id ORDER BY amount DESC LIMIT 12',
+        scope_args + [w['period_start'] + 'T00:00:00', w['period_end'] + 'T23:59:59']))
+    by_criticality = _rows(conn.execute(
+        "SELECT a.criticality band, COALESCE(SUM(c.amount),0) amount, COUNT(*) entries" +
+        base_join + ' WHERE 1=1' + scope_sql +
+        ' AND c.posted_at>=? AND c.posted_at<? AND a.id IS NOT NULL'
+        ' GROUP BY a.criticality ORDER BY amount DESC',
+        scope_args + [w['period_start'] + 'T00:00:00', w['period_end'] + 'T23:59:59']))
+    top_assets = _rows(conn.execute(
+        'SELECT a.id asset_id, a.asset_no, a.name asset_name, a.criticality,'
+        ' COALESCE(SUM(c.amount),0) amount' + base_join +
+        ' WHERE 1=1' + scope_sql +
+        ' AND c.posted_at>=? AND c.posted_at<? AND a.id IS NOT NULL'
+        ' GROUP BY a.id ORDER BY amount DESC LIMIT 10',
+        scope_args + [w['period_start'] + 'T00:00:00', w['period_end'] + 'T23:59:59']))
+
+    return {
+        'maintenance_cost_window': current_total,
+        'maintenance_cost_previous': previous_total,
+        'cost_delta': round(current_total - previous_total, 2),
+        'by_site': [{**r, 'amount': round(float(r['amount']), 2)} for r in by_site],
+        'by_criticality': [
+            {**r, 'band': r['band'], 'amount': round(float(r['amount']), 2)}
+            for r in by_criticality],
+        'top_cost_assets': top_assets,
+        'attribution_note': ('entries without an asset are included in window '
+                             'totals only when unscoped'),
     }
 
 
@@ -1390,7 +1492,8 @@ def _compute_live_snapshot(conn, f: ExecutiveFilters) -> dict:
         'condition': condition,
         'inventory_procurement': inventory,
     }
-    return {
+    costs = compute_cost_kpis(conn, f)
+    payload = {
         'window': f.window(),
         'filters_applied': {
             'site_id': f.site_id, 'region': f.region, 'asset_type_id': f.asset_type_id,
@@ -1404,10 +1507,12 @@ def _compute_live_snapshot(conn, f: ExecutiveFilters) -> dict:
         'condition': condition,
         'inventory_procurement': inventory,
         'workforce': workforce,
+        'costs': costs,
         'risk_backlog_summary': backlog['summary'],
         'top_risk_contributors': backlog['rows'][:10],
         'explanations': explain_kpi_changes(conn, f),
     }
+    return payload
 
 
 def executive_snapshot(conn, f: ExecutiveFilters, *, use_cache: bool = True) -> dict:

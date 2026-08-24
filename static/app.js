@@ -238,9 +238,25 @@ async function renderAnalytics(){
   ${saidiCell}
   <div class="panel-grid">
     <section class="panel"><div class="panel-head"><div><h3>Daily Forced-Outage Downtime</h3><p>Hours lost per day in window — decision: where is reliability bleeding?</p></div></div><div class="panel-body">${sparkBars(rel.trend||[],'downtime_hours','period')}</div></section>
-    <section class="panel"><div class="panel-head"><div><h3>Outage Mix</h3><p>Planned vs unplanned in window</p></div></div><div class="panel-body">
+    <section class="panel"><div class="panel-head"><div><h3>Outage Mix & MTTR Trend</h3><p>Planned vs unplanned in window</p></div></div><div class="panel-body">
       ${barChart([{label:'Unplanned (Forced)',v:rel.unplanned_outages},{label:'Planned',v:rel.planned_outages}],'label','v')}
+      ${(rel.trend||[]).length?`<h3 class="section-sub">Weekly MTTR (h)</h3>${sparkBars(rel.trend,'mttr_hours','period','var(--amber)')}`:''}
       <p class="section-sub">MTBF ${rel.total_downtime_hours>0?fmt(k.maintenance.mtbf_hours??'—')+' h':'no failures'} · MTTR ${k.maintenance.mttr_hours!=null?fmt(k.maintenance.mttr_hours)+' h':'—'}</p>
+    </div></section>
+  </div>
+
+  <h3 class="section-sub">Cost Exposure</h3>
+  <div class="kpi-grid">
+    ${kpiCard('Maintenance Cost',fmtMoney(k.costs.maintenance_cost_window),'MC',`${k.costs.attribution_note}`)}
+    ${(()=>{const d=k.costs.cost_delta;const cls=d>0?'warn':'good';const arrow=d>0?'↑':d<0?'↓':'';return kpiCard('vs Previous Period',(d>=0?'+':'')+fmtMoney(d).replace('$','$'),'Δ',`${fmtMoney(k.costs.maintenance_cost_previous)} previous`,cls)})()}
+    ${kpiCard('Top Cost Asset',(k.costs.top_cost_assets[0]?esc(k.costs.top_cost_assets[0].asset_no):'—'),'TC',k.costs.top_cost_assets[0]?fmtMoney(k.costs.top_cost_assets[0].amount):'No attributed cost')}
+  </div>
+  <div class="panel-grid">
+    <section class="panel"><div class="panel-head"><div><h3>Cost by Criticality</h3><p>Where maintenance spend concentrates</p></div></div><div class="panel-body">
+      ${k.costs.by_criticality.length?barChart(k.costs.by_criticality.map(x=>({label:x.band||'Unattributed',v:x.amount})),'label','v'):empty('No attributed costs in window')}
+    </div></section>
+    <section class="panel"><div class="panel-head"><div><h3>Top Cost Assets</h3><p>Click for the asset KPI dossier</p></div></div><div class="panel-body">
+      ${k.costs.top_cost_assets.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Asset</th><th>Criticality</th><th>Cost</th></tr></thead><tbody>${k.costs.top_cost_assets.map(a=>`<tr class="drill-row" data-kind="asset-kpi" data-id="${a.asset_id}" style="cursor:pointer"><td>${esc(a.asset_no)} — ${esc(a.asset_name)}</td><td>${esc(a.criticality)}</td><td><strong>${fmtMoney(a.amount)}</strong></td></tr>`).join('')}</tbody></table></div>`:empty('No attributed costs in window')}
     </div></section>
   </div>
 
@@ -268,6 +284,14 @@ async function renderAnalytics(){
     ${kpiCard('Schedule Compliance',fmt(m.schedule_compliance_pct)+'%','SC','Finished by target date',m.schedule_compliance_pct>=90?'good':'warn')}
     ${kpiCard('Backlog',fmt(m.backlog_hours)+' h','BL',m.backlog_weeks!=null?`≈ ${fmt(m.backlog_weeks)} crew-weeks (${fmt(m.weekly_capacity_hours)} h/wk capacity)`:'Capacity unavailable')}
     ${kpiCard('Repeat Failure Rate',fmt(m.repeat_failure_rate_pct)+'%','RF','Corrective share, 90 days',m.repeat_failure_rate_pct>20?'warn':'good')}
+  </div>
+  <div class="panel-grid">
+    <section class="panel"><div class="panel-head"><div><h3>Overdue Aging</h3><p>How long work has been stuck past target</p></div></div><div class="panel-body">
+      ${barChart(Object.entries(m.overdue_by_age_bucket||{}).map(([bucket,v])=>({label:bucket,v})),'label','v')}
+    </div></section>
+    <section class="panel"><div class="panel-head"><div><h3>Open Backlog by Priority</h3><p>Current unresolved workload</p></div></div><div class="panel-body">
+      ${m.by_priority.length?barChart(m.by_priority,'priority','count'):empty('No open work')}
+    </div></section>
   </div>
   <div class="panel-grid">
     <section class="panel"><div class="panel-head"><div><h3>Risk-Weighted Backlog</h3><p>Not age-ranked: criticality × priority × health × SLA × alarms × parts. Click to open the work order.</p></div></div><div class="panel-body">

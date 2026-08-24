@@ -146,7 +146,7 @@ def test_snapshot_equivalence_with_live_computation():
     assert first['snapshot'].get('materialized') is True
     assert second['snapshot']['served_from_cache'] is True
     for section in ('window', 'filters_applied', 'reliability', 'assets', 'maintenance',
-                    'condition', 'inventory_procurement', 'workforce',
+                    'condition', 'inventory_procurement', 'workforce', 'costs',
                     'risk_backlog_summary', 'top_risk_contributors', 'explanations'):
         assert json.dumps(first[section], sort_keys=True) == json.dumps(live[section], sort_keys=True), section
         assert json.dumps(second[section], sort_keys=True) == json.dumps(live[section], sort_keys=True), section

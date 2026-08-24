@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -418,3 +419,105 @@ def test_asset_kpi_profile_api_permissions_and_404():
         assert body['asset']['id'] == ids['tr']
         assert body['window']['period_days'] == 7
         assert 'health' in body and 'calculated_at' in body
+
+
+def test_cost_kpis_window_math_and_scoping():
+    _ensure_db()
+    now = datetime.now()
+    with db() as conn:
+        # Dedicated site/asset keeps exact-sum assertions immune to ledger
+        # entries seeded by other suites on shared records.
+        site_cur = conn.execute(
+            '''INSERT INTO sites(site_code,name,region,city,site_type,status)
+               VALUES('KPI-COST','KPI Cost Site','Greater Cairo','Cairo',
+                      'Operations Centre','Operating')''')
+        site_id = int(site_cur.lastrowid)
+        loc_cur = conn.execute(
+            '''INSERT INTO locations(location_code,name,location_type,site_id)
+               VALUES('KPI-COST-LOC','KPI Cost Location','Site',?)''', (site_id,))
+        asset_cur = conn.execute(
+            '''INSERT INTO assets(asset_no,name,category,criticality,condition,status,
+                 location_id,created_at,updated_at)
+               VALUES('BENCH-KPI-COST','KPI Cost Asset','Transformer','Critical',
+                      'Good','Operating',?,?,?)''',
+            (int(loc_cur.lastrowid), now.isoformat(timespec='seconds'),
+             now.isoformat(timespec='seconds')))
+        asset_id = int(asset_cur.lastrowid)
+        admin = int(conn.execute("SELECT id FROM users WHERE username='omar'").fetchone()[0])
+        entries = [
+            ('COST-KPI-A', asset_id, '1500.0', (now - timedelta(days=2)).isoformat(timespec='seconds')),
+            ('COST-KPI-B', asset_id, '500.0',  (now - timedelta(days=40)).isoformat(timespec='seconds')),
+        ]
+        for entry_no, a_id, amount, posted_at in entries:
+            conn.execute(
+                '''INSERT INTO maintenance_cost_ledger(entry_no,work_order_id,asset_id,cost_type,
+                     amount,quantity,reference,posted_by,posted_at)
+                   VALUES(?,NULL,?,'Repair',?,1,'kpi-regression',?,?)''',
+                (entry_no, a_id, amount, admin, posted_at))
+
+    from app.kpi_service import compute_cost_kpis
+    f = ExecutiveFilters(site_id=site_id, period_days=30)
+    with db() as conn:
+        costs = compute_cost_kpis(conn, f)
+        org = compute_cost_kpis(conn, ExecutiveFilters(period_days=30))
+
+    assert costs['maintenance_cost_window'] == 1500.0
+    assert costs['maintenance_cost_previous'] == 500.0
+    assert costs['cost_delta'] == round(1500.0 - 500.0, 2)
+    # Top-asset/criticality roll-ups are window-scoped: current entry only.
+    top = {x['asset_no']: float(x['amount']) for x in costs['top_cost_assets']}
+    assert top.get('BENCH-KPI-COST') == 1500.0
+    bands = {x['band']: float(x['amount']) for x in costs['by_criticality']}
+    assert bands.get('Critical') == 1500.0
+    assert any(x['site_name'] == 'KPI Cost Site' for x in costs['by_site'])
+    # Organization scope includes the same attributed amounts.
+    assert org['maintenance_cost_window'] >= costs['maintenance_cost_window']
+
+
+def test_overdue_aging_buckets_classify_correctly():
+    _ensure_db()
+    now = datetime.now()
+    ids3 = _ids()
+    ages = {'WO-KPI-AGE1': 5, 'WO-KPI-AGE2': 20, 'WO-KPI-AGE3': 60, 'WO-KPI-AGE4': 120}
+    with db() as conn:
+        for wo_no, days in ages.items():
+            target = (now - timedelta(days=days)).strftime('%Y-%m-%d')
+            _make_wo(ids3, wo_no=wo_no, asset_id=ids3['pmp'], priority='High',
+                     status='Approved', target_finish=target)
+    f = ExecutiveFilters(period_days=30)
+    with db() as conn:
+        from app.kpi_service import compute_maintenance_kpis
+        m = compute_maintenance_kpis(conn, f)
+    buckets = m['overdue_by_age_bucket']
+    for bucket, expected in (('1-7d', 1), ('8-30d', 1), ('31-90d', 1), ('90d+', 1)):
+        assert buckets[bucket] >= expected, f'{bucket}: {buckets}'
+
+
+def test_reliability_trend_exposes_weekly_mttr_series():
+    ids4 = _ids()
+    now = datetime.now()
+    _seed_outage(ids4, asset_id=ids4['tr'], site_id=ids4['ncs'],
+                 start=(now - timedelta(days=3)).isoformat(timespec='seconds'),
+                 end=(now - timedelta(days=3) + timedelta(hours=2)).isoformat(timespec='seconds'),
+                 code_suffix='MTTR1')
+    with db() as conn:
+        rel = compute_reliability(conn, ExecutiveFilters(period_days=28))
+    assert rel['trend'], 'expected at least one weekly bucket'
+    current_week = rel['trend'][-1]
+    assert set(current_week) == {'period', 'outages', 'downtime_hours', 'mttr_hours'}
+    assert current_week['outages'] >= 1
+    assert current_week['mttr_hours'] == round(
+        current_week['downtime_hours'] / current_week['outages'], 2)
+
+
+def test_snapshot_includes_costs_and_stays_cache_consistent():
+    _ensure_db()
+    f = ExecutiveFilters(period_days=60)
+    with db() as conn:
+        conn.execute('DELETE FROM kpi_snapshot')
+    with db() as conn:
+        live = executive_snapshot(conn, f, use_cache=False)
+    assert 'costs' in live and 'maintenance_cost_window' in live['costs']
+    with db() as conn:
+        served = executive_snapshot(conn, f)
+    assert json.dumps(served['costs'], sort_keys=True) == json.dumps(live['costs'], sort_keys=True)
