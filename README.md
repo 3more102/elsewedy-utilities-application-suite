@@ -130,6 +130,10 @@ Trend values are extracted from the canonical `compute_reliability` result; the 
 
 Reliability WHY/contributor responses use outage records as correlation evidence and retain the explicit correlation-not-causation disclaimer.
 
+### Cost trend intelligence
+
+`cost/maintenance_cost_window` is available through `/api/kpi/trend` and `/api/kpi/explanation`. Because `compute_cost_kpis` sums immutable `maintenance_cost_ledger` entries inside each requested window, historical buckets are genuine as-of evaluations (not snapshot echoes) and pass the trend snapshot guard by construction. WHY drivers cite the canonical `top_cost_assets` section with `contributor` attribution and resolvable asset drill targets; contributor scope always equals metric scope.
+
 ### Scope model and WHY contributor guarantees
 
 The canonical KPI computation layer supports executive filtering by:
