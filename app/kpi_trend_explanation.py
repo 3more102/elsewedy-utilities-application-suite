@@ -427,6 +427,41 @@ def _maintenance_cost_drivers(conn, f, limit: int = 10) -> list[dict]:
     return drivers
 
 
+def _inventory_stockout_drivers(conn, f, *, current: dict,
+                                limit: int = 10) -> list[dict]:
+    """Stocked-out lines composing ``inventory/stockout_lines``.
+
+    Consumes the canonical ``stockouts`` section of the same compute payload
+    the metric counts; every cited line is one of the counted records, hence
+    ``contributor`` attribution. Magnitude is how far below its own reorder
+    point the line sits, derived deterministically from the record.
+    """
+    drivers = []
+    for row in (current.get('stockouts') or [])[:limit]:
+        try:
+            available = float(row['current_stock']) - float(row['reserved_stock'])
+            reorder = float(row['reorder_point'] or 0)
+        except (TypeError, ValueError):
+            available, reorder = 0.0, 0.0
+        shortfall = round(max(0.0, reorder - available), 3)
+        drivers.append({
+            'kind': 'stockout_line',
+            'label': (
+                f"{row['item_no']} {row.get('name') or ''} ".strip()
+                + f"in {row.get('warehouse_name') or 'warehouse'}"
+            ),
+            'magnitude': shortfall,
+            'unit': ('units short of reorder point' if shortfall > 0
+                     else 'at/below reorder point'),
+            'attribution': 'contributor',
+            'source_type': 'inventory_item',
+            'source_id': int(row['id']),
+            'drill': {'module': 'inventory', 'record': row['item_no'],
+                      'id': int(row['id'])},
+        })
+    return drivers
+
+
 def _workforce_unassigned_drivers(conn, f, *, current: dict,
                                   limit: int = 10) -> list[dict]:
     """Unassigned critical work orders composing the workforce metric.
@@ -552,6 +587,8 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
         drivers = _maintenance_cost_drivers(conn, f)
     elif family == 'workforce' and metric == 'unassigned_critical_work':
         drivers = _workforce_unassigned_drivers(conn, f, current=current)
+    elif family == 'inventory' and metric == 'stockout_lines':
+        drivers = _inventory_stockout_drivers(conn, f, current=current)
     elif family == 'maintenance' and metric in {
             'open_work_orders', 'overdue_work_orders', 'emergency_work_orders',
             'high_risk_overdue_work_orders', 'unassigned_critical_work_orders',
