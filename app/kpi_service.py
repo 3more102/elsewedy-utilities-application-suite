@@ -1235,6 +1235,15 @@ def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
     high_risk_open = _count(open_where + ' AND h.risk_score>=?',
                             [HSE_HIGH_RISK_SCORE])
 
+    # Open-incident records ranked by risk: the literal rows composing the
+    # open_incidents/high_risk_open counts, extracted with the identical
+    # base predicates and scope so contributors equal the counted set.
+    open_incident_records = _rows(conn.execute(
+        'SELECT h.id,h.incident_no,h.incident_type,h.title,h.severity,'
+        'h.risk_score' + base + open_where +
+        ' ORDER BY h.risk_score DESC, h.created_at DESC LIMIT 10',
+        list(scope_args)))
+
     cur_args = [w['period_start'] + 'T00:00:00', w['period_end'] + 'T23:59:59']
     prev_args = [w['previous_start'] + 'T00:00:00', w['previous_end'] + 'T23:59:59']
     incidents_current = _count(' AND h.created_at>=? AND h.created_at<?', cur_args)
@@ -1364,6 +1373,7 @@ def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
     return {
         'open_incidents': open_incidents,
         'high_risk_open': high_risk_open,
+        'open_incident_records': open_incident_records,
         'high_risk_definition': f'risk_score >= {HSE_HIGH_RISK_SCORE} (domain escalation threshold)',
         'incidents_current': incidents_current,
         'incidents_previous': incidents_previous,
@@ -1832,6 +1842,10 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
     # computation, whose contributor query shares the exact joins, scope and
     # predicates of the repeat-failure rate itself. No second extraction
     # with different scoping may be introduced.
+    # Chronic bad actors come straight from the canonical maintenance
+    # computation, whose contributor query shares the exact joins, scope and
+    # predicates of the repeat-failure rate itself. No second extraction
+    # with different scoping may be introduced.
     explanations['repeat_failures'] = {
         'current': maint_now['repeat_failure_rate_pct'],
         'previous': None,
@@ -1850,6 +1864,44 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
             }
             for r in maint_now.get('repeat_failure_assets', [])
         ],
+    }
+    # Open HSE incidents are the literal records composing the open counts;
+    # extraction shares compute_hse_kpis' base predicates and scope.
+    hse_now = compute_hse_kpis(conn, f)
+
+    def _hse_drivers(records, threshold: int | None,
+                     kind: str) -> list[dict]:
+        drivers = []
+        for r in records:
+            risk = int(r['risk_score'] or 0)
+            if threshold is not None and risk < threshold:
+                continue
+            drivers.append({
+                'kind': kind,
+                'label': (
+                    f"{r['incident_no']} {r['incident_type']} "
+                    f"risk {risk}"
+                ),
+                'risk_score': risk,
+                'severity': r['severity'],
+                'link': {'module': 'hse', 'record': r['incident_no'],
+                         'id': r['id']},
+            })
+        return drivers
+
+    explanations['hse_open_incidents'] = {
+        'current': hse_now['open_incidents'],
+        'previous': None,
+        'delta': None,
+        'drivers': _hse_drivers(hse_now.get('open_incident_records', []),
+                                None, 'open_incident'),
+    }
+    explanations['hse_high_risk_open'] = {
+        'current': hse_now['high_risk_open'],
+        'previous': None,
+        'delta': None,
+        'drivers': _hse_drivers(hse_now.get('open_incident_records', []),
+                                HSE_HIGH_RISK_SCORE, 'high_risk_incident'),
     }
     return explanations
 
