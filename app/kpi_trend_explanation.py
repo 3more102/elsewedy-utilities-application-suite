@@ -276,15 +276,21 @@ def _maintenance_overdue_drivers(conn, f, limit: int = 5) -> list[dict]:
     ]
 
 
-def _reliability_outage_drivers(conn, f, limit: int = 5) -> list[dict]:
+def _reliability_outage_drivers(conn, f, metric: str, limit: int = 5) -> list[dict]:
     """Reuse the canonical outage-driver extraction from the snapshot's own
-    explanation section instead of recomputing attribution here."""
+    explanation section instead of recomputing attribution here.
+
+    The driver record class must correspond to the metric being explained:
+    ``planned_outages`` is explained by planned (non-forced) outage records,
+    every other reliability metric is explained by forced/unplanned records.
+    """
     from .kpi_service import explain_kpi_changes
 
     explanations = explain_kpi_changes(conn, f)
-    availability = explanations.get('availability') or {}
+    section = ('planned_outages' if metric == 'planned_outages'
+               else 'availability')
     drivers = []
-    for driver in (availability.get('drivers') or [])[:limit]:
+    for driver in ((explanations.get(section) or {}).get('drivers') or [])[:limit]:
         link = driver.get('link') or {}
         drivers.append({
             'kind': driver.get('kind', 'unplanned_outage'),
@@ -338,7 +344,7 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
                         else not moved_up)
 
     if family == 'reliability':
-        drivers = _reliability_outage_drivers(conn, f)
+        drivers = _reliability_outage_drivers(conn, f, metric)
     elif family == 'maintenance' and metric in {
             'open_work_orders', 'overdue_work_orders', 'emergency_work_orders',
             'high_risk_overdue_work_orders', 'unassigned_critical_work_orders',
