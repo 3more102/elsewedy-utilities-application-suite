@@ -66,6 +66,111 @@ def test_audit_tamper_is_detected():
             assert verify_audit_chain(conn) is True
 
 
+def test_append_maintains_transactional_anchor():
+    module = 'AuditAnchorMaintained'
+    with TestClient(app):
+        with db() as conn:
+            user_id = _admin_id(conn)
+            digest = append_audit(
+                conn, user_id, 'CREATE', module, 'anchored', '', {'v': 1}
+            )
+
+        with db() as conn:
+            anchor = conn.execute(
+                'SELECT head_hash,record_count FROM audit_chain_anchor WHERE id=1'
+            ).fetchone()
+            count = int(
+                conn.execute('SELECT COUNT(*) FROM audit_logs').fetchone()[0]
+            )
+            assert verify_audit_chain_report(conn)['valid'] is True
+
+        assert anchor['head_hash'] == digest
+        assert int(anchor['record_count']) == count
+
+
+def test_tail_truncation_is_detected():
+    """Deleting the newest audit records must fail verification.
+
+    Pure hash linkage cannot see a shortened chain; the transactional anchor
+    head/count comparison is what makes tail truncation detectable.
+    """
+    module = 'AuditTruncation'
+    with TestClient(app):
+        with db() as conn:
+            user_id = _admin_id(conn)
+            append_audit(conn, user_id, 'CREATE', module, 't1', '', {'n': 1})
+            append_audit(conn, user_id, 'CREATE', module, 't2', '', {'n': 2})
+
+        with db() as conn:
+            assert verify_audit_chain_report(conn)['valid'] is True
+            victim = dict(conn.execute(
+                "SELECT * FROM audit_logs WHERE module=? ORDER BY id DESC LIMIT 1",
+                (module,),
+            ).fetchone())
+            conn.execute('DELETE FROM audit_logs WHERE id=?', (victim['id'],))
+
+        with db() as conn:
+            report = verify_audit_chain_report(conn)
+            assert report['valid'] is False
+            with pytest.raises(AuditIntegrityError):
+                verify_audit_chain(conn)
+            integrity_api_shape = report
+
+        assert integrity_api_shape['first_invalid_id'] is None
+
+        # Undo the deletion so the shared regression database keeps a valid,
+        # anchored chain for subsequent suite modules. The anchor was never
+        # changed by the raw DELETE, so only the row itself is restored.
+        with db() as conn:
+            conn.execute(
+                '''INSERT INTO audit_logs(
+                     id,user_id,action,module,record_id,old_value,new_value,
+                     created_at,prev_hash,audit_hash
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                (
+                    victim['id'], victim['user_id'], victim['action'],
+                    victim['module'], victim['record_id'], victim['old_value'],
+                    victim['new_value'], victim['created_at'],
+                    victim['prev_hash'], victim['audit_hash'],
+                ),
+            )
+
+        with db() as conn:
+            assert verify_audit_chain_report(conn)['valid'] is True
+
+
+def test_anchor_head_and_count_mismatch_is_detected():
+    module = 'AuditAnchorMismatch'
+    with TestClient(app):
+        with db() as conn:
+            user_id = _admin_id(conn)
+            append_audit(conn, user_id, 'CREATE', module, 'm1', '', {'n': 1})
+
+        with db() as conn:
+            saved = dict(conn.execute(
+                'SELECT head_hash,record_count FROM audit_chain_anchor WHERE id=1'
+            ).fetchone())
+
+            conn.execute('UPDATE audit_chain_anchor SET record_count=0 WHERE id=1')
+            assert verify_audit_chain_report(conn)['valid'] is False
+
+            conn.execute(
+                'UPDATE audit_chain_anchor SET record_count=?,head_hash=? WHERE id=1',
+                (saved['record_count'], 'fabricated-head'),
+            )
+            report = verify_audit_chain_report(conn)
+            assert report['valid'] is False
+            assert report['head_hash'] != 'fabricated-head'
+
+            conn.execute(
+                'UPDATE audit_chain_anchor SET head_hash=? WHERE id=1',
+                (saved['head_hash'],),
+            )
+
+        with db() as conn:
+            assert verify_audit_chain_report(conn)['valid'] is True
+
+
 def _login(client, username='omar', password='EUAS@2026'):
     r = client.post('/api/auth/login', json={'username': username, 'password': password})
     assert r.status_code == 200, r.text

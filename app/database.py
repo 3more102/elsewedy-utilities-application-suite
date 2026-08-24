@@ -167,6 +167,28 @@ def _backfill_audit_chain(conn):
         conn.execute('UPDATE audit_logs SET prev_hash=?,audit_hash=? WHERE id=?',(prev,digest,r['id']))
         prev=digest
 
+def _ensure_audit_anchor(conn):
+    """Bootstrap-only sync of the singleton audit-chain anchor row.
+
+    The anchor is written transactionally by every append so that deleting
+    (truncating) rows from audit_logs becomes detectable, which pure hash
+    linkage alone cannot catch for tail records. The bootstrap deliberately
+    never overwrites an existing anchor: a mismatch must stay visible to the
+    deployment gate instead of being silently healed on restart.
+    """
+    row = conn.execute('SELECT id FROM audit_chain_anchor WHERE id=1').fetchone()
+    if row is not None:
+        return
+    head = conn.execute(
+        'SELECT audit_hash FROM audit_logs ORDER BY id DESC LIMIT 1'
+    ).fetchone()
+    count = int(conn.execute('SELECT COUNT(*) FROM audit_logs').fetchone()[0])
+    conn.execute(
+        'INSERT OR IGNORE INTO audit_chain_anchor(id,head_hash,record_count) VALUES(?,?,?)',
+        (1, (head['audit_hash'] if head and head['audit_hash'] else ''), count),
+    )
+
+
 def init_db(hash_password):
     with db() as conn:
         conn.executescript('''
@@ -504,6 +526,11 @@ def init_db(hash_password):
           prev_hash TEXT DEFAULT '', audit_hash TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_audit_chain ON audit_logs(id,audit_hash);
+        CREATE TABLE IF NOT EXISTS audit_chain_anchor(
+          id INTEGER PRIMARY KEY CHECK(id=1),
+          head_hash TEXT NOT NULL DEFAULT '',
+          record_count INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS kpi_snapshot(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           scope_key TEXT NOT NULL,
@@ -541,6 +568,7 @@ def init_db(hash_password):
         ''')
         _ensure_schema_columns(conn)
         _backfill_audit_chain(conn)
+        _ensure_audit_anchor(conn)
         conn.execute('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)',(SCHEMA_VERSION,now()))
         # A database written by a NEWER release must never be opened by an
         # older binary: columns and constraints it relies on may not exist
