@@ -39,6 +39,13 @@ PERMISSION_CATALOG: dict[str, tuple[str, tuple[str, ...]]] = {
         'Export audit records',
         ('admin', 'maintenance_manager', 'executive'),
     ),
+    'analytics.executive.read': (
+        'Read executive utilities KPI dashboards',
+        (
+            'admin', 'maintenance_manager', 'executive',
+            'asset_manager', 'planner', 'supervisor',
+        ),
+    ),
     'assets.create': (
         'Create assets',
         ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
@@ -190,6 +197,9 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('GET', '/api/audit'): 'audit.read',
     ('GET', '/api/audit/replay'): 'audit.read',
     ('GET', '/api/exports/audit.csv'): 'audit.export',
+    ('GET', '/api/kpi/executive'): 'analytics.executive.read',
+    ('GET', '/api/kpi/backlog/risk'): 'analytics.executive.read',
+    ('GET', '/api/kpi/deterioration'): 'analytics.executive.read',
     ('POST', '/api/assets'): 'assets.create',
     ('PATCH', '/api/assets/{asset_id}'): 'assets.update',
     ('DELETE', '/api/assets/{asset_id}'): 'assets.delete',

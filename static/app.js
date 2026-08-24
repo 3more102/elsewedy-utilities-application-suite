@@ -181,7 +181,134 @@ async function uploadDocument(work=null){const assets=S.cache.assets||await api(
 
 window.downloadDoc=async(id,name)=>{try{const r=await fetch(`/api/documents/${id}/download`,{headers:{Authorization:'Bearer '+S.token}});if(!r.ok)throw new Error('Download failed');const b=await r.blob(),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download=name;a.click();URL.revokeObjectURL(u)}catch(e){toast(e.message)}}
 
-async function renderAnalytics(){const a=await api('/api/analytics');const s=a.summary;$('#content').innerHTML=`<div class="hero"><div><h1>Analytics</h1><p>Reliability, maintenance, workforce capacity, approvals, cost, procurement, inventory and HSE intelligence.</p></div></div><div class="kpi-grid">${kpi('MTBF',s.mtbf==null?'No failures':fmt(s.mtbf)+' h','BF',`${s.reliability_period_days}-day operating-time method`)}${kpi('MTTR',fmt(s.mttr)+' h','TR','Corrective downtime / failures')}${kpi('Availability',fmt(s.availability)+'%','AV','Operating time less corrective downtime')}${kpi('PM Compliance',s.pm_compliance+'%','PM','Preventive maintenance')}${kpi('WO Completion',s.work_order_completion_rate+'%','WO','Lifecycle completion')}${kpi('Peak Capacity',fmt(a.maintenance_forecast.summary.peak_utilization_pct)+'%','CP','90-day workforce load',a.maintenance_forecast.summary.peak_utilization_pct>100?'warn':'good')}</div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Work Trend</h3><p>Monthly work-order volume</p></div></div><div class="panel-body">${a.monthly_work.length?svgLine(a.monthly_work,'count','period'):empty('No trend data')}</div></section><section class="panel"><div class="panel-head"><div><h3>Open Backlog by Priority</h3><p>Current unresolved workload</p></div></div><div class="panel-body">${a.backlog_by_priority.length?barChart(a.backlog_by_priority,'priority','count'):empty('No backlog')}</div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Maintenance Work by Type</h3><p>Volume and actual cost</p></div></div><div class="panel-body">${barChart(a.maintenance_by_type,'work_type','count')}</div></section><section class="panel"><div class="panel-head"><div><h3>Maintenance Cost / Asset</h3><p>Actual cost concentration</p></div></div><div class="panel-body">${svgLine(a.cost_by_asset,'maintenance_cost','asset_no')}</div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Procurement Spend by Vendor</h3><p>Purchase-order commitments</p></div></div><div class="panel-body">${a.procurement_by_vendor.length?barChart(a.procurement_by_vendor,'vendor','spend'):empty('No PO spend yet')}</div></section><section class="panel"><div class="panel-head"><div><h3>Inventory Health</h3><p>Available stock vs reorder/max levels</p></div></div><div class="panel-body">${barChart(a.inventory_health,'stock_state','count')}</div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Approval Outcomes</h3><p>Workflow decisions across modules</p></div></div><div class="panel-body">${a.approval_summary.length?barChart(a.approval_summary,'status','count'):empty('No approvals')}</div></section><section class="panel"><div class="panel-head"><div><h3>HSE Risk Distribution</h3><p>Incident risk bands</p></div></div><div class="panel-body">${a.hse_by_risk.length?barChart(a.hse_by_risk,'risk_band','count'):empty('No HSE risk data')}</div></section></div><section class="panel"><div class="panel-head"><div><h3>Asset Reliability</h3><p>365-day failure, downtime, MTBF, MTTR and availability calculation.</p></div></div>${table(['Asset','Description','Failures','Downtime','MTBF','MTTR','Availability','Maintenance Cost'],a.asset_reliability.map(x=>[x.asset_no,esc(x.name),x.failures,fmt(x.downtime_hours)+' h',x.mtbf_hours==null?'—':fmt(x.mtbf_hours)+' h',fmt(x.mttr_hours)+' h',fmt(x.availability_pct)+'%',fmtMoney(x.maintenance_cost)]))}</section><section class="panel" style="margin-top:14px"><div class="panel-head"><div><h3>Site Reliability</h3><p>Aggregated operating time and corrective downtime by utility site.</p></div></div>${table(['Site','Assets','Failures','MTBF','MTTR','Availability','Cost'],a.site_reliability.map(x=>[esc(x.site_name),x.assets,x.failures,x.mtbf_hours==null?'—':fmt(x.mtbf_hours)+' h',fmt(x.mttr_hours)+' h',fmt(x.availability_pct)+'%',fmtMoney(x.maintenance_cost)]))}</section><div class="panel-grid" style="margin-top:14px"><section class="panel"><div class="panel-head"><div><h3>Asset Health Score</h3><p>Lowest-scoring assets requiring risk review</p></div></div>${table(['Asset','Name','Score','Risk','Condition','Priority Work'],a.asset_health_scores.slice().sort((x,y)=>x.score-y.score).slice(0,8).map(x=>[x.asset_no,esc(x.name),fmt(x.score),status(x.risk_band),status(x.condition),x.open_priority_work]))}</section><section class="panel"><div class="panel-head"><div><h3>90-Day Capacity Forecast</h3><p>Shift/absence-adjusted maintenance demand versus capacity.</p></div></div><div class="panel-body">${barChart(a.maintenance_forecast.weeks,'week_start','demand_hours')}</div></section></div><section class="panel" style="margin-top:14px"><div class="panel-head"><div><h3>Maintenance Cost Ledger</h3><p>Posted labor, material and historical cost entries</p></div></div><div class="panel-body">${a.maintenance_cost_ledger.length?barChart(a.maintenance_cost_ledger,'cost_type','amount'):empty('No posted costs')}</div></section>`}
+const KPI_STATE={days:30,siteId:'',typeId:'',crit:''};
+
+function kpiDelta(cur,prev,unit='',lowerIsBetter=false){
+  if(cur==null||prev==null)return '';
+  const d=Math.round((cur-prev)*10)/10;
+  if(!isFinite(d))return '';
+  const good=lowerIsBetter?d<0:d>0, bad=lowerIsBetter?d>0:d>0&&false;
+  const cls=d===0?'':(good?'good':'warn');
+  const arrow=d>0?'↑':d<0?'↓':'';
+  return `<div class="trend ${cls}">${arrow} ${Math.abs(d)}${unit} vs previous period</div>`;
+}
+
+function kpiCard(label,value,icon,hint='',cls='',sub=''){return `<article class="kpi"><div class="kpi-top"><span class="kpi-label">${esc(label)}</span><span class="kpi-ico">${esc(icon)}</span></div><div class="kpi-value">${value}</div>${sub}<div class="trend ${cls}">${hint}</div></article>`}
+
+function sparkBars(items,valueKey,labelKey,color){if(!items.length)return empty('No data in window');const max=Math.max(1,...items.map(x=>Number(x[valueKey]||0)));return `<div class="chart-bars">${items.slice(-14).map(x=>`<div class="bar-row" title="${esc(x[labelKey])}: ${fmt(x[valueKey])}"><span>${esc(String(x[labelKey]).slice(5))}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3,Number(x[valueKey]||0)/max*100)}%;background:${color||'var(--red)'}"></div></div><b>${fmt(x[valueKey])}</b></div>`).join('')}</div>`}
+
+function heatGrid(cells){if(!cells.length)return empty('No risk concentration');const max=Math.max(1,...cells.map(c=>c.v));return `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px">${cells.map(c=>{const t=c.v/max;const bg=t===0?'#f4f5f7':`rgba(220,53,69,${0.12+t*0.75})`;return `<a href="#" class="heat-cell" data-site="${c.site_id}" title="${esc(c.label)}: ${fmt(c.v)}" style="display:block;background:${bg};border:1px solid var(--line);border-radius:8px;padding:9px;text-decoration:none;color:inherit"><strong style="font-size:11px;display:block">${esc(c.label)}</strong><span style="font-size:18px;font-weight:800">${fmt(c.v)}</span></a>`}).join('')}</div>`}
+
+async function renderAnalytics(){
+  if(S.user&&!roleIn('admin','maintenance_manager','executive','asset_manager','planner','supervisor')){$('#content').innerHTML=empty('Executive analytics require elevated permissions.');return}
+  if(KPI_STATE.siteId==='')KPI_STATE.siteId=S.siteId||'';
+  const qp=new URLSearchParams({period_days:KPI_STATE.days});
+  const siteId=KPI_STATE.siteId||S.siteId;
+  if(siteId)qp.set('site_id',siteId);
+  if(KPI_STATE.typeId)qp.set('asset_type_id',KPI_STATE.typeId);
+  if(KPI_STATE.crit)qp.set('criticality',KPI_STATE.crit);
+  const [k,deter]=await Promise.all([api('/api/kpi/executive?'+qp),api('/api/kpi/deterioration?'+qp).catch(()=>null)]);
+  const ref=S.ref||await api('/api/reference');
+  const rel=k.reliability,as=k.assets,m=k.maintenance,c=k.condition,ip=k.inventory_procurement,wf=k.workforce,fresh=k.freshness;
+  const freshCls=fresh.state==='stale'?'warn':'good';
+  const availSub=kpiDelta(rel.availability_pct,rel.availability_previous_pct,'%',true);
+  const saidiCell=rel.saidi_minutes==null?`<div class="trend">Configure customers served per site to enable SAIDI/SAIFI/CAIDI.</div>`:'';
+  const heatCells=(k.reliability.trend||[]).map(t=>({site_id:'',label:t.period,v:t.downtime_hours}));
+  const detBy={};(deter?.signals||[]).forEach(s=>{detBy[s.kind]=(detBy[s.kind]||0)+1});
+  $('#content').innerHTML=`
+  <div class="hero"><div><h1>Executive Analytics</h1>
+    <p>Drill from enterprise KPIs to assets, work and alarms. <span class="status ${freshCls}">Calculated ${esc(fresh.calculated_at)} · source ${fresh.state}</span></p></div>
+    <div class="hero-actions">
+      <select id="kpi-days" class="btn">${[7,30,90,365].map(d=>`<option value="${d}" ${d==KPI_STATE.days?'selected':''}>Last ${d} days</option>`).join('')}</select>
+      <select id="kpi-site" class="btn"><option value="">All Sites</option>${ref.sites.map(s=>`<option value="${s.id}" ${String(s.id)===String(siteId)?'selected':''}>${esc(s.name)}</option>`).join('')}</select>
+      <select id="kpi-type" class="btn"><option value="">All Asset Classes</option>${ref.asset_types.map(t=>`<option value="${t.id}" ${String(t.id)===KPI_STATE.typeId?'selected':''}>${esc(t.name)}</option>`).join('')}</select>
+      <select id="kpi-crit" class="btn"><option value="">All Criticality</option>${['Critical','High','Medium','Low'].map(x=>`<option value="${x}" ${x===KPI_STATE.crit?'selected':''}>${x}</option>`).join('')}</select>
+    </div></div>
+
+  <h3 class="section-sub">Reliability</h3>
+  <div class="kpi-grid">
+    ${kpiCard('Availability',fmt(rel.availability_pct)+'%','AV','Forced-outage method','',rel.availability_pct>=95?'good':'warn',availSub)}
+    ${rel.saidi_minutes!=null?kpiCard('SAIDI',fmt(rel.saidi_minutes)+' min','SD','System average interruption duration'):kpiCard('SAIDI','—','SD','Customers not configured')}
+    ${rel.saifi!=null?kpiCard('SAIFI',fmt(rel.saifi),'SF','Interruptions per customer'):kpiCard('SAIFI','—','SF','Customers not configured')}
+    ${rel.caidi_minutes!=null?kpiCard('CAIDI',fmt(rel.caidi_minutes)+' min','CD','Average restoration time'):kpiCard('CAIDI','—','CD','Requires SAIFI > 0')}
+  </div>
+  ${saidiCell}
+  <div class="panel-grid">
+    <section class="panel"><div class="panel-head"><div><h3>Daily Forced-Outage Downtime</h3><p>Hours lost per day in window — decision: where is reliability bleeding?</p></div></div><div class="panel-body">${sparkBars(rel.trend||[],'downtime_hours','period')}</div></section>
+    <section class="panel"><div class="panel-head"><div><h3>Outage Mix</h3><p>Planned vs unplanned in window</p></div></div><div class="panel-body">
+      ${barChart([{label:'Unplanned (Forced)',v:rel.unplanned_outages},{label:'Planned',v:rel.planned_outages}],'label','v')}
+      <p class="section-sub">MTBF ${rel.total_downtime_hours>0?fmt(k.maintenance.mtbf_hours??'—')+' h':'no failures'} · MTTR ${k.maintenance.mttr_hours!=null?fmt(k.maintenance.mttr_hours)+' h':'—'}</p>
+    </div></section>
+  </div>
+
+  <h3 class="section-sub">Assets & Condition</h3>
+  <div class="kpi-grid">
+    ${kpiCard('Assets Down',as.down,'AD',`${as.operating} operating / ${as.total} total`,as.down?'warn':'good')}
+    ${kpiCard('Critical Assets Down',as.critical_down,'CR','Immediate exposure',as.critical_down?'warn':'good')}
+    ${kpiCard('Health Band: Warning+',(as.health_distribution.Warning||0)+(as.health_distribution.Critical||0),'HB','Portfolio health distribution','warn')}
+    ${kpiCard('Critical Active Alarms',c.critical_active_alarms,'AL',`${c.unacknowledged_alarms} unacknowledged`,c.critical_active_alarms?'warn':'good')}
+  </div>
+  <div class="panel-grid">
+    <section class="panel"><div class="panel-head"><div><h3>Risk Heat — Daily Downtime</h3><p>Decision: which days need investigation</p></div></div><div class="panel-body">${heatGrid(heatCells)}</div></section>
+    <section class="panel"><div class="panel-head"><div><h3>Deterioration Signals</h3><p>Trend / anomaly labels only — no failure probabilities claimed</p></div></div><div class="panel-body">
+      ${(deter?.signals||[]).length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Kind</th><th>Subject</th><th>Evidence</th></tr></thead><tbody>${(deter.signals||[]).slice(0,8).map(s=>`<tr class="drill-row" data-kind="${s.subject_type}" data-id="${s.link.asset_id||s.id}" data-code="${esc(s.code)}"><td><span class="status ${s.kind==='deterioration'||s.kind==='anomaly'?'Critical':'Warning'}">${esc(s.kind)}</span></td><td>${esc(s.label)}</td><td style="font-size:10px">${esc(JSON.stringify(s.detail))}</td></tr>`).join('')}</tbody></table></div>`:empty('No deterioration signals in window')}
+    </div></section>
+  </div>
+
+  <h3 class="section-sub">Maintenance Execution</h3>
+  <div class="kpi-grid">
+    ${kpiCard('Open WO',m.open_wo,'WO',`${m.overdue_wo} overdue`,m.overdue_wo?'warn':'good')}
+    ${kpiCard('Emergency WO',m.emergency_wo,'EM',`${m.unassigned_critical_wo} unassigned critical`,m.emergency_wo?'warn':'')}
+    ${kpiCard('PM Compliance',fmt(m.pm_compliance_pct)+'%','PM','Target ≥ 95%',m.pm_compliance_pct>=95?'good':'warn')}
+    ${kpiCard('Schedule Compliance',fmt(m.schedule_compliance_pct)+'%','SC','Finished by target date',m.schedule_compliance_pct>=90?'good':'warn')}
+    ${kpiCard('Backlog',fmt(m.backlog_hours)+' h','BL',m.backlog_weeks!=null?`≈ ${fmt(m.backlog_weeks)} crew-weeks (${fmt(m.weekly_capacity_hours)} h/wk capacity)`:'Capacity unavailable')}
+    ${kpiCard('Repeat Failure Rate',fmt(m.repeat_failure_rate_pct)+'%','RF','Corrective share, 90 days',m.repeat_failure_rate_pct>20?'warn':'good')}
+  </div>
+  <div class="panel-grid">
+    <section class="panel"><div class="panel-head"><div><h3>Risk-Weighted Backlog</h3><p>Not age-ranked: criticality × priority × health × SLA × alarms × parts. Click to open the work order.</p></div></div><div class="panel-body">
+      <div class="kpi-grid" style="margin-bottom:10px">${kpiCard('Total Open',k.risk_backlog_summary.total_open,'T','')}${kpiCard('Critical',k.risk_backlog_summary.critical_count,'C','Emergency+Critical','warn')}${kpiCard('Risk-Weighted Score',fmt(k.risk_backlog_summary.risk_weighted_backlog),'R',`avg ${fmt(k.risk_backlog_summary.average_risk)}`)}${kpiCard('Blocked High-Risk',k.risk_backlog_summary.blocked_high_risk,'B','Parts shortage','warn')}</div>
+      <div class="table-wrap"><table class="data-table"><thead><tr><th>Risk</th><th>WO</th><th>Priority</th><th>Asset</th><th>Drivers</th></tr></thead><tbody>
+        ${(k.top_risk_contributors||[]).map(r=>`<tr class="drill-row" data-kind="work" data-id="${r.id}" title="${esc(Object.entries(r.components).map(([kk,v])=>`${kk}: +${v}`).join('  '))}"><td><strong>${fmt(r.risk_score)}</strong></td><td>${esc(r.wo_no)}</td><td>${status(r.priority)}</td><td>${esc(r.asset_no||'—')}</td><td style="font-size:10px">${r.parts_blocked?'parts · ':''}${r.overdue_days?r.overdue_days+'d overdue · ':''}${r.sla_breached?'SLA breach · ':''}${esc(r.health_band)}</td></tr>`).join('')||'<tr><td colspan="5">'+empty('No open work')+'</td></tr>'}
+      </tbody></table></div>
+    </div></section>
+    <section class="panel"><div class="panel-head"><div><h3>KPI Change Drivers</h3><p>Why did the number move vs previous period</p></div></div><div class="panel-body">
+      <div class="detail-box"><span>Availability drivers (window)</span>${(k.explanations.availability.drivers||[]).length?`<ol style="margin:6px 0 0;padding-left:16px;font-size:11px">${k.explanations.availability.drivers.map(d=>`<li>${esc(d.label)} — ${fmt(d.hours)} h <small>(${esc(d.link.record)})</small></li>`).join('')}</ol>`:'<p style="margin:4px 0 0;font-size:11px">No forced outages drove availability this window.</p>'}</div>
+      <div class="detail-box" style="margin-top:8px"><span>Maintenance movement</span><p style="margin:4px 0 0;font-size:11px">Backlog ${k.explanations.backlog.current} vs ${k.explanations.backlog.previous} (Δ ${k.explanations.backlog.delta}) · Emergency WO Δ ${k.explanations.emergency_share.delta} · PM compliance Δ ${fmt(k.explanations.pm_compliance.delta)}pp</p></div>
+    </div></section>
+  </div>
+
+  <h3 class="section-sub">Inventory, Procurement & Workforce</h3>
+  <div class="kpi-grid">
+    ${kpiCard('Stockouts',ip.stockout_items,'ST','Available stock ≤ 0',ip.stockout_items?'warn':'good')}
+    ${kpiCard('Work Blocked by Parts',ip.work_blocked_by_parts,'BP',`${ip.blocked_high_risk_work} high-risk blocked`,ip.work_blocked_by_parts?'warn':'good')}
+    ${kpiCard('Overdue POs',ip.overdue_purchase_orders,'PO',ip.avg_po_lead_time_days!=null?`Avg lead time ${fmt(ip.avg_po_lead_time_days)} d`:'No receipt history',ip.overdue_purchase_orders?'warn':'good')}
+    ${kpiCard('Technicians Available',wf.technicians_available,'TE',`${wf.technicians_dispatched} dispatched · ${wf.technicians_off_today} off`)}
+    ${kpiCard('Unassigned Critical Work',wf.unassigned_critical_work.length,'UC','Needs dispatch now',wf.unassigned_critical_work.length?'warn':'good')}
+    ${kpiCard('Open SLA Breaches',wf.sla_breached_open,'SX','Response or resolution breached',wf.sla_breached_open?'warn':'good')}
+  </div>
+  <div class="panel-grid">
+    <section class="panel"><div class="panel-head"><div><h3>Critical Stockouts</h3><p>Decision: expedite or re-plan work</p></div></div><div class="panel-body">
+      ${ip.stockouts.length?barChart(ip.stockouts.slice(0,6).map(i=>({label:i.item_no,v:i.reserved_stock})),'label','v')||'<p>All stockout items fully reserved.</p>':empty('No stockouts')}
+    </div></section>
+    <section class="panel"><div class="panel-head"><div><h3>Workload by Technician</h3><p>Open work per technician</p></div></div><div class="panel-body">
+      ${wf.workload_by_technician.length?barChart(wf.workload_by_technician.map(t=>({label:t.name,v:t.open_wo})),'label','v'):empty('No assigned open work')}
+    </div></section>
+  </div>`;
+
+  const reload=()=>render();
+  $('#kpi-days').onchange=e=>{KPI_STATE.days=Number(e.target.value);reload()};
+  $('#kpi-site').onchange=e=>{KPI_STATE.siteId=e.target.value;S.siteId=e.target.value;reload()};
+  $('#kpi-type').onchange=e=>{KPI_STATE.typeId=e.target.value;reload()};
+  $('#kpi-crit').onchange=e=>{KPI_STATE.crit=e.target.value;reload()};
+  $$('#content .drill-row').forEach(row=>{
+    row.onclick=async()=>{
+      const kind=row.dataset.kind,id=row.dataset.id;
+      if(kind==='work'&&id){await go('work');setTimeout(()=>workDetail(Number(id)),250)}
+      else if(kind==='asset'&&id){await go('assets');setTimeout(()=>assetDetail(Number(id)),250)}
+      else if(kind==='channel'){await go('telemetry')}
+    };
+  });
+}
 
 async function renderAutomation(){
   if(!roleIn('admin','maintenance_manager','executive')){$('#content').innerHTML=empty('Automation & Reports is restricted to management roles.');return}

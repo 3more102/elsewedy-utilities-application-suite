@@ -155,6 +155,12 @@ def _ensure_schema_columns(conn):
     if 'prev_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT DEFAULT ''")
     if 'audit_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN audit_hash TEXT DEFAULT ''")
 
+def _ensure_site_columns(conn):
+    """Upgraded databases get the customer-normalization column for SAIDI/SAIFI."""
+    cols=_table_columns(conn,'sites')
+    if 'customers_served' not in cols:
+        conn.execute('ALTER TABLE sites ADD COLUMN customers_served INTEGER NOT NULL DEFAULT 0')
+
 def _backfill_audit_chain(conn):
     prev=''
     for r in conn.execute('SELECT id,user_id,action,module,record_id,old_value,new_value,created_at,prev_hash,audit_hash FROM audit_logs ORDER BY id').fetchall():
@@ -211,7 +217,7 @@ def init_db(hash_password):
         CREATE TABLE IF NOT EXISTS sites(
           id INTEGER PRIMARY KEY AUTOINCREMENT, site_code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
           region TEXT NOT NULL, city TEXT NOT NULL, site_type TEXT NOT NULL, latitude REAL, longitude REAL,
-          status TEXT NOT NULL DEFAULT 'Operating', manager TEXT DEFAULT ''
+          status TEXT NOT NULL DEFAULT 'Operating', manager TEXT DEFAULT '', customers_served INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS locations(
           id INTEGER PRIMARY KEY AUTOINCREMENT, location_code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
@@ -530,6 +536,7 @@ def init_db(hash_password):
         );
         ''')
         _ensure_schema_columns(conn)
+        _ensure_site_columns(conn)
         _backfill_audit_chain(conn)
         _ensure_audit_anchor(conn)
         conn.execute('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)',(SCHEMA_VERSION,now()))

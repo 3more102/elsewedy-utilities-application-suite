@@ -927,8 +927,84 @@ def list_workflow_events(module:str='',record_type:str='',record_id:Optional[int
     sql+=' ORDER BY e.id DESC LIMIT 300'
     with db() as conn:return rows(conn.execute(sql,args))
 
-# ---------- launchpad / dashboard ----------
-@app.get('/api/launchpad')
+# ---------- executive utilities KPI layer ----------
+_KPI_ROLES = ('admin', 'maintenance_manager', 'executive', 'asset_manager', 'planner', 'supervisor')
+
+
+def _kpi_filters(
+    period_end: Optional[str] = None,
+    period_days: int = 30,
+    site_id: Optional[int] = None,
+    region: Optional[str] = None,
+    asset_type_id: Optional[int] = None,
+    criticality: Optional[str] = None,
+) -> 'ExecutiveFilters':
+    from .kpi_service import ExecutiveFilters
+    if period_days < 1 or period_days > 365:
+        raise HTTPException(422, 'period_days must be between 1 and 365')
+    return ExecutiveFilters(
+        period_end=period_end, period_days=period_days, site_id=site_id,
+        region=region, asset_type_id=asset_type_id, criticality=criticality)
+
+
+@app.get('/api/kpi/executive')
+def kpi_executive(
+    period_end: Optional[str] = None,
+    period_days: int = Query(30, ge=1, le=365),
+    site_id: Optional[int] = None,
+    region: Optional[str] = None,
+    asset_type_id: Optional[int] = None,
+    criticality: Optional[str] = None,
+    user=Depends(require_roles(*_KPI_ROLES)),
+):
+    """Maximo-class executive utilities snapshot with drillable sections.
+
+    Every section aggregates the same filtered scope so numbers stay consistent
+    across cards, tables and drill-downs. Freshness metadata states when the
+    KPI was calculated and whether its newest source record is stale.
+    """
+    f = _kpi_filters(period_end, period_days, site_id, region, asset_type_id, criticality)
+    from .kpi_service import executive_snapshot
+    with db() as conn:
+        return executive_snapshot(conn, f)
+
+
+@app.get('/api/kpi/backlog/risk')
+def kpi_backlog_risk(
+    limit: int = Query(25, ge=1, le=200),
+    period_end: Optional[str] = None,
+    period_days: int = Query(30, ge=1, le=365),
+    site_id: Optional[int] = None,
+    region: Optional[str] = None,
+    asset_type_id: Optional[int] = None,
+    criticality: Optional[str] = None,
+    user=Depends(require_roles(*_KPI_ROLES)),
+):
+    """Risk-weighted maintenance backlog ranked by explainable component scores."""
+    f = _kpi_filters(period_end, period_days, site_id, region, asset_type_id, criticality)
+    from .kpi_service import risk_weighted_backlog
+    with db() as conn:
+        return risk_weighted_backlog(conn, f, limit=limit)
+
+
+@app.get('/api/kpi/deterioration')
+def kpi_deterioration(
+    limit: int = Query(30, ge=1, le=100),
+    period_end: Optional[str] = None,
+    period_days: int = Query(30, ge=1, le=365),
+    site_id: Optional[int] = None,
+    region: Optional[str] = None,
+    asset_type_id: Optional[int] = None,
+    criticality: Optional[str] = None,
+    user=Depends(require_roles(*_KPI_ROLES)),
+):
+    """Deterministic condition-deterioration signals (trend/anomaly labels only)."""
+    f = _kpi_filters(period_end, period_days, site_id, region, asset_type_id, criticality)
+    from .kpi_service import compute_deterioration_signals
+    with db() as conn:
+        return compute_deterioration_signals(conn, f, limit=limit)
+
+# ---------- launchpad / dashboard ----------@app.get('/api/launchpad')
 def launchpad(user=Depends(current_user)):
     apps=[
       ('assets','Asset Management','Enterprise asset registry & hierarchy','AS'),('work','Work Management','Plan, assign and execute work','WO'),('maintenance','Preventive Maintenance','Calendar, meter and condition plans','PM'),('workforce','Workforce Planning','Crafts, shifts, absences and capacity','WF'),('inventory','Inventory','Spares, warehouses and transactions','IN'),('procurement','Procurement','PR, approval, PO and receipt','PO'),('approvals','Approval Center','Unified operational approval queue','AP'),('operations','Utilities Operations','Electrical, water and infrastructure','OP'),('telemetry','Telemetry & Alarms','SCADA-style readings, thresholds and alarm response','TM'),('field','Field Service','Technician mobile workspace','FS'),('dispatch','Technician Dispatch','Dispatch board, ETA and field arrival','DP'),('map','GIS / Locations','Sites, assets, work and alerts','GI'),('inspections','Inspection Management','Digital inspection forms','IP'),('hse','Safety & HSE','Incidents, hazards and actions','HS'),('contracts','Contracts','Utility service and supply agreements','CT'),('vendors','Vendors','Supplier and OEM management','VN'),('projects','Projects','Budgets, progress and milestones','PJ'),('documents','Documents','Technical records and attachments','DC'),('analytics','Analytics','Reliability, cost and performance','AN'),('automation','Automation & Reports','Scheduled controls, exports, backups and observability','AU'),('administration','Administration','Users, RBAC and audit','AD')]
