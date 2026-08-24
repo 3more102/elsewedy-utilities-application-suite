@@ -53,21 +53,6 @@ _TREND_FAMILIES: dict[str, dict] = {
                                   'path': 'unplanned_outages'},
         },
     },
-    'assets': {
-        'compute': 'compute_asset_kpis',
-        'metrics': {
-            'unavailable_assets': {
-                'label': 'Unavailable Assets', 'unit': 'assets',
-                'direction': 'lower_is_better', 'path': 'down'},
-            'critical_unavailable_assets': {
-                'label': 'Critical Unavailable Assets', 'unit': 'assets',
-                'direction': 'lower_is_better', 'path': 'critical_down'},
-            'assets_in_attention_condition': {
-                'label': 'Assets In Attention Condition', 'unit': 'assets',
-                'direction': 'lower_is_better',
-                'path': 'condition_attention'},
-        },
-    },
     'maintenance': {
         'compute': 'compute_maintenance_kpis',
         'metrics': {
@@ -114,14 +99,6 @@ _TREND_FAMILIES: dict[str, dict] = {
             'stockout_lines': {'label': 'Stockout Lines', 'unit': 'lines',
                                'direction': 'lower_is_better',
                                'path': 'stockout_items'},
-            'work_blocked_by_parts': {
-                'label': 'Work Blocked By Parts', 'unit': 'work orders',
-                'direction': 'lower_is_better',
-                'path': 'work_blocked_by_parts'},
-            'overdue_purchase_orders': {
-                'label': 'Overdue Purchase Orders', 'unit': 'purchase orders',
-                'direction': 'lower_is_better',
-                'path': 'overdue_purchase_orders'},
         },
     },
     'workforce': {
