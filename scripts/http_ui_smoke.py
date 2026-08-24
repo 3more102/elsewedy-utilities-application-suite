@@ -4,7 +4,8 @@ The check deliberately discovers CSS/JS/manifest references from the served root
 page instead of duplicating the asset list in CI. This makes the production
 container gate fail when a UI layer is referenced by HTML but missing from the
 image, served as an empty/fallback response, returned with an implausible
-content type, or exposes the ASGI server implementation through a Server header.
+content type, exposes the ASGI server implementation through a Server header,
+or accidentally publishes FastAPI documentation/schema introspection routes.
 
 Example:
     python scripts/http_ui_smoke.py http://127.0.0.1:8879
@@ -14,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 from html.parser import HTMLParser
+from urllib.error import HTTPError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
@@ -42,6 +44,15 @@ def _fetch(url: str) -> tuple[int, str, dict[str, str], bytes]:
         body = response.read()
         headers = {key.casefold(): value for key, value in response.headers.items()}
         return int(response.status), response.geturl(), headers, body
+
+
+def _fetch_allow_error(url: str) -> tuple[int, str, dict[str, str], bytes]:
+    try:
+        return _fetch(url)
+    except HTTPError as exc:
+        body = exc.read()
+        headers = {key.casefold(): value for key, value in exc.headers.items()}
+        return int(exc.code), exc.geturl(), headers, body
 
 
 def _expected_content_type(path: str) -> tuple[str, ...]:
@@ -90,6 +101,22 @@ def run(base_url: str) -> dict:
     assert 'id="login-form"' in html, 'login shell hook missing from served root'
     assert 'id="content"' in html, 'application content hook missing from served root'
 
+    private_introspection_paths = (
+        '/api/docs',
+        '/api/docs/',
+        '/openapi.json',
+        '/docs/oauth2-redirect',
+    )
+    for path in private_introspection_paths:
+        private_status, private_url, private_headers, private_body = _fetch_allow_error(
+            urljoin(base, path.lstrip('/'))
+        )
+        assert private_status == 404, (path, private_status, private_url)
+        assert urlparse(private_url).path == path, (path, private_url)
+        assert b'Not Found' in private_body, (path, private_body)
+        assert 'no-store' in private_headers.get('cache-control', '').casefold(), (path, private_headers)
+        _assert_security_headers(private_headers)
+
     parser = _AssetParser()
     parser.feed(html)
     assets = list(dict.fromkeys(parser.assets))
@@ -135,7 +162,12 @@ def run(base_url: str) -> dict:
 
         checked.append({'path': path, 'bytes': len(asset_body), 'content_type': asset_type})
 
-    return {'root_bytes': len(body), 'assets_checked': len(checked), 'assets': checked}
+    return {
+        'root_bytes': len(body),
+        'assets_checked': len(checked),
+        'private_introspection_paths_checked': len(private_introspection_paths),
+        'assets': checked,
+    }
 
 
 def main() -> int:
