@@ -417,7 +417,96 @@ async function uploadDocument(work=null){const assets=S.cache.assets||await api(
 
 window.downloadDoc=async(id,name)=>{try{const r=await fetch(`/api/documents/${id}/download`,{headers:{Authorization:'Bearer '+S.token}});if(!r.ok)throw new Error('Download failed');const b=await r.blob(),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download=name;a.click();URL.revokeObjectURL(u)}catch(e){toast(e.message)}}
 
-async function renderAnalytics(){const a=await api('/api/analytics');const s=a.summary;$('#content').innerHTML=`<div class="hero"><div><h1>Analytics</h1><p>Reliability, maintenance, workforce capacity, approvals, cost, procurement, inventory and HSE intelligence.</p></div></div><div class="kpi-grid">${kpi('MTBF',s.mtbf==null?'No failures':fmt(s.mtbf)+' h','BF',`${s.reliability_period_days}-day operating-time method`)}${kpi('MTTR',fmt(s.mttr)+' h','TR','Corrective downtime / failures')}${kpi('Availability',fmt(s.availability)+'%','AV','Operating time less corrective downtime')}${kpi('PM Compliance',s.pm_compliance+'%','PM','Preventive maintenance')}${kpi('WO Completion',s.work_order_completion_rate+'%','WO','Lifecycle completion')}${kpi('Peak Capacity',fmt(a.maintenance_forecast.summary.peak_utilization_pct)+'%','CP','90-day workforce load',a.maintenance_forecast.summary.peak_utilization_pct>100?'warn':'good')}</div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Work Trend</h3><p>Monthly work-order volume</p></div></div><div class="panel-body">${a.monthly_work.length?svgLine(a.monthly_work,'count','period'):empty('No trend data')}</div></section><section class="panel"><div class="panel-head"><div><h3>Open Backlog by Priority</h3><p>Current unresolved workload</p></div></div><div class="panel-body">${a.backlog_by_priority.length?barChart(a.backlog_by_priority,'priority','count'):empty('No backlog')}</div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Maintenance Work by Type</h3><p>Volume and actual cost</p></div></div><div class="panel-body">${barChart(a.maintenance_by_type,'work_type','count')}</div></section><section class="panel"><div class="panel-head"><div><h3>Maintenance Cost / Asset</h3><p>Actual cost concentration</p></div></div><div class="panel-body">${svgLine(a.cost_by_asset,'maintenance_cost','asset_no')}</div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Procurement Spend by Vendor</h3><p>Purchase-order commitments</p></div></div><div class="panel-body">${a.procurement_by_vendor.length?barChart(a.procurement_by_vendor,'vendor','spend'):empty('No PO spend yet')}</div></section><section class="panel"><div class="panel-head"><div><h3>Inventory Health</h3><p>Available stock vs reorder/max levels</p></div></div><div class="panel-body">${barChart(a.inventory_health,'stock_state','count')}</div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Approval Outcomes</h3><p>Workflow decisions across modules</p></div></div><div class="panel-body">${a.approval_summary.length?barChart(a.approval_summary,'status','count'):empty('No approvals')}</div></section><section class="panel"><div class="panel-head"><div><h3>HSE Risk Distribution</h3><p>Incident risk bands</p></div></div><div class="panel-body">${a.hse_by_risk.length?barChart(a.hse_by_risk,'risk_band','count'):empty('No HSE risk data')}</div></section></div><section class="panel"><div class="panel-head"><div><h3>Asset Reliability</h3><p>365-day failure, downtime, MTBF, MTTR and availability calculation.</p></div></div>${table(['Asset','Description','Failures','Downtime','MTBF','MTTR','Availability','Maintenance Cost'],a.asset_reliability.map(x=>[x.asset_no,esc(x.name),x.failures,fmt(x.downtime_hours)+' h',x.mtbf_hours==null?'—':fmt(x.mtbf_hours)+' h',fmt(x.mttr_hours)+' h',fmt(x.availability_pct)+'%',fmtMoney(x.maintenance_cost)]))}</section><section class="panel" data-csp-style="mt14"><div class="panel-head"><div><h3>Site Reliability</h3><p>Aggregated operating time and corrective downtime by utility site.</p></div></div>${table(['Site','Assets','Failures','MTBF','MTTR','Availability','Cost'],a.site_reliability.map(x=>[esc(x.site_name),x.assets,x.failures,x.mtbf_hours==null?'—':fmt(x.mtbf_hours)+' h',fmt(x.mttr_hours)+' h',fmt(x.availability_pct)+'%',fmtMoney(x.maintenance_cost)]))}</section><div class="panel-grid" data-csp-style="mt14"><section class="panel"><div class="panel-head"><div><h3>Asset Health Score</h3><p>Lowest-scoring assets requiring risk review</p></div></div>${table(['Asset','Name','Score','Risk','Condition','Priority Work'],a.asset_health_scores.slice().sort((x,y)=>x.score-y.score).slice(0,8).map(x=>[x.asset_no,esc(x.name),fmt(x.score),status(x.risk_band),status(x.condition),x.open_priority_work]))}</section><section class="panel"><div class="panel-head"><div><h3>90-Day Capacity Forecast</h3><p>Shift/absence-adjusted maintenance demand versus capacity.</p></div></div><div class="panel-body">${barChart(a.maintenance_forecast.weeks,'week_start','demand_hours')}</div></section></div><section class="panel" data-csp-style="mt14"><div class="panel-head"><div><h3>Maintenance Cost Ledger</h3><p>Posted labor, material and historical cost entries</p></div></div><div class="panel-body">${a.maintenance_cost_ledger.length?barChart(a.maintenance_cost_ledger,'cost_type','amount'):empty('No posted costs')}</div></section>`}
+async function renderAnalytics(){const [a,condRes]=await Promise.all([api('/api/analytics'),api('/api/kpi/executive'+(S.siteId?`?site_id=${S.siteId}&`:'?')+'period_days=30').then(x=>({ok:true,data:x})).catch(e=>({ok:false,message:e.message||String(e)}))]);S.cache.conditionKpis=condRes.ok?condRes.data:null;const conditionHtml=conditionIntelligenceHtml(condRes);const s=a.summary;$('#content').innerHTML=`<div class="hero"><div><h1>Analytics</h1><p>Reliability, maintenance, workforce capacity, approvals, cost, procurement, inventory and HSE intelligence.</p></div></div><div class="kpi-grid">${kpi('MTBF',s.mtbf==null?'No failures':fmt(s.mtbf)+' h','BF',`${s.reliability_period_days}-day operating-time method`)}${kpi('MTTR',fmt(s.mttr)+' h','TR','Corrective downtime / failures')}${kpi('Availability',fmt(s.availability)+'%','AV','Operating time less corrective downtime')}${kpi('PM Compliance',s.pm_compliance+'%','PM','Preventive maintenance')}${kpi('WO Completion',s.work_order_completion_rate+'%','WO','Lifecycle completion')}${kpi('Peak Capacity',fmt(a.maintenance_forecast.summary.peak_utilization_pct)+'%','CP','90-day workforce load',a.maintenance_forecast.summary.peak_utilization_pct>100?'warn':'good')}</div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Work Trend</h3><p>Monthly work-order volume</p></div></div><div class="panel-body">${a.monthly_work.length?svgLine(a.monthly_work,'count','period'):empty('No trend data')}</div></section><section class="panel"><div class="panel-head"><div><h3>Open Backlog by Priority</h3><p>Current unresolved workload</p></div></div><div class="panel-body">${a.backlog_by_priority.length?barChart(a.backlog_by_priority,'priority','count'):empty('No backlog')}</div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Maintenance Work by Type</h3><p>Volume and actual cost</p></div></div><div class="panel-body">${barChart(a.maintenance_by_type,'work_type','count')}</div></section><section class="panel"><div class="panel-head"><div><h3>Maintenance Cost / Asset</h3><p>Actual cost concentration</p></div></div><div class="panel-body">${svgLine(a.cost_by_asset,'maintenance_cost','asset_no')}</div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Procurement Spend by Vendor</h3><p>Purchase-order commitments</p></div></div><div class="panel-body">${a.procurement_by_vendor.length?barChart(a.procurement_by_vendor,'vendor','spend'):empty('No PO spend yet')}</div></section><section class="panel"><div class="panel-head"><div><h3>Inventory Health</h3><p>Available stock vs reorder/max levels</p></div></div><div class="panel-body">${barChart(a.inventory_health,'stock_state','count')}</div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Approval Outcomes</h3><p>Workflow decisions across modules</p></div></div><div class="panel-body">${a.approval_summary.length?barChart(a.approval_summary,'status','count'):empty('No approvals')}</div></section><section class="panel"><div class="panel-head"><div><h3>HSE Risk Distribution</h3><p>Incident risk bands</p></div></div><div class="panel-body">${a.hse_by_risk.length?barChart(a.hse_by_risk,'risk_band','count'):empty('No HSE risk data')}</div></section></div><section class="panel"><div class="panel-head"><div><h3>Asset Reliability</h3><p>365-day failure, downtime, MTBF, MTTR and availability calculation.</p></div></div>${table(['Asset','Description','Failures','Downtime','MTBF','MTTR','Availability','Maintenance Cost'],a.asset_reliability.map(x=>[x.asset_no,esc(x.name),x.failures,fmt(x.downtime_hours)+' h',x.mtbf_hours==null?'—':fmt(x.mtbf_hours)+' h',fmt(x.mttr_hours)+' h',fmt(x.availability_pct)+'%',fmtMoney(x.maintenance_cost)]))}</section><section class="panel" data-csp-style="mt14"><div class="panel-head"><div><h3>Site Reliability</h3><p>Aggregated operating time and corrective downtime by utility site.</p></div></div>${table(['Site','Assets','Failures','MTBF','MTTR','Availability','Cost'],a.site_reliability.map(x=>[esc(x.site_name),x.assets,x.failures,x.mtbf_hours==null?'—':fmt(x.mtbf_hours)+' h',fmt(x.mttr_hours)+' h',fmt(x.availability_pct)+'%',fmtMoney(x.maintenance_cost)]))}</section><div class="panel-grid" data-csp-style="mt14"><section class="panel"><div class="panel-head"><div><h3>Asset Health Score</h3><p>Lowest-scoring assets requiring risk review</p></div></div>${table(['Asset','Name','Score','Risk','Condition','Priority Work'],a.asset_health_scores.slice().sort((x,y)=>x.score-y.score).slice(0,8).map(x=>[x.asset_no,esc(x.name),fmt(x.score),status(x.risk_band),status(x.condition),x.open_priority_work]))}</section><section class="panel"><div class="panel-head"><div><h3>90-Day Capacity Forecast</h3><p>Shift/absence-adjusted maintenance demand versus capacity.</p></div></div><div class="panel-body">${barChart(a.maintenance_forecast.weeks,'week_start','demand_hours')}</div></section></div><section class="panel" data-csp-style="mt14"><div class="panel-head"><div><h3>Maintenance Cost Ledger</h3><p>Posted labor, material and historical cost entries</p></div></div><div class="panel-body">${a.maintenance_cost_ledger.length?barChart(a.maintenance_cost_ledger,'cost_type','amount'):empty('No posted costs')}</div></section>${conditionHtml}`};bindConditionIntelligence()
+function conditionIntelligenceHtml(res){
+  if(!res.ok){
+    return `<section class="panel"><div class="panel-head"><div><h3>Condition Intelligence</h3><p>Alarm and condition signals from the canonical KPI service</p></div></div><div class="panel-body">${empty('Condition intelligence unavailable: '+res.message)}<button class="btn" data-cond-retry="1">Retry</button></div></section>`
+  }
+  const d=res.data,c=d.condition||{},scopeNote=`Scope: ${d.filters_applied&&d.filters_applied.site_id?('site #'+d.filters_applied.site_id):'all sites'} · last ${d.filters_applied?d.filters_applied.period_days:30} days`
+  const cards=[
+    {metric:'active_alarms',label:'Active Alarms',value:c.active_alarms},
+    {metric:'critical_active_alarms',label:'Critical Alarms',value:c.critical_active_alarms,cls:(Number(c.critical_active_alarms)||0)>0?'bad':'good'},
+    {metric:'unacknowledged_alarms',label:'Unacknowledged',value:c.unacknowledged_alarms,cls:(Number(c.unacknowledged_alarms)||0)>0?'warn':''},
+    {metric:'alarm_storms',label:'Alarm Storms',value:Array.isArray(c.alarm_storms)?c.alarm_storms.length:null,cls:(Array.isArray(c.alarm_storms)&&c.alarm_storms.length)?'bad':'good'},
+    {metric:'repeated_alarm_assets',label:'Repeated-Alarm Assets',value:Array.isArray(c.repeated_alarm_assets)?c.repeated_alarm_assets.length:null,cls:(Array.isArray(c.repeated_alarm_assets)&&c.repeated_alarm_assets.length)?'warn':'good'},
+  ].map(x=>`<article class="kpi"><div class="kpi-top"><span class="kpi-label">${esc(x.label)}</span><span class="kpi-ico">CI</span></div><div class="kpi-value">${x.value==null?'Unavailable':fmt(x.value)}</div><div class="trend ${x.cls||''}"><button class="btn small" data-cond-why="${x.metric}" aria-label="Explain why ${esc(x.label)} changed">Why?</button> <span data-cond-spark-label="${x.metric}"></span></div></article>`).join('')
+  const contributors=c.contributors||[]
+  const contribRows=contributors.map((al,i)=>[
+    esc(al.alarm_no),status(al.severity),status(al.status),fmt(al.occurrence_count),
+    al.hours_open==null?'—':fmt(al.hours_open),
+    esc(al.channel_code||'—'),esc(al.asset_no||'—'),esc(al.site_name||'—'),
+    `<button class="btn small" data-cond-open="${i}" aria-label="Open alarm ${esc(al.alarm_no)} in telemetry context">Open</button>`
+  ])
+  return `<section class="panel"><div class="panel-head"><div><h3>Condition Intelligence</h3><p>${esc(scopeNote)} · freshness ${esc((d.freshness&&d.freshness.calculated_at)||'n/a')}</p></div><div><button class="btn small" data-cond-retry="1" aria-label="Reload condition intelligence">Reload</button></div></div><div class="panel-body"><div class="kpi-grid">${cards}</div>
+    <h4 class="subhead">Trend (chronological, oldest first)</h4>
+    <div data-cond-trends>${empty('Loading trends…')}</div>
+    <h4 class="subhead">Most severe active alarms (backend-ranked)</h4>
+    ${contribRows.length?table(['Alarm','Severity','Status','Occurrences','Hours open','Channel','Asset','Site',''],contribRows):empty('No active alarms recorded in scope')}
+  </div></section>`
+}
+function bindConditionIntelligence(){
+  const retry=$('[data-cond-retry]');if(retry)retry.onclick=()=>renderAnalytics()
+  $$('[data-cond-why]').forEach(b=>{b.onclick=()=>kpiConditionWhy(b.dataset.condWhy)})
+  $$('[data-cond-open]').forEach(b=>{b.onclick=()=>openConditionContributor(Number(b.dataset.condOpen))})
+  const trendHost=$('[data-cond-trends]')
+  if(trendHost){
+    const metrics=[['active_alarms','Active Alarms'],['critical_active_alarms','Critical Alarms'],['unacknowledged_alarms','Unacknowledged']]
+    Promise.all(metrics.map(([metric,label])=>
+      api(`/api/kpi/trend?family=condition&metric=${metric}&samples=12${S.siteId?`&site_id=${S.siteId}`:''}`)
+        .then(t=>({t,label})).catch(e=>({error:e.message||String(e),label}))
+    )).then(results=>{
+      if(!trendHost.isConnected)return
+      trendHost.innerHTML=results.map(r=>r.error
+        ?empty(`${r.label}: ${r.error}`)
+        :`<div data-csp-style="mt12"><p><b>${esc(r.label)}</b> — ${esc(r.t.unit)} (min ${fmt(r.t.min)} / max ${fmt(r.t.max)})</p>${svgLine(r.t.samples,'value','period_end')}</div>`).join('')
+    })
+  }
+}
+async function kpiConditionWhy(metric){
+  try{
+    const e=await api(`/api/kpi/explanation?family=condition&metric=${metric}${S.siteId?`&site_id=${S.siteId}`:''}&period_days=30`)
+    const driverRows=(e.drivers||[]).map(d=>[
+      status(d.kind),esc(d.label||'—'),
+      d.magnitude==null?'—':fmt(d.magnitude)+(d.unit?' '+d.unit:''),
+      status(d.attribution),
+      d.drill?`<button class="btn small" data-driver-go="${esc(d.drill.module)}" aria-label="Open ${esc(d.label||'source record')}">Open source</button>`:'—'
+    ])
+    openModal(`Why did ${e.label} change?`,`
+      <p><b>Current:</b> ${e.value==null?'Unavailable':fmt(e.value)+' '+esc(e.unit)} · <b>Previous:</b> ${e.previous_value==null?'Unavailable':fmt(e.previous_value)} · <b>Delta:</b> ${e.delta==null?'—':fmt(e.delta)}${e.improved==null?'':(e.improved?' (improved)':' (worsened)')}</p>
+      ${driverRows.length?table(['Kind','Driver','Magnitude','Attribution',''],driverRows):empty('No measured drivers observed between the two windows')}
+      <p class="trend">${esc(e.summary)}</p>
+      <p class="trend warn">${esc(e.disclaimer)}</p>`)
+    $$('#modal-body [data-driver-go]').forEach(b=>{b.onclick=()=>{closeModal();go(b.dataset.driverGo)}})
+  }catch(err){toast(err.message||'Unable to load explanation')}
+}
+function openConditionContributor(idx){
+  const list=((S.cache.conditionKpis||{}).condition||{}).contributors||[]
+  const al=list[idx]
+  if(!al)return
+  const canManage=roleIn('admin','asset_manager','maintenance_manager','planner','supervisor')
+  openModal(`Alarm ${al.alarm_no}`,`
+    <p><b>Severity:</b> ${status(al.severity)} · <b>Status:</b> ${status(al.status)}</p>
+    <p><b>Asset:</b> ${esc(al.asset_no||'—')} · <b>Channel:</b> ${esc(al.channel_code||'—')} · <b>Site:</b> ${esc(al.site_name||'—')}</p>
+    <p><b>Occurrences:</b> ${fmt(al.occurrence_count)} · <b>Hours open:</b> ${al.hours_open==null?'—':fmt(al.hours_open)}</p>
+    <div class="form-actions">
+      ${al.status==='Open'?'<button class="btn" id="cond-ack">Acknowledge</button>':''}
+      ${canManage?'<button class="btn primary" id="cond-wo">Create work order</button>':''}
+      ${canManage?'<button class="btn" id="cond-close">Close alarm</button>':''}
+      <button class="btn" id="cond-go-telemetry">Open telemetry module</button>
+    </div>`)
+  const ack=$('#cond-ack');if(ack)ack.onclick=()=>kpiCondAction('acknowledge',al.alarm_id)
+  const woBtn=$('#cond-wo');if(woBtn)woBtn.onclick=()=>{closeModal();alarmToWork(al.alarm_id)}
+  const closeBtn=$('#cond-close');if(closeBtn)closeBtn.onclick=()=>kpiCondAction('close',al.alarm_id)
+  $('#cond-go-telemetry').onclick=()=>{closeModal();go('telemetry')}
+}
+async function kpiCondAction(action,alarmId){
+  try{
+    await api(`/api/alarms/${Number(alarmId)}/${action}`,{method:'POST'})
+    toast(action==='close'?'Alarm closed':'Alarm acknowledged')
+    closeModal()
+    renderAnalytics()
+  }catch(e){toast(e.message)}
+}
 
 async function renderAutomation(){
   if(!roleIn('admin','maintenance_manager','executive')){$('#content').innerHTML=empty('Automation & Reports is restricted to management roles.');return}
