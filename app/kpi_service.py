@@ -1237,6 +1237,56 @@ def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
         ' GROUP BY a.id HAVING COUNT(*)>=2 ORDER BY incidents DESC LIMIT 10',
         scope_args + [cutoff90]))
 
+    # Deterministic, evidence-backed recommendations. Labels follow the
+    # existing convention (risk_indicator / repeat_incident /
+    # corrective_action_needed); nothing predicts future safety events.
+    recommendations: list[dict] = []
+    seen_keys: set[tuple] = set()
+
+    def _recommend(kind: str, subject_key: tuple, **payload):
+        if subject_key in seen_keys:
+            return
+        seen_keys.add(subject_key)
+        recommendations.append({'kind': kind, **payload})
+
+    high_risk_open_rows = _rows(conn.execute(
+        'SELECT h.id, h.incident_no, h.title, h.site_id, s.name site_name' + base +
+        open_where + ' AND h.risk_score>=? ORDER BY h.risk_score DESC LIMIT 20',
+        scope_args + [HSE_HIGH_RISK_SCORE]))
+    for r in high_risk_open_rows:
+        _recommend(
+            'corrective_action_needed',
+            ('corrective_action_needed', r['id']),
+            incident_id=r['id'], incident_no=r['incident_no'],
+            label=f"{r['incident_no']} — {r['title']}",
+            site_name=r['site_name'],
+            action='Open corrective work through the standard work-management flow')
+
+    for r in repeat_locations:
+        _recommend(
+            'repeat_incident',
+            ('repeat_incident', 'location', r['location_id']),
+            location_id=r['location_id'], label=r['location_name'],
+            incidents=int(r['incidents']),
+            action='Recommend HSE/reliability investigation of this location')
+    for r in repeat_assets:
+        _recommend(
+            'repeat_incident',
+            ('repeat_incident', 'asset', r['asset_id']),
+            asset_id=r['asset_id'], asset_no=r['asset_no'], label=r['asset_no'],
+            incidents=int(r['incidents']),
+            action='Recommend HSE/reliability investigation of this asset')
+
+    window_high = sum(1 for r in trend_rows
+                      if float(r['risk_score'] or 0) >= HSE_HIGH_RISK_SCORE)
+    if window_high >= 2:
+        _recommend(
+            'risk_indicator',
+            ('risk_indicator', w['period_start']),
+            high_risk_in_window=window_high,
+            label=f'{window_high} high-risk incidents recorded in the current window',
+            action='Review weekly trend and contributor concentration')
+
     return {
         'open_incidents': open_incidents,
         'high_risk_open': high_risk_open,
@@ -1261,6 +1311,7 @@ def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
             {**r, 'incidents': int(r['incidents'])} for r in repeat_locations],
         'repeat_assets_90d': [
             {**r, 'incidents': int(r['incidents'])} for r in repeat_assets],
+        'recommendations': recommendations,
         'correlation_note': ('contributor rankings correlate incident records; '
                              'causality requires completed investigation data'),
         'unavailable': {

@@ -335,16 +335,24 @@ async function renderAnalytics(){
   <div class="panel-grid">
     <section class="panel"><div class="panel-head"><div><h3>Weekly Incident Trend</h3><p>Incidents and high-risk incidents per week — click a contributor to open the safety register.</p></div></div><div class="panel-body">
       ${(k.hse.trend||[]).length?sparkBars(k.hse.trend,'incidents','period'):empty('No incidents recorded in window')}
+      <h3 class="section-sub">Severity distribution (window)</h3>
+      ${barChart(Object.entries(k.hse.severity_distribution_window||{}).filter(([,v])=>v>0).map(([sev,v])=>({label:'Severity '+sev,v})),'label','v')||empty('No incidents')}
       <div class="table-wrap" style="margin-top:10px"><table class="data-table"><thead><tr><th>Contributor</th><th>Incidents</th><th>High risk</th><th>Example</th></tr></thead><tbody>
         ${[...k.hse.contributors_by_site.map(x=>({kind:'Site',...x})),...k.hse.contributors_by_type.map(x=>({kind:'Type',...x})),...k.hse.contributors_by_asset.map(x=>({kind:'Asset',...x}))].slice(0,8).map(x=>`<tr class="drill-row" data-kind="hse" style="cursor:pointer"><td>${x.kind}: ${esc(x.label)}</td><td>${x.incidents}</td><td>${x.high_risk}</td><td style="font-size:10px">${esc(x.example_incident_no||'')}</td></tr>`).join('')||'<tr><td colspan="4">'+empty('No incidents in window')+'</td></tr>'}
       </tbody></table></div>
     </div></section>
     <section class="panel"><div class="panel-head"><div><h3>Safety Metrics Honesty</h3><p>What EUAS can and cannot compute from stored data</p></div></div><div class="panel-body">
       <div class="detail-box"><span>Risk bands (existing taxonomy)</span><p style="margin:4px 0 0;font-size:11px">${Object.entries(k.hse.risk_band_distribution||{}).map(([b,n])=>`${b}: ${n}`).join(' · ')||'No records'}</p></div>
+      ${(k.hse.repeat_locations_90d||[]).length||(k.hse.repeat_assets_90d||[]).length?`<div class="detail-box" style="margin-top:8px"><span>Repeat warnings (90 days)</span><p style="margin:4px 0 0;font-size:11px">${[...(k.hse.repeat_locations_90d||[]).map(x=>'📍 '+esc(x.location_name)+' ×'+x.incidents),...(k.hse.repeat_assets_90d||[]).map(x=>esc(x.asset_no)+' ×'+x.incidents)].join(' · ')}</p></div>`:''}
       <div class="detail-box" style="margin-top:8px"><span>Explicitly unavailable</span>${Object.entries(k.hse.unavailable||{}).map(([m,r])=>`<p style="margin:4px 0 0;font-size:11px"><strong>${esc(m)}</strong>: ${esc(r)}</p>`).join('')}</div>
       <p class="section-sub">${esc(k.hse.correlation_note)}</p>
     </div></section>
-  </div>`;
+  </div>
+  ${(k.hse.recommendations||[]).length?`<section class="panel" style="margin-bottom:14px"><div class="panel-head"><div><h3>Safety Recommendations</h3><p>Deterministic, evidence-backed. Corrective work uses the standard work-management flow with its own authorization and audit.</p></div></div><div class="panel-body">
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Kind</th><th>Subject</th><th>Recommended action</th><th></th></tr></thead><tbody>
+      ${k.hse.recommendations.map(rec=>`<tr><td><span class="status ${rec.kind==='corrective_action_needed'?'Critical':rec.kind==='repeat_incident'?'Warning':'Info'}">${esc(rec.kind)}</span></td><td>${esc(rec.label||'')}</td><td style="font-size:10px">${esc(rec.action)}</td><td>${rec.incident_id&&canWork()?`<button class="btn small" data-hse-wo="${rec.incident_id}" title="Uses the standard Create Work Order flow, prefilled from this incident. Creation stays subject to work-management permissions and audit.">Plan corrective WO</button>`:''}${rec.incident_id?`<button class="btn small" data-hse-view="${rec.incident_id}">View register</button>`:''}</td></tr>`).join('')}
+    </tbody></table></div>
+  </div></section>`:''}`;
 
   const reload=()=>render();
   $('#kpi-days').onchange=e=>{KPI_STATE.days=Number(e.target.value);reload()};
@@ -365,6 +373,16 @@ async function renderAnalytics(){
     }catch(err){$('#kpi-shortage-body').innerHTML=empty(err.message)}
   };
   $('#kpi-shortages-refresh').onclick=loadShortages;
+  $$('[data-hse-view]').forEach(b=>b.onclick=()=>go('hse'));
+  $$('[data-hse-wo]').forEach(b=>b.onclick=async()=>{
+    const incidentId=Number(b.dataset.hsewo);
+    try{
+      const list=S.cache.hse||await api('/api/hse');
+      const h=list.find(x=>x.id===incidentId);
+      if(!h){toast('Open the safety register to load incidents first');return}
+      newCorrectiveWorkFromIncident(h);
+    }catch(err){toast(err.message)}
+  });
   $$('#content .drill-row').forEach(row=>{
     row.onclick=async()=>{
       const kind=row.dataset.kind,id=row.dataset.id;
@@ -375,6 +393,22 @@ async function renderAnalytics(){
       else if(kind==='channel'){await go('telemetry')}
     };
   });
+}
+
+function newCorrectiveWorkFromIncident(h){
+  if(!canWork()){toast('Work-order creation requires work-management permissions');return}
+  newWorkOrder();
+  setTimeout(()=>{
+    const f=$('#dynamic-form');if(!f)return;
+    const set=(name,value)=>{const el=f.querySelector(`[name="${name}"]`);if(el&&value!=null)el.value=value};
+    set('title',`Corrective action for ${h.incident_no} — ${h.title}`);
+    set('work_type','Safety');
+    set('priority',h.risk_score>=12?'Critical':'High');
+    set('safety_requirements',`Source incident ${h.incident_no} (risk score ${h.risk_score}). ${h.corrective_action||''}`.trim());
+    set('description',`Raised from HSE incident ${h.incident_no} recorded at ${h.occurred_at||'unknown time'}.`);
+    if(h.asset_id)set('asset_id',String(h.asset_id));
+    if(h.location_id)set('location_id',String(h.location_id));
+  },60);
 }
 
 function customersModal(sites){

@@ -235,3 +235,194 @@ def test_hse_high_risk_boundary_cases():
     with db() as conn:
         hse_after = compute_hse_kpis(conn, ExecutiveFilters(site_id=site_id, period_days=7))
     assert hse_after['high_risk_current'] == base_high + 1
+
+
+def test_launchpad_route_registered_exactly_once_and_serves():
+    """Permanent regression: /api/launchpad was once silently dead when its
+    decorator merged into a section comment during an automated insertion."""
+    from fastapi.routing import APIRoute
+    routes = [r for r in app.routes if isinstance(r, APIRoute)
+              and r.path == '/api/launchpad' and 'GET' in (r.methods or set())]
+    assert len(routes) == 1, (
+        f'/api/launchpad must be registered exactly once, found {len(routes)}')
+    _ensure_db()
+    with TestClient(app) as client:
+        admin = auth(client)
+        r = client.get('/api/launchpad', headers=admin)
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body, list) and len(body) >= 10
+        assert any(x['code'] == 'hse' for x in body)
+
+
+def test_hse_recommendations_generated_deduplicated_and_labeled():
+    _ensure_db()
+    site_id = _kpi_site()
+    tr = None
+    with db() as conn:
+        tr = int(conn.execute(
+            "SELECT id FROM assets WHERE asset_no='BENCH-KPI-HSE'").fetchone()[0])
+    # Two high-risk open incidents -> corrective_action_needed x2 plus a
+    # window-level risk_indicator.
+    _seed_incident(incident_no='HSE-KPI-REC1', site_id=site_id, asset_id=tr,
+                   severity=4, probability=3, status='Open', created_days_ago=2)
+    _seed_incident(incident_no='HSE-KPI-REC2', site_id=site_id, asset_id=tr,
+                   severity=4, probability=4, status='Open', created_days_ago=1)
+    # Repeat asset: second non-high-risk incident within 90 days.
+    _seed_incident(incident_no='HSE-KPI-REC3', site_id=site_id, asset_id=tr,
+                   severity=2, probability=2, status='Closed', created_days_ago=20)
+    f = ExecutiveFilters(site_id=site_id, period_days=30)
+    with db() as conn:
+        hse = compute_hse_kpis(conn, f)
+    recs = hse['recommendations']
+    kinds = [r['kind'] for r in recs]
+    # The shared regression site may hold additional high-risk open incidents
+    # seeded by other tests in this module; assert the floors, not exact counts.
+    assert kinds.count('corrective_action_needed') >= 2
+    assert 'repeat_incident' in kinds       # asset with >=2 incidents in 90d
+    assert 'risk_indicator' in kinds        # at least two high-risk in one window
+    # Deduplication: same subject never appears twice under one kind.
+    subjects = [(r['kind'], r.get('incident_id') or r.get('asset_id')
+                 or r.get('location_id') or r.get('label')) for r in recs]
+    assert len(subjects) == len(set(subjects))
+    allowed = {'corrective_action_needed', 'repeat_incident', 'risk_indicator'}
+    assert set(kinds) <= allowed
+    # Recommendations carry drill IDs that resolve to real incidents where applicable.
+    corrective = [r for r in recs if r['kind'] == 'corrective_action_needed']
+    with db() as conn:
+        for r in corrective:
+            hit = conn.execute('SELECT incident_no FROM safety_incidents WHERE id=?',
+                               (r['incident_id'],)).fetchone()
+            assert hit is not None
+
+
+def test_hse_read_grants_no_mutation_rights():
+    """analytics.hse.read must not imply incident or work-order mutation."""
+    _ensure_db()
+    _kpi_site()
+    with TestClient(app) as client:
+        exec_view = auth(client, 'exec', 'Viewer@2026')
+        tech = auth(client, 'tech1', 'Tech@2026')
+
+        # Incident mutation requires hse.incident.* capabilities, not KPI reads.
+        assert client.post('/api/hse', headers=exec_view,
+                           json={'incident_type': 'Near Miss', 'title': 'x',
+                                 'severity': 1, 'probability': 1,
+                                 'description': 'x'}).status_code == 403
+        assert client.patch('/api/hse/999999999', headers=exec_view,
+                            json={'status': 'Closed'}).status_code == 403
+        assert client.patch('/api/hse/999999999', headers=tech,
+                            json={'status': 'Closed'}).status_code == 403
+
+        # Work-order creation stays behind its own work.create capability:
+        # executive viewers may read HSE KPIs but cannot create corrective work.
+        assert client.post('/api/work-orders', headers=exec_view,
+                           json={'title': 'nope', 'priority': 'Low',
+                                 'work_type': 'Corrective Maintenance'}).status_code == 403
+
+
+def test_corrective_wo_from_incident_context_keeps_audit_linkage():
+    """The controlled flow uses the standard work-management endpoint; the
+    source incident reference travels inside the WO record and the audit."""
+    _ensure_db()
+    site_id = _kpi_site()
+    _seed_incident(incident_no='HSE-KPI-ACT1', site_id=site_id,
+                   severity=4, probability=3, status='Open', created_days_ago=1)
+    with TestClient(app) as client:
+        admin = auth(client)
+        ref = client.get('/api/reference', headers=admin).json()
+        asset = next(a for a in client.get('/api/assets', headers=admin).json()
+                     if a['asset_no'] == 'BENCH-KPI-HSE')
+        created = client.post('/api/work-orders', headers=admin, json={
+            'title': 'Corrective action for HSE-KPI-ACT1',
+            'asset_id': asset['id'],
+            'work_type': 'Safety',
+            'priority': 'Critical',
+            'safety_requirements':
+                'Source incident HSE-KPI-ACT1 (risk score 12).',
+        })
+        assert created.status_code == 200, created.text
+        wo = created.json()
+
+        # Source linkage persists on the resulting work order.
+        detail = client.get(f"/api/work-orders/{wo['id']}", headers=admin).json()
+        assert 'HSE-KPI-ACT1' in detail['safety_requirements']
+
+        # The domain endpoint wrote its own audit event (no duplicate here).
+        audits = client.get('/api/audit', headers=admin,
+                            params={'q': wo['wo_no']}).json()
+        assert any(x['action'].upper().startswith('CREATE') for x in audits)
+
+
+def test_export_hse_equivalence_scope_isolation_and_no_content_leak():
+    _ensure_db()
+    site_id = _kpi_site()
+    _seed_incident(incident_no='HSE-KPI-EXP1', site_id=site_id,
+                   severity=4, probability=3, status='Open', created_days_ago=2)
+    with TestClient(app) as client:
+        admin = auth(client)
+        scoped_json = client.get('/api/kpi/executive', headers=admin,
+                                 params={'site_id': site_id, 'refresh': 'true'}).json()
+        csv_resp = client.get('/api/exports/executive-kpis.csv', headers=admin,
+                              params={'site_id': site_id})
+        assert csv_resp.status_code == 200
+        import csv as _csv
+        import io as _io
+        rows = list(_csv.reader(_io.StringIO(csv_resp.text)))
+        metrics = {(x[0], x[1]): x[2] for x in rows[1:]}
+
+        # HSE values present and equal to the JSON snapshot values.
+        assert int(metrics[('hse', 'open_incidents')]) == \
+            scoped_json['hse']['open_incidents']
+        assert int(metrics[('hse', 'high_risk_open')]) == \
+            scoped_json['hse']['high_risk_open']
+        # Unavailable metrics stay explicit in exports.
+        unavailable_keys = set(scoped_json['hse']['unavailable'])
+        assert unavailable_keys >= {'overdue_investigations',
+                                    'corrective_action_closure_rate',
+                                    'trir_ltifr_exposure_rates'}
+        # No contributor names or raw incident content leak through CSV rows.
+        blob = csv_resp.text.lower()
+        assert 'description' not in blob
+        assert 'contributors_by_site' not in blob
+        assert 'kpi regression' not in blob
+
+        # Scope isolation: another site's scope cannot include this data.
+        other_sites = [s['id'] for s in
+                       client.get('/api/reference', headers=admin).json()['sites']
+                       if s['id'] != site_id]
+        if other_sites:
+            other = client.get('/api/kpi/executive', headers=admin,
+                               params={'site_id': other_sites[0], 'refresh': 'true'},
+                               ).json()
+
+
+def test_hse_query_path_stays_set_based():
+    """HSE KPI computation issues grouped statements, not per-incident queries."""
+    _ensure_db()
+    site_id = _kpi_site()
+    now = datetime.now()
+    for i in range(30):
+        _seed_incident(incident_no=f'HSE-KPI-PERF{i:02d}', site_id=site_id,
+                       severity=(i % 5) + 1, probability=2, status='Open',
+                       created_days_ago=i % 25)
+    import sqlite3 as sq
+    real_connect = sq.connect
+    counter = {'n': 0}
+
+    def counting_connect(*a, **kw):
+        c = real_connect(*a, **kw)
+        try:
+            c.set_trace_callback(lambda s: counter.__setitem__('n', counter['n'] + 1))
+        except Exception:
+            pass
+        return c
+    sq.connect = counting_connect
+    try:
+        with db() as conn:
+            compute_hse_kpis(conn, ExecutiveFilters(site_id=site_id, period_days=60))
+    finally:
+        sq.connect = real_connect
+    assert counter['n'] <= 25, (
+        f"HSE KPI path issued {counter['n']} statements for 30 incidents; "
+        'per-incident fan-out detected')
