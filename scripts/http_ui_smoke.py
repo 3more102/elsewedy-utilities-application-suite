@@ -5,8 +5,9 @@ page instead of duplicating the asset list in CI. This makes the production
 container gate fail when a UI layer is referenced by HTML but missing from the
 image, served as an empty/fallback response, returned with an implausible
 content type, exposes the ASGI server implementation through a Server header,
-accidentally publishes FastAPI documentation/schema introspection routes, or
-loses the production cross-origin isolation header contract.
+accidentally publishes FastAPI documentation/schema introspection routes, loses
+the production cross-origin isolation header contract, or reflects unsafe
+client-controlled request correlation IDs.
 
 Example:
     python scripts/http_ui_smoke.py http://127.0.0.1:8879
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from html.parser import HTMLParser
 from urllib.error import HTTPError
 from urllib.parse import urljoin, urlparse
@@ -39,8 +41,10 @@ class _AssetParser(HTMLParser):
             self.assets.append(str(candidate))
 
 
-def _fetch(url: str) -> tuple[int, str, dict[str, str], bytes]:
-    request = Request(url, headers={'User-Agent': 'EUAS-production-ui-smoke/1.0'})
+def _fetch(url: str, extra_headers: dict[str, str] | None = None) -> tuple[int, str, dict[str, str], bytes]:
+    request_headers = {'User-Agent': 'EUAS-production-ui-smoke/1.0'}
+    request_headers.update(extra_headers or {})
+    request = Request(url, headers=request_headers)
     with urlopen(request, timeout=10) as response:
         body = response.read()
         headers = {key.casefold(): value for key, value in response.headers.items()}
@@ -89,6 +93,11 @@ def _assert_security_headers(headers: dict[str, str]) -> None:
     assert "'unsafe-inline'" not in csp, csp
 
 
+def _assert_generated_request_id(value: str | None) -> None:
+    assert value is not None, 'missing X-Request-ID response header'
+    assert re.fullmatch(r'[0-9a-f]{32}', value), value
+
+
 def run(base_url: str) -> dict:
     base = base_url.rstrip('/') + '/'
     status, final_url, headers, body = _fetch(base)
@@ -98,11 +107,39 @@ def run(base_url: str) -> dict:
     assert 'text/html' in content_type, content_type
     assert body, 'root HTML response is empty'
     _assert_security_headers(headers)
+    _assert_generated_request_id(headers.get('x-request-id'))
 
     html = body.decode('utf-8')
     assert '<title>EUAS' in html, 'served root is not the EUAS browser shell'
     assert 'id="login-form"' in html, 'login shell hook missing from served root'
     assert 'id="content"' in html, 'application content hook missing from served root'
+
+    health_url = urljoin(base, 'api/health')
+    valid_request_id = 'EUAS.smoke-req_123:abc'
+    valid_status, _, valid_headers, _ = _fetch(
+        health_url,
+        {'X-Request-ID': valid_request_id},
+    )
+    assert valid_status == 200
+    assert valid_headers.get('x-request-id') == valid_request_id, valid_headers
+
+    overlong_request_id = 'x' * 65
+    overlong_status, _, overlong_headers, _ = _fetch(
+        health_url,
+        {'X-Request-ID': overlong_request_id},
+    )
+    assert overlong_status == 200
+    _assert_generated_request_id(overlong_headers.get('x-request-id'))
+    assert overlong_headers.get('x-request-id') != overlong_request_id
+
+    malformed_request_id = 'invalid request id with spaces'
+    malformed_status, _, malformed_headers, _ = _fetch(
+        health_url,
+        {'X-Request-ID': malformed_request_id},
+    )
+    assert malformed_status == 200
+    _assert_generated_request_id(malformed_headers.get('x-request-id'))
+    assert malformed_headers.get('x-request-id') != malformed_request_id
 
     private_introspection_paths = (
         '/api/docs',
@@ -149,6 +186,7 @@ def run(base_url: str) -> dict:
         if expected:
             assert any(token in asset_type for token in expected), (path, asset_type)
         _assert_security_headers(asset_headers)
+        _assert_generated_request_id(asset_headers.get('x-request-id'))
 
         if path == '/static/help-security.js':
             help_script = asset_body.decode('utf-8')
@@ -169,6 +207,7 @@ def run(base_url: str) -> dict:
         'root_bytes': len(body),
         'assets_checked': len(checked),
         'private_introspection_paths_checked': len(private_introspection_paths),
+        'request_id_cases_checked': 4,
         'assets': checked,
     }
 
