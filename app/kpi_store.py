@@ -153,6 +153,7 @@ def _window_metrics(
         customers = outage.get('customer_count')
         entry = {
             'outage_no': outage['outage_no'],
+            'asset_id': outage.get('asset_id'),
             'asset_no': outage.get('asset_no'),
             'asset_name': outage.get('asset_name'),
             'duration_hours': round(duration, 3),
@@ -511,6 +512,7 @@ def compute_inventory_kpis(conn, slow_moving_days: int = 90) -> dict:
             if not covered:
                 uncovered_reorder += 1
                 contributors.append({
+                    'item_id': int(item['id']),
                     'item_no': item['item_no'],
                     'name': item['name'],
                     'available': round(available, 3),

@@ -27,6 +27,128 @@ $('#modal-close').onclick=closeModal;$('#modal-layer').onclick=e=>{if(e.target.i
 function formModal(title,fields,onSubmit,submit='Save'){openModal(title,`<form id="dynamic-form" class="form-grid">${fields.join('')}<div class="form-actions"><button type="button" class="btn" id="cancel-form">Cancel</button><button class="btn primary">${esc(submit)}</button></div></form>`);$('#cancel-form').onclick=closeModal;$('#dynamic-form').onsubmit=async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(e.target));try{await onSubmit(data,e.target);closeModal();toast('Saved successfully');await render()}catch(err){toast(err.message)}}}
 function table(headers,rows){return `<div class="table-wrap"><table class="data-table"><thead><tr>${headers.map(x=>`<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.length?rows.map(r=>`<tr>${r.map(x=>`<td>${x}</td>`).join('')}</tr>`).join(''):`<tr><td colspan="${headers.length}">${empty('No records found')}</td></tr>`}</tbody></table></div>`}
 function kpi(label,value,icon,hint='',cls=''){return `<article class="kpi"><div class="kpi-top"><span class="kpi-label">${esc(label)}</span><span class="kpi-ico">${esc(icon)}</span></div><div class="kpi-value">${value}</div><div class="trend ${cls}">${hint}</div></article>`}
+function kpiTrendHtml(current,previous,lowerIsBetter){
+  if(current==null||previous==null||Number(previous)===0)return '<div class="trend">No previous-period baseline</div>'
+  const delta=Number(current)-Number(previous)
+  if(Number(delta)===0)return '<div class="trend">▪ No change vs previous period</div>'
+  const pct=Math.abs(delta/Number(previous)*100).toFixed(1)
+  const improved=lowerIsBetter?delta<0:delta>0
+  return `<div class="trend ${improved?'good':'bad'}">${delta<0?'▾':'▴'} ${pct}% vs previous period (${fmt(Math.abs(previous))})</div>`
+}
+function reliabilityIndexCard(k){
+  if((k.missing_inputs||[]).length){
+    return `<article class="kpi"><div class="kpi-top"><span class="kpi-label">${esc(k.id.toUpperCase())}</span><span class="kpi-ico">RI</span></div><div class="kpi-value" title="${esc(k.definition)}">Unavailable</div><div class="trend warn">Missing data: ${k.missing_inputs.map(esc).join(', ')}</div></article>`
+  }
+  return `<article class="kpi"><div class="kpi-top"><span class="kpi-label" title="${esc(k.definition)}">${esc(k.id.toUpperCase())}</span><span class="kpi-ico">RI</span></div><div class="kpi-value">${fmt(k.value)}${k.unit==='%'?'%':''}</div>${kpiTrendHtml(k.value,k.previous_value,k.direction==='lower_is_better')}</article>`
+}
+function inventoryIndexCard(k,renderValue){
+  return `<article class="kpi"><div class="kpi-top"><span class="kpi-label" title="${esc(k.definition)}">${esc(k.name)}</span><span class="kpi-ico">IV</span></div><div class="kpi-value">${renderValue}</div><div class="trend">${esc(k.formula)}</div></article>`
+}
+function kpiFamilyPanel(title,subtitle,bodyHtml,actions=''){
+  return `<section class="panel"><div class="panel-head"><div><h3>${title}</h3><p>${subtitle}</p></div>${actions?`<div>${actions}</div>`:''}</div><div class="panel-body">${bodyHtml}</div></section>`
+}
+function reliabilityPanel(relRes){
+  if(!relRes.ok){
+    return kpiFamilyPanel('Utility Reliability Indices','SAIFI · SAIDI · CAIDI · ASAI',`${empty('Reliability KPI feed unavailable: '+relRes.message)}<button class="btn" data-kpi-retry="1">Retry</button>`)
+  }
+  const r=relRes.data,k=r.kpis
+  const missing=Object.values(k).some(x=>(x.missing_inputs||[]).length)
+  const contribRows=(r.contributors||[]).map((c,i)=>[
+    `<a href="#" class="rel-contributor-link" data-idx="${i}">${esc(c.outage_no)}</a>`,
+    esc(c.asset_no||'—'),esc(c.asset_name||'—'),
+    fmt(c.duration_hours),
+    c.customer_hours==null?'—':fmt(c.customer_hours),
+    c.share_pct==null?'—':fmt(c.share_pct)+'%'
+  ])
+  const adminAction=roleIn('admin')?'<button class="btn small" data-customer-counts="1">Customer counts</button>':''
+  const body=`<div class="kpi-grid">${reliabilityIndexCard(k.saifi)}${reliabilityIndexCard(k.saidi)}${reliabilityIndexCard(k.caidi)}${reliabilityIndexCard(k.asai)}</div>
+    ${missing?'<div class="trend warn">Indices are reported as unavailable rather than invented — declare site customer counts to enable them.</div>':''}
+    <h4 class="subhead">Ranked interruption contributors (by customer-hours)</h4>
+    ${contribRows.length?table(['Outage','Asset','Name','Duration h','Customer-hours','SAIDI share'],contribRows):empty(missing?'No attributable interruptions until customer counts are declared':'No sustained interruptions recorded in this window')}`
+  const subtitle=`${r.window_start.slice(0,10)} → ${r.window_end.slice(0,10)} · ${r.customers_served!=null?fmt(r.customers_served)+' customers served':'customer counts not declared'} · ${r.counts.ongoing_outages} ongoing outage(s)`
+  return kpiFamilyPanel('Utility Reliability Indices',subtitle,body,adminAction)
+}
+function inventoryPanel(invRes){
+  if(!invRes.ok){
+    return kpiFamilyPanel('Inventory & Procurement Exposure','Stock availability · reorder coverage · pipeline aging',`${empty('Inventory KPI feed unavailable: '+invRes.message)}<button class="btn" data-kpi-retry="1">Retry</button>`)
+  }
+  const d=invRes.data,k=d.kpis
+  const contribRows=(d.contributors||[]).map((c,i)=>[
+    `<a href="#" class="inv-contributor-link" data-idx="${i}">${esc(c.item_no)}</a>`,
+    esc(c.name),fmt(c.available),fmt(c.reorder_point),fmtMoney(c.exposure_value),
+    c.on_order?'Yes':'<b>No</b>'
+  ])
+  const body=`<div class="kpi-grid">
+      ${inventoryIndexCard(k.stock_availability_pct,fmt(k.stock_availability_pct.value)+'%')}
+      ${inventoryIndexCard(k.stockout_lines,fmt(k.stockout_lines.value))}
+      ${inventoryIndexCard(k.uncovered_reorder_lines,fmt(k.uncovered_reorder_lines.value))}
+      ${inventoryIndexCard(k.slow_moving_value_pct,fmt(k.slow_moving_value_pct.value)+'%')}
+      ${inventoryIndexCard(k.open_po_aging_days_avg,k.open_po_aging_days_avg.value==null?'No open POs':fmt(k.open_po_aging_days_avg.value)+' days')}
+    </div>
+    <p class="trend">${d.stocked_lines} stocked lines · portfolio value ${fmtMoney(d.stock_value)} · ${d.below_reorder_lines} at/below reorder point · ${d.open_purchase_orders} open PO(s)</p>
+    <h4 class="subhead">Uncovered reorder exposure (highest first)</h4>
+    ${contribRows.length?table(['Item','Name','Available','Reorder point','Exposure value','On order'],contribRows):empty('Every line below its reorder point has an open requisition')}
+    <p class="trend">Inventory scope is portfolio-wide; reliability indices follow the selected site filter.</p>`
+  return kpiFamilyPanel('Inventory & Procurement Exposure','Stock availability · reorder coverage · pipeline aging',body)
+}
+function bindKpiDashboardHandlers(){
+  $$('.rel-contributor-link').forEach(a=>{a.onclick=e=>{e.preventDefault();kpiContributorDetail(Number(a.dataset.idx))}})
+  $$('.inv-contributor-link').forEach(a=>{a.onclick=e=>{e.preventDefault();kpiItemDetail(Number(a.dataset.idx))}})
+  $$('[data-kpi-retry]').forEach(b=>{b.onclick=()=>renderDashboard()})
+  const ccButton=$('[data-customer-counts]');if(ccButton)ccButton.onclick=()=>openCustomerCounts()
+}
+function kpiContributorDetail(idx){
+  const c=((S.cache.relKpis||{}).contributors||[])[idx]
+  if(!c)return
+  openModal(`Interruption ${c.outage_no}`,`
+    <p><b>Asset:</b> ${esc(c.asset_no||'—')} ${esc(c.asset_name||'')}</p>
+    <p><b>Duration in window:</b> ${fmt(c.duration_hours)} h</p>
+    <p><b>Affected customers:</b> ${c.customer_hours==null?'Site customer count not declared':fmt(c.duration_hours)+' h × declared customer count → '+fmt(c.customer_hours)+' customer-hours'}</p>
+    <p><b>Contribution to SAIDI:</b> ${c.share_pct==null?'—':fmt(c.share_pct)+'%'}</p>
+    <div class="form-actions">${c.asset_id?'<button class="btn primary" id="kpi-open-asset">Open asset record</button>':''}<button class="btn" id="kpi-go-operations">Open operations module</button></div>`)
+  const assetBtn=$('#kpi-open-asset');if(assetBtn&&c.asset_id)assetBtn.onclick=()=>{closeModal();assetDetail(Number(c.asset_id))}
+  $('#kpi-go-operations').onclick=()=>{closeModal();go('operations')}
+}
+async function kpiItemDetail(idx){
+  const c=((S.cache.invKpis||{}).contributors||[])[idx]
+  if(!c)return
+  try{
+    const history=await api(`/api/inventory/${Number(c.item_id)}/transactions`)
+    openModal(`${c.item_no} — ${c.name}`,`
+      <p><b>Available:</b> ${fmt(c.available)} · <b>Reorder point:</b> ${fmt(c.reorder_point)} · <b>Exposure value:</b> ${fmtMoney(c.exposure_value)} · <b>On order:</b> ${c.on_order?'Yes':'No'}</p>
+      ${history.length?table(['Date','Type','Quantity','Reference','Work Order'],history.map(x=>[x.created_at,status(x.tx_type),fmt(x.quantity),esc(x.reference||'—'),esc(x.wo_no||'—')])):empty('No stock transactions recorded')}
+      <div class="form-actions"><button class="btn primary" id="kpi-go-inventory">Open inventory module</button></div>`)
+    $('#kpi-go-inventory').onclick=()=>{closeModal();go('inventory')}
+  }catch(e){toast(e.message||'Unable to load item history')}
+}
+function openCustomerCounts(){
+  if(!roleIn('admin'))return toast('Administrator role required')
+  const sites=(S.ref&&S.ref.sites)||[]
+  openModal('Site customer counts',`
+    <p class="trend">Declared counts feed the SAIFI / SAIDI / CAIDI / ASAI denominators. Every change is audited with before/after values.</p>
+    ${table(['Site','Name','Customers served',''],sites.map(s=>[
+      esc(s.site_code),esc(s.name),
+      `<input type="number" min="0" step="1" id="cc-${Number(s.id)}" value="${s.customer_count??''}" placeholder="not declared">`,
+      `<button class="btn small" data-save-cc="${Number(s.id)}">Save</button>`
+    ]))}`)
+  $$('[data-save-cc]').forEach(b=>{b.onclick=()=>saveCustomerCount(Number(b.dataset.saveCc))})
+}
+async function saveCustomerCount(siteId){
+  if(!roleIn('admin'))return toast('Administrator role required')
+  const el=document.getElementById(`cc-${siteId}`)
+  if(!el)return
+  const raw=el.value.trim()
+  const value=raw===''?null:Number(raw)
+  if(value!==null&&(!Number.isInteger(value)||value<0))return toast('Enter a non-negative whole number or clear the field')
+  try{
+    await api(`/api/sites/${siteId}/customer-count`,{method:'PATCH',body:JSON.stringify({customer_count:value})})
+    const s=((S.ref||{}).sites||[]).find(x=>Number(x.id)===Number(siteId))
+    if(s)s.customer_count=value
+    toast('Customer count saved')
+    openCustomerCounts()
+    renderDashboard()
+  }catch(e){toast(e.message||'Save failed')}
+}
 function barChart(items,labelKey,valueKey){
   const max=Math.max(1,...items.map(x=>Number(x[valueKey]||0)));
   return `<div class="chart-bars">${items.map(x=>{const width=Math.max(4,Number(x[valueKey]||0)/max*100);return `<div class="bar-row" title="${esc(x[labelKey])}: ${fmt(x[valueKey])}"><span>${esc(x[labelKey])}</span><svg class="bar-svg" viewBox="0 0 100 9" preserveAspectRatio="none" aria-hidden="true"><rect class="bar-bg" x="0" y="0" width="100" height="9" rx="4.5"></rect><rect class="bar-fg" x="0" y="0" width="${width}" height="9" rx="4.5"></rect></svg><b>${fmt(x[valueKey])}</b></div>`}).join('')}</div>`
@@ -73,7 +195,7 @@ function changePassword(){formModal('Change Password',[field('Current Password',
 
 async function renderHome(){const apps=await api('/api/launchpad');const d=await api('/api/dashboard'+(S.siteId?`?site_id=${S.siteId}`:''));$('#content').innerHTML=`<section class="suite-banner"><div><div class="eyebrow">ELSEWEDY UTILITIES APPLICATION SUITE</div><h1>One Platform. Every Asset. Every Operation.</h1><p>Unified asset, maintenance, utilities and field operations management.</p></div><div class="banner-stat"><div><strong>${d.kpis.total_assets}</strong><span>Assets</span></div><div><strong>${d.kpis.open_work_orders}</strong><span>Open Work</span></div><div><strong>${d.kpis.pm_compliance}%</strong><span>PM Compliance</span></div></div></section><div class="hero"><div><h1>Application Launchpad</h1><p>Connected enterprise applications for utilities operations.</p></div><div class="hero-actions"><button class="btn primary" id="home-new-wo">+ New Work Order</button><button class="btn" id="home-dashboard">Executive Dashboard</button></div></div><div class="launch-grid">${apps.map(a=>`<button class="launch-card" data-app="${a.code}"><span class="launch-icon">${a.icon}</span><strong>${esc(a.name)}</strong><span>${esc(a.description)}</span></button>`).join('')}</div>`;$$('.launch-card').forEach(x=>x.onclick=()=>go(x.dataset.app));$('#home-dashboard').onclick=()=>go('dashboard');$('#home-new-wo').onclick=()=>newWorkOrder()}
 
-async function renderDashboard(){const qp=new URLSearchParams();if(S.siteId)qp.set('site_id',S.siteId);if(S.dashDate)qp.set('as_of',S.dashDate);const d=await api('/api/dashboard?'+qp);const k=d.kpis;const htotal=d.asset_health.reduce((a,b)=>a+b.count,0)||1;const good=(d.asset_health.find(x=>x.condition==='Good')?.count||0)/htotal*100;const fair=(d.asset_health.find(x=>['Fair','Warning'].includes(x.condition))?.count||0)/htotal*100;$('#content').innerHTML=`<div class="hero"><div><h1>Executive Dashboard</h1><p>${S.siteId?'Filtered by selected site':'Portfolio-wide utility performance overview'}.</p></div><div class="hero-actions"><input type="date" id="dash-date" value="${S.dashDate}" class="btn"><button class="btn" id="dash-refresh">Refresh</button></div></div><div class="kpi-grid">${kpi('Total Assets',k.total_assets,'AS','Enterprise asset base')}${kpi('Operating Assets',k.operating_assets,'OP',`${Math.round(k.operating_assets/Math.max(k.total_assets,1)*100)}% operational`,'good')}${kpi('Under Maintenance',k.assets_under_maintenance,'UM','Temporarily constrained')}${kpi('Critical Assets',k.critical_assets,'CR','Priority monitoring','warn')}${kpi('Open Work Orders',k.open_work_orders,'WO',`${k.overdue_work_orders} overdue`,k.overdue_work_orders?'warn':'good')}${kpi('Overdue Work',k.overdue_work_orders,'OD','Past target finish',k.overdue_work_orders?'warn':'good')}${kpi('Completed Work',k.completed_work_orders,'CP','Completed / closed')}${kpi('Emergency Work',k.emergency_work_orders,'EM','Immediate response')}${kpi('PM Compliance',k.pm_compliance+'%','PM','Target ≥ 95%',k.pm_compliance>=95?'good':'warn')}${kpi('MTBF',k.mtbf==null?'No failures':fmt(k.mtbf)+' h','BF','365-day reliability indicator')}${kpi('MTTR',k.mttr+' h','TR','Average repair time')}${kpi('Inventory Value',fmtMoney(k.inventory_value),'IV',`${k.low_stock_items} low stock`)}${kpi('Low Stock Items',k.low_stock_items,'LS','Reorder attention',k.low_stock_items?'warn':'good')}${kpi('Pending POs',k.pending_purchase_orders,'PO','Procurement pipeline')}${kpi('Active Technicians',k.active_technicians,'FS','Field resources')}${kpi('Safety Incidents',k.safety_incidents,'HS','Open HSE records',k.safety_incidents?'warn':'good')}${kpi('Open Outages',k.open_outages||0,'OT','Assets currently unavailable',(k.open_outages||0)?'bad':'good')}${kpi('Active Dispatches',k.active_dispatches||0,'DP','Technicians in dispatch lifecycle')}${kpi('Active Alarms',k.active_alarms||0,'AL',`${k.critical_alarms||0} critical`,(k.active_alarms||0)?'bad':'good')}${kpi('Utility Performance',k.utility_performance+'%','UP','Operating asset ratio',k.utility_performance>=95?'good':'warn')}${kpi('Asset Health Score',k.asset_health_score,'AH','Risk-weighted portfolio health',k.asset_health_score>=85?'good':k.asset_health_score>=70?'':'warn')}${kpi('90d Forecast Load',fmt(k.forecast_demand_hours_90d)+' h','FC',`Peak ${fmt(k.forecast_peak_utilization)}% utilization`,k.forecast_peak_utilization>100?'warn':'good')}${kpi('Parts-Blocked Work',k.parts_shortage_jobs_90d||0,'PB','90-day backlog with spare shortages',(k.parts_shortage_jobs_90d||0)?'warn':'good')}${kpi('Maintenance Cost',fmtMoney(k.maintenance_cost),'MC','Actual work cost')}</div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Work Orders by Status</h3><p>Live workflow distribution</p></div></div><div class="panel-body">${barChart(d.wo_by_status,'status','count')}</div></section><section class="panel"><div class="panel-head"><div><h3>Asset Health Distribution</h3><p>Condition across the managed asset base</p></div></div><div class="panel-body"><div class="donut-wrap">${donutChart(good,fair)}<div class="legend">${d.asset_health.map(x=>`<div><span class="dot ${x.condition==='Good'?'green':x.condition==='Fair'||x.condition==='Warning'?'amber':'red'}"></span>${esc(x.condition)} <b>${x.count}</b></div>`).join('')}</div></div></div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Maintenance Cost by Asset</h3><p>Actual work-order cost</p></div></div><div class="panel-body">${svgLine(d.cost_by_asset,'cost','asset_no')}</div></section><section class="panel"><div class="panel-head"><div><h3>Recent Activity</h3><p>Audited enterprise actions</p></div></div><div class="panel-body"><div class="activity">${d.recent_activity.length?d.recent_activity.map(x=>`<div class="activity-item"><span class="activity-dot">${esc(x.action.slice(0,2))}</span><div><strong>${esc(x.full_name)} · ${esc(x.action)}</strong><p>${esc(x.module)} · ${esc(x.record_id)}</p></div><time>${esc(x.created_at.slice(5,16).replace('T',' '))}</time></div>`).join(''):empty('No activity')}</div></div></section></div>`;$('#dash-refresh').onclick=()=>renderDashboard();$('#dash-date').onchange=e=>{S.dashDate=e.target.value;renderDashboard()}}
+async function renderDashboard(){const qp=new URLSearchParams();if(S.siteId)qp.set('site_id',S.siteId);if(S.dashDate)qp.set('as_of',S.dashDate);const [d,relRes,invRes]=await Promise.all([api('/api/dashboard?'+qp),api('/api/kpis/reliability?'+qp).then(x=>({ok:true,data:x})).catch(e=>({ok:false,message:e.message||String(e)})),api('/api/kpis/inventory').then(x=>({ok:true,data:x})).catch(e=>({ok:false,message:e.message||String(e)}))]);S.cache.relKpis=relRes.ok?relRes.data:null;S.cache.invKpis=invRes.ok?invRes.data:null;const kpiFamilies=reliabilityPanel(relRes)+inventoryPanel(invRes);const k=d.kpis;const htotal=d.asset_health.reduce((a,b)=>a+b.count,0)||1;const good=(d.asset_health.find(x=>x.condition==='Good')?.count||0)/htotal*100;const fair=(d.asset_health.find(x=>['Fair','Warning'].includes(x.condition))?.count||0)/htotal*100;$('#content').innerHTML=`<div class="hero"><div><h1>Executive Dashboard</h1><p>${S.siteId?'Filtered by selected site':'Portfolio-wide utility performance overview'}.</p></div><div class="hero-actions"><input type="date" id="dash-date" value="${S.dashDate}" class="btn"><button class="btn" id="dash-refresh">Refresh</button></div></div><div class="kpi-grid">${kpi('Total Assets',k.total_assets,'AS','Enterprise asset base')}${kpi('Operating Assets',k.operating_assets,'OP',`${Math.round(k.operating_assets/Math.max(k.total_assets,1)*100)}% operational`,'good')}${kpi('Under Maintenance',k.assets_under_maintenance,'UM','Temporarily constrained')}${kpi('Critical Assets',k.critical_assets,'CR','Priority monitoring','warn')}${kpi('Open Work Orders',k.open_work_orders,'WO',`${k.overdue_work_orders} overdue`,k.overdue_work_orders?'warn':'good')}${kpi('Overdue Work',k.overdue_work_orders,'OD','Past target finish',k.overdue_work_orders?'warn':'good')}${kpi('Completed Work',k.completed_work_orders,'CP','Completed / closed')}${kpi('Emergency Work',k.emergency_work_orders,'EM','Immediate response')}${kpi('PM Compliance',k.pm_compliance+'%','PM','Target ≥ 95%',k.pm_compliance>=95?'good':'warn')}${kpi('MTBF',k.mtbf==null?'No failures':fmt(k.mtbf)+' h','BF','365-day reliability indicator')}${kpi('MTTR',k.mttr+' h','TR','Average repair time')}${kpi('Inventory Value',fmtMoney(k.inventory_value),'IV',`${k.low_stock_items} low stock`)}${kpi('Low Stock Items',k.low_stock_items,'LS','Reorder attention',k.low_stock_items?'warn':'good')}${kpi('Pending POs',k.pending_purchase_orders,'PO','Procurement pipeline')}${kpi('Active Technicians',k.active_technicians,'FS','Field resources')}${kpi('Safety Incidents',k.safety_incidents,'HS','Open HSE records',k.safety_incidents?'warn':'good')}${kpi('Open Outages',k.open_outages||0,'OT','Assets currently unavailable',(k.open_outages||0)?'bad':'good')}${kpi('Active Dispatches',k.active_dispatches||0,'DP','Technicians in dispatch lifecycle')}${kpi('Active Alarms',k.active_alarms||0,'AL',`${k.critical_alarms||0} critical`,(k.active_alarms||0)?'bad':'good')}${kpi('Utility Performance',k.utility_performance+'%','UP','Operating asset ratio',k.utility_performance>=95?'good':'warn')}${kpi('Asset Health Score',k.asset_health_score,'AH','Risk-weighted portfolio health',k.asset_health_score>=85?'good':k.asset_health_score>=70?'':'warn')}${kpi('90d Forecast Load',fmt(k.forecast_demand_hours_90d)+' h','FC',`Peak ${fmt(k.forecast_peak_utilization)}% utilization`,k.forecast_peak_utilization>100?'warn':'good')}${kpi('Parts-Blocked Work',k.parts_shortage_jobs_90d||0,'PB','90-day backlog with spare shortages',(k.parts_shortage_jobs_90d||0)?'warn':'good')}${kpi('Maintenance Cost',fmtMoney(k.maintenance_cost),'MC','Actual work cost')}</div>${kpiFamilies}<div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Work Orders by Status</h3><p>Live workflow distribution</p></div></div><div class="panel-body">${barChart(d.wo_by_status,'status','count')}</div></section><section class="panel"><div class="panel-head"><div><h3>Asset Health Distribution</h3><p>Condition across the managed asset base</p></div></div><div class="panel-body"><div class="donut-wrap">${donutChart(good,fair)}<div class="legend">${d.asset_health.map(x=>`<div><span class="dot ${x.condition==='Good'?'green':x.condition==='Fair'||x.condition==='Warning'?'amber':'red'}"></span>${esc(x.condition)} <b>${x.count}</b></div>`).join('')}</div></div></div></section></div><div class="panel-grid"><section class="panel"><div class="panel-head"><div><h3>Maintenance Cost by Asset</h3><p>Actual work-order cost</p></div></div><div class="panel-body">${svgLine(d.cost_by_asset,'cost','asset_no')}</div></section><section class="panel"><div class="panel-head"><div><h3>Recent Activity</h3><p>Audited enterprise actions</p></div></div><div class="panel-body"><div class="activity">${d.recent_activity.length?d.recent_activity.map(x=>`<div class="activity-item"><span class="activity-dot">${esc(x.action.slice(0,2))}</span><div><strong>${esc(x.full_name)} · ${esc(x.action)}</strong><p>${esc(x.module)} · ${esc(x.record_id)}</p></div><time>${esc(x.created_at.slice(5,16).replace('T',' '))}</time></div>`).join(''):empty('No activity')}</div></div></section></div>`;$('#dash-refresh').onclick=()=>renderDashboard();$('#dash-date').onchange=e=>{S.dashDate=e.target.value;renderDashboard()};bindKpiDashboardHandlers()}
 
 async function renderAssets(){const q='';const list=await api('/api/assets'+(S.siteId?`?site_id=${S.siteId}`:''));S.cache.assets=list;$('#content').innerHTML=`<div class="hero"><div><h1>Asset Registry</h1><p>Hierarchy, condition, ownership, cost and maintenance history.</p></div><div class="hero-actions">${canAsset()?'<button class="btn primary" id="asset-new">+ Asset</button>':''}<button class="btn" id="asset-export">Export CSV</button></div></div><div class="toolbar"><div class="toolbar-left"><input id="asset-q" placeholder="Search asset…"><select id="asset-condition"><option value="">All conditions</option><option>Good</option><option>Fair</option><option>Warning</option><option>Poor</option><option>Critical</option></select><select id="asset-sort"><option value="asset_no">Asset ID</option><option value="name">Name</option><option value="condition">Condition</option><option value="criticality">Criticality</option><option value="current_value">Current value</option></select></div></div><section class="panel" id="asset-table-panel">${assetTable(list)}</section>`;if(canAsset())$('#asset-new').onclick=()=>newAsset();$('#asset-export').onclick=async()=>{const r=await fetch('/api/assets-export.csv',{headers:{Authorization:'Bearer '+S.token}});if(!r.ok)return toast('Export failed');const b=await r.blob(),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download='EUAS_assets.csv';a.click();URL.revokeObjectURL(u)};const refresh=async()=>{const p=new URLSearchParams();if($('#asset-q').value)p.set('q',$('#asset-q').value);if($('#asset-condition').value)p.set('condition',$('#asset-condition').value);if($('#asset-sort').value)p.set('sort',$('#asset-sort').value);if(S.siteId)p.set('site_id',S.siteId);const r=await api('/api/assets?'+p);S.cache.assets=r;$('#asset-table-panel').innerHTML=assetTable(r)};$('#asset-q').oninput=refresh;$('#asset-condition').onchange=refresh;$('#asset-sort').onchange=refresh}
 function assetTable(list){return table(['Asset ID','Asset','Type','Location','Criticality','Condition','Status','Value','Actions'],list.map(a=>[`<button class="link" onclick="assetDetail(${a.id})">${esc(a.asset_no)}</button>`,esc(a.name),esc(a.asset_type||a.category),esc(a.location_name||'—'),status(a.criticality),status(a.condition),status(a.status),fmtMoney(a.current_value),`<button class="btn small" onclick="assetDetail(${a.id})">Open</button>${canAsset()?` <button class="btn small" onclick="editAsset(${a.id})">Edit</button>`:''}`]))}
