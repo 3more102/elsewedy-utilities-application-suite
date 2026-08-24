@@ -461,3 +461,109 @@ def test_executive_kpi_csv_export_matches_snapshot_and_permissions():
         # Unconfigured reliability indices export an explicit unavailable state.
         saidi = metrics[('reliability', 'saidi_minutes')]
         assert saidi == 'unavailable' or float(saidi) >= 0
+
+
+def test_pm_capacity_risk_maps_critical_plans_to_week_buckets():
+    from app.kpi_service import ExecutiveFilters, compute_pm_capacity_risk
+
+    _ensure_db()
+    with db() as conn:
+        tr = int(conn.execute("SELECT id FROM assets WHERE asset_no='TR-001'").fetchone()[0])
+        pmp = int(conn.execute("SELECT id FROM assets WHERE asset_no='PMP-301'").fetchone()[0])
+        for i, (asset_id, offset_days) in enumerate([(tr, 14), (tr, 35), (pmp, 49)]):
+            conn.execute(
+                '''INSERT INTO maintenance_plans(pm_no,name,asset_id,trigger_type,
+                     interval_days,next_due,priority,active,compliance_target)
+                   VALUES(?,?,?,'Calendar',30,?,'Critical',1,95)''',
+                (f'PM-RISK-{i}', f'KPI risk plan {i}', asset_id,
+                 (datetime.now() + timedelta(days=offset_days)).strftime('%Y-%m-%d')))
+        conn.execute(
+            '''INSERT INTO maintenance_plans(pm_no,name,asset_id,trigger_type,
+                 interval_days,next_due,priority,active,compliance_target)
+               VALUES('PM-RISK-MED','Medium plan ignored',?,'Calendar',30,?,
+                      'Medium',1,95)''',
+            (pmp, (datetime.now() + timedelta(days=15)).strftime('%Y-%m-%d')))
+
+    with db() as conn:
+        risk = compute_pm_capacity_risk(conn, ExecutiveFilters(period_days=30))
+
+    assert risk['critical_pm_total'] >= 2
+    seen = []
+    for week in risk['overloaded_weeks']:
+        for pm in week['critical_pms']:
+            seen.append(pm['pm_no'])
+            assert pm['next_due'] and pm['asset_no']
+    assert len(seen) == len(set(seen)), 'a critical PM landed in multiple buckets'
+    assert risk['unplaced_critical_pms'] == 0
+    for week in risk['overloaded_weeks']:
+        assert week['utilization_pct'] > 100
+        assert week['capacity_state'] == 'Over Capacity'
+    counted_assets = {pm['asset_no']
+                      for w in risk['overloaded_weeks'] for pm in w['critical_pms']}
+    with db() as conn:
+        for asset_no in counted_assets:
+            row = conn.execute('SELECT criticality FROM assets WHERE asset_no=?',
+                               (asset_no,)).fetchone()
+            assert row['criticality'] == 'Critical'
+
+
+def test_pm_capacity_risk_endpoint_authorization_and_validation():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    _ensure_db()
+    with TestClient(app) as client:
+        admin = client.post('/api/auth/login',
+                            json={'username': 'omar', 'password': 'EUAS@2026'}).json()
+        headers = {'Authorization': f"Bearer {admin['token']}"}
+        tech = client.post('/api/auth/login',
+                           json={'username': 'tech1', 'password': 'Tech@2026'}).json()
+        tech_headers = {'Authorization': f"Bearer {tech['token']}"}
+
+        assert client.get('/api/kpi/pm-risk', headers=tech_headers).status_code == 403
+        r = client.get('/api/kpi/pm-risk', headers=headers, params={'horizon_days': 84})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body['horizon_days'] == 84
+        assert {'critical_pm_total', 'overloaded_weeks', 'capacity_source'} <= set(body)
+        assert client.get('/api/kpi/pm-risk', headers=headers,
+                          params={'horizon_days': 5}).status_code == 422
+
+
+def test_executive_export_filename_disambiguates_scope():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    _ensure_db()
+    with TestClient(app) as client:
+        admin = client.post('/api/auth/login',
+                            json={'username': 'omar', 'password': 'EUAS@2026'}).json()
+        headers = {'Authorization': f"Bearer {admin['token']}"}
+
+        base = client.get('/api/exports/executive-kpis.csv', headers=headers)
+        disp_base = base.headers.get('content-disposition', '')
+        assert 'EUAS_executive_kpis-all_' in disp_base
+
+        scoped = client.get('/api/exports/executive-kpis.csv', headers=headers,
+                            params={'region': 'Greater Cairo'})
+        disp_scoped = scoped.headers.get('content-disposition', '')
+        assert 'greatercairo' in disp_scoped or 'greater-cairo' in disp_scoped
+
+        # Sanitization: hostile region text cannot inject header characters.
+        hostile = client.get('/api/exports/executive-kpis.csv', headers=headers,
+                             params={'region': 'Bad\nRegion"\\//x'})
+        disp_hostile = hostile.headers.get('content-disposition', '')
+        filename_value = disp_hostile.split('filename="')[1].split('"')[0]
+        assert '\n' not in filename_value and '"' not in filename_value
+        assert filename_value.startswith('EUAS_executive_kpis-')
+
+        # Content identical across repeated exports of the same scope+window;
+        # the filename never changes the CSV body.
+        a = client.get('/api/exports/executive-kpis.csv', headers=headers,
+                       params={'criticality': 'Critical'}).text
+        b = client.get('/api/exports/executive-kpis.csv', headers=headers,
+                       params={'criticality': 'Critical'}).text
+        assert a == b
+        assert a.count('Family,Metric,Value,Previous,Delta') == 1

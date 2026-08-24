@@ -92,7 +92,7 @@ python scripts/disaster_recovery.py restore backups/euas-backup-YYYYMMDDTHHMMSSZ
   --force
 ```
 
-The SQLite restore is copied to a temporary target, integrity-checked, then atomically moved into place.
+The SQLite restore is copied to a temporary target, integrity-checked, then atomically moved into place. Stale `-wal`, `-shm`, and `-journal` sidecars of the target are removed as part of the restore so leftover pre-crash WAL frames cannot be replayed over the restored database (EUAS runs SQLite in WAL mode).
 
 ## Restore PostgreSQL
 
@@ -104,7 +104,7 @@ python scripts/disaster_recovery.py restore backups/euas-backup-YYYYMMDDTHHMMSSZ
   --force
 ```
 
-The restore uses `--clean --if-exists --no-owner`. Run it only against the intended recovery database.
+The restore uses `--clean --if-exists --no-owner`, which drops and recreates every object in the target database; `--force` is therefore required, matching the SQLite restore gate. Run it only against the intended recovery database.
 
 ## Restore uploads
 

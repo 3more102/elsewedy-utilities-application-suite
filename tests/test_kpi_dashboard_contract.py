@@ -248,3 +248,42 @@ def test_admin_customer_count_endpoint_stays_audited_for_dashboard():
             ).fetchall()
         assert len(audits) == 1
         assert 'null' in audits[0]['old_value'] and '750' in audits[0]['new_value']
+
+
+def test_shortage_expedite_bridge_contract():
+    """The material-blocked panel must expose the shortage->requisition
+    bridge through the canonical shortages endpoint and the standard PR
+    modal flow - no parallel procurement API, no auto-submission."""
+    source = APP_JS.read_text(encoding='utf-8')
+    assert '/api/kpi/parts/shortages' in source
+    assert 'loadShortageExpediteLines' in source
+    assert 'data-expedite' in source
+    # The bridge prefills the existing newPR() modal and posts to the
+    # standard requisition endpoint; submission stays manual.
+    assert 'newPR()' in source
+    assert "api('/api/procurement/requisitions'" in source
+    assert 'procurement/requisitions/' not in source.split('data-expedite')[1].split('}')[0] \
+        if 'data-expedite' in source else True
+    lowered = source.lower()
+    assert 'autosubmit' not in lowered and 'auto-submit' not in lowered
+    # Role gating mirrors the backend requisition-create whitelist.
+    for role in ('storekeeper', 'maintenance_manager', 'procurement', 'planner'):
+        assert role in source
+
+
+def test_command_strip_consumes_canonical_endpoints_without_recomputation():
+    """The dashboard command strip must render HSE and PM capacity signals
+    straight from the canonical endpoints - no JS-side formula rewrites."""
+    source = APP_JS.read_text(encoding='utf-8')
+    assert '/api/kpi/hse' in source
+    assert '/api/planning/maintenance-forecast' in source
+    assert '/api/kpi/pm-risk' in source
+    assert 'commandStripHtml' in source
+    assert 'data-strip-drill' in source
+    # Strip renders backend fields directly.
+    for field in ('open_incidents', 'high_risk_open', 'days_since_last_high_risk',
+                  'capacity_state', 'utilization_pct', 'craft_states'):
+        assert field in source, field
+    lowered = source.lower()
+    for forbidden in ('saidi=', 'saifi=', 'caidi='):
+        assert forbidden not in lowered

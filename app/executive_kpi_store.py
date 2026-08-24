@@ -130,6 +130,25 @@ def install_executive_kpi_routes() -> None:
         with db() as conn:
             return compute_parts_shortages(conn, f, limit=limit)
 
+    @app.get('/api/kpi/pm-risk')
+    def kpi_pm_capacity_risk(
+        horizon_days: int = Query(84, ge=14, le=365),
+        site_id: Optional[int] = None,
+        region: Optional[str] = None,
+        user=Depends(require_roles(*KPI_ROLES)),
+    ):
+        """High-criticality PMs landing in over-capacity weeks.
+
+        Demand/capacity math is delegated to the canonical maintenance
+        forecast; this endpoint cross-references critical plan due dates
+        against those buckets so scheduling can act before the week arrives.
+        """
+        f = _kpi_filters(site_id=site_id, region=region)
+        from .kpi_service import compute_pm_capacity_risk
+
+        with db() as conn:
+            return compute_pm_capacity_risk(conn, f, horizon_days=horizon_days)
+
     @app.get('/api/kpi/hse')
     def kpi_hse(
         period_end: Optional[str] = None,
@@ -187,8 +206,26 @@ def install_executive_kpi_routes() -> None:
         with db() as conn:
             snapshot = executive_snapshot(conn, f)
             rows = snapshot_export_rows(snapshot)
+        # Filename disambiguates the scope so multi-scope exports cannot be
+        # confused on disk. Segments are sanitized to a safe charset; only
+        # scopes the caller explicitly queried appear in the name.
+        import re as _re
+
+        parts: list[str] = []
+        if site_id:
+            parts.append(f'site{int(site_id)}')
+        if region:
+            parts.append(_re.sub(r'[^A-Za-z0-9_-]', '', region)[:40].lower() or 'region')
+        if asset_type_id:
+            parts.append(f'class{int(asset_type_id)}')
+        if criticality:
+            parts.append(_re.sub(r'[^A-Za-z0-9_-]', '', criticality)[:20].lower())
+        suffix = ('-' + '-'.join(parts)) if parts else '-all'
+        filename = (
+            f'EUAS_executive_kpis{suffix}'
+            f'_{_application.date.today().strftime("%Y%m%d")}.csv')
         return _application.csv_response(
-            'EUAS_executive_kpis.csv',
+            filename,
             ['Family', 'Metric', 'Value', 'Previous', 'Delta'],
             rows,
         )

@@ -25,6 +25,28 @@ def test_postgres_translation_escapes_literal_percent_for_psycopg():
     assert ignored == "INSERT INTO demo(name,pattern) VALUES(%s, 'PM%%') ON CONFLICT DO NOTHING"
 
 
+def test_postgres_translation_covers_audit_chain_anchor_statements():
+    bootstrap = _pg_insert_or_ignore(
+        'INSERT OR IGNORE INTO audit_chain_anchor(id,head_hash,record_count) VALUES(?,?,?)'
+    )
+    assert bootstrap == (
+        'INSERT INTO audit_chain_anchor(id,head_hash,record_count) '
+        'VALUES(%s,%s,%s) ON CONFLICT DO NOTHING'
+    )
+    anchored_append = _pg_sql(
+        'UPDATE audit_chain_anchor SET head_hash=?,record_count=record_count+1 WHERE id=?'
+    )
+    assert anchored_append == (
+        'UPDATE audit_chain_anchor SET head_hash=%s,record_count=record_count+1 WHERE id=%s'
+    )
+    presence = _pg_sql(
+        "SELECT 1 FROM information_schema.tables WHERE table_name='audit_chain_anchor'"
+    )
+    assert presence == (
+        "SELECT 1 FROM information_schema.tables WHERE table_name='audit_chain_anchor'"
+    )
+
+
 def test_postgres_translation_types_standalone_null_checks():
     sql = _pg_sql(
         'SELECT id FROM notifications WHERE ((user_id=?) OR (user_id IS NULL AND ? IS NULL)) '
