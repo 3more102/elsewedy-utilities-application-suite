@@ -299,6 +299,181 @@ def _maintenance_forecast(conn,horizon_days:int=90,site_id:Optional[int]=None):
                        'capacity_hours':total_capacity,'peak_utilization_pct':max([x['utilization_pct'] for x in out] or [0]),
                        'parts_shortage_jobs':sum(x['parts_shortage_jobs'] for x in out),'parts_ready_jobs':sum(x['parts_ready_jobs'] for x in out)}}
 
+_BACKLOG_PRIORITY_WEIGHT={'Emergency':30,'Critical':26,'High':20,'Medium':12,'Low':5}
+_BACKLOG_CRITICALITY_WEIGHT={'Critical':14,'High':10,'Medium':6,'Low':2}
+
+def _material_blocker_map(conn, wo_ids:list[int]) -> dict[int,int]:
+    """Return {work_order_id: shortage_item_count} using one set-based query.
+
+    A requirement is short when the remaining quantity (planned minus already
+    issued) exceeds everything secured for this work order: open reservations
+    plus unreserved free stock. The expression avoids backend-specific scalar
+    functions so SQLite and PostgreSQL evaluate it identically.
+    """
+    if not wo_ids:return {}
+    marks=','.join('?'*len(wo_ids))
+    result:dict[int,int]={}
+    blocked=rows(conn.execute(
+        f'''SELECT rr.work_order_id wid,COUNT(*) shortages
+            FROM work_order_requirements rr
+            JOIN inventory_items ii ON ii.id=rr.inventory_item_id
+            WHERE rr.work_order_id IN ({marks}) AND rr.status<>'Cancelled'
+              AND (rr.quantity-COALESCE((SELECT SUM(m.quantity) FROM work_order_materials m
+                    WHERE m.work_order_id=rr.work_order_id AND m.inventory_item_id=rr.inventory_item_id),0))
+                  > COALESCE((SELECT SUM(res.quantity-res.issued_quantity) FROM inventory_reservations res
+                    WHERE res.work_order_id=rr.work_order_id AND res.inventory_item_id=rr.inventory_item_id
+                      AND res.status IN ('Reserved','Partially Issued')),0)
+                    +(CASE WHEN ii.current_stock-ii.reserved_stock>0 THEN ii.current_stock-ii.reserved_stock ELSE 0 END)-1e-9
+            GROUP BY rr.work_order_id''',
+        wo_ids,
+    ))
+    for b in blocked:result[int(b['wid'])]=int(b['shortages'])
+    return result
+
+def _ranked_work_backlog(conn, site_id:Optional[int]=None, limit:int=200, offset:int=0):
+    """Rank open work by operational risk instead of simple age or priority.
+
+    Evidence sources are the platform's own records: job priority, asset
+    criticality and health snapshots, active condition alarms, SLA breach
+    state, overdue targets, repeat corrective history, safety requirements,
+    assignment state, backlog age and material blockers. Each contribution is
+    reported per item so planners can audit why work ranked where it did.
+    """
+    sql=('''SELECT w.id,w.wo_no,w.title,w.priority,w.status,w.work_type,w.asset_id,w.location_id,w.assigned_to,
+              w.created_at,w.target_start,w.target_finish,w.safety_requirements,a.criticality asset_criticality,a.asset_no,
+              sl.response_due,sl.resolution_due,sl.response_status,sl.resolution_status,sl.escalated_level
+            FROM work_orders w
+            LEFT JOIN assets a ON a.id=w.asset_id
+            LEFT JOIN locations l ON l.id=w.location_id
+            LEFT JOIN work_order_sla sl ON sl.work_order_id=w.id
+            WHERE w.status NOT IN ('Completed','Closed','Cancelled')''')
+    args:list[object]=[]
+    if site_id is not None:
+        sql+=' AND l.site_id=?';args.append(site_id)
+    work=rows(conn.execute(sql,args))
+    if not work:
+        return {'generated_at':now(),'total':0,'items':[],'bands':{'HIGH RISK':0,'ELEVATED':0,'ROUTINE':0}}
+    wo_ids=[int(w['id']) for w in work]
+    asset_ids=sorted({int(w['asset_id']) for w in work if w['asset_id']})
+
+    alarm_tier:dict[int,str]={}
+    if asset_ids:
+        marks=','.join('?'*len(asset_ids))
+        for r in rows(conn.execute(
+            f'''SELECT asset_id,
+                  SUM(CASE WHEN severity='Critical' THEN 1 ELSE 0 END) crit_alarms,
+                  COUNT(*) active_alarms
+                FROM operational_alarms WHERE status IN ('Open','Acknowledged') AND asset_id IN ({marks})
+                GROUP BY asset_id''',
+            asset_ids,
+        )):
+            alarm_tier[int(r['asset_id'])]='Critical' if int(r['crit_alarms'] or 0)>0 else 'Warning'
+
+    health:dict[int,dict]={}
+    if asset_ids:
+        marks=','.join('?'*len(asset_ids))
+        for r in rows(conn.execute(
+            f'''SELECT s.asset_id,s.score,s.risk_band FROM asset_health_snapshots s
+                WHERE s.id IN (SELECT MAX(id) FROM asset_health_snapshots WHERE asset_id IN ({marks}) GROUP BY asset_id)''',
+            asset_ids,
+        )):
+            health[int(r['asset_id'])]={'score':float(r['score'] or 0),'risk_band':r['risk_band']}
+
+    repeat_cutoff=(datetime.now()-timedelta(days=90)).isoformat()
+    repeats:dict[int,int]={}
+    if asset_ids:
+        marks=','.join('?'*len(asset_ids))
+        for r in rows(conn.execute(
+            f'''SELECT asset_id,COUNT(*) failures FROM work_orders
+                WHERE asset_id IN ({marks}) AND status IN ('Completed','Closed')
+                  AND work_type IN ('Corrective Maintenance','Breakdown') AND created_at>=?
+                GROUP BY asset_id''',
+            (*asset_ids, repeat_cutoff),
+        )):
+            repeats[int(r['asset_id'])]=int(r['failures'])
+
+    blockers=_material_blocker_map(conn,wo_ids)
+    today=date.today().isoformat()
+    stamp_now=now()
+    ranked=[]
+    for w in work:
+        score=float(_BACKLOG_PRIORITY_WEIGHT.get(w['priority'],8))
+        factors=[]
+        crit=str(w['asset_criticality'] or '')
+        crit_points=float(_BACKLOG_CRITICALITY_WEIGHT.get(crit,4))
+        score+=crit_points;factors.append(f'Asset criticality {crit or "Unknown"} (+{crit_points:g})')
+
+        days_open=0.0
+        try:
+            created=_dt(w['created_at'])
+            days_open=max(0.0,(datetime.now()-created).total_seconds()/86400)
+        except Exception:
+            pass
+        if days_open>7:
+            age_points=min(10.0,(days_open-7)/3.0)
+            score+=age_points;factors.append(f'{int(days_open)} days open (+{age_points:g})')
+
+        resolution_status=str(w['resolution_status'] or '')
+        response_status=str(w['response_status'] or '')
+        sla_points=0.0
+        if resolution_status=='Breached':sla_points+=20
+        elif response_status=='Breached':sla_points+=8
+        if (w['escalated_level'] or 0)>0:sla_points+=6
+        if sla_points:
+            score+=sla_points;factors.append(f'SLA exposure {resolution_status or response_status} (+{sla_points:g})')
+
+        target=str(w['target_finish'] or '')[:10]
+        if target and target<today:
+            score+=10;factors.append(f'Past target finish {target} (+10)')
+
+        tier=alarm_tier.get(int(w['asset_id'])) if w['asset_id'] else None
+        if tier=='Critical':
+            score+=12;factors.append('Active Critical condition alarm (+12)')
+        elif tier=='Warning':
+            score+=6;factors.append('Active warning alarm (+6)')
+
+        h=health.get(int(w['asset_id'])) if w['asset_id'] else None
+        if h:
+            if float(h['score'])<=40:
+                score+=10;factors.append(f"Asset health {h['score']:g} ({h['risk_band']}) (+10)")
+            elif float(h['score'])<=60:
+                score+=5;factors.append(f"Asset health {h['score']:g} ({h['risk_band']}) (+5)")
+
+        n_failures=repeats.get(int(w['asset_id']),0) if w['asset_id'] else 0
+        if n_failures>1:
+            repeat_points=min(10.0,(n_failures-1)*3.0)
+            score+=repeat_points;factors.append(f'{n_failures} corrective failures in 90d (+{repeat_points:g})')
+
+        if str(w['safety_requirements'] or '').strip():
+            score+=6;factors.append('Safety requirements on scope (+6)')
+
+        shortage=blockers.get(int(w['id']),0)
+        material_blocked=shortage>0
+        if material_blocked:
+            score+=8;factors.append(f'MATERIAL BLOCKED — {shortage} part(s) unavailable (+8)')
+
+        if not w['assigned_to']:
+            score+=4;factors.append('Unassigned (+4)')
+
+        band='HIGH RISK' if score>=60 else 'ELEVATED' if score>=35 else 'ROUTINE'
+        ranked.append({
+            'id':int(w['id']),'wo_no':w['wo_no'],'title':w['title'],'priority':w['priority'],
+            'status':w['status'],'work_type':w['work_type'],'assigned_to':w['assigned_to'],
+            'asset_id':w['asset_id'],'asset_no':w['asset_no'],'asset_criticality':crit,
+            'health_score':round(h['score'],1) if h else None,'health_risk_band':h['risk_band'] if h else None,
+            'active_alarm_tier':tier,'days_open':round(days_open,1),
+            'target_finish':str(w['target_finish'] or '') or None,
+            'sla_resolution_status':w['resolution_status'],'sla_response_status':w['response_status'],
+            'escalated_level':w['escalated_level'] or 0,'safety_scope':bool(str(w['safety_requirements'] or '').strip()),
+            'material_blocked':material_blocked,'material_shortage_items':shortage,
+            'risk_score':round(min(100.0,score),1),'risk_band':band,'factors':factors,
+        })
+    ranked.sort(key=lambda x:(-x['risk_score'],x['id']))
+    bands={'HIGH RISK':0,'ELEVATED':0,'ROUTINE':0}
+    for item in ranked:bands[item['risk_band']]+=1
+    return {'generated_at':stamp_now,'total':len(ranked),'bands':bands,'items':ranked[offset:offset+limit]}
+
+
 def _outage_overlap_hours(start_value, end_value, window_start:datetime, window_end:datetime):
     try:start=_dt(start_value)
     except Exception:return 0.0
@@ -976,8 +1151,15 @@ def dashboard(site_id:Optional[int]=None,as_of:Optional[str]=None,user=Depends(c
         asset_ids=rows(conn.execute('SELECT a.id FROM assets a LEFT JOIN locations l ON l.id=a.location_id WHERE 1=1'+where,args))
         for x in asset_ids:health_scores.append(_asset_health(conn,x['id'])['score'])
         portfolio_health=round(sum(health_scores)/max(len(health_scores),1),1)
+        open_work_ids=[int(x['id']) for x in rows(conn.execute("SELECT w.id FROM work_orders w LEFT JOIN locations l ON l.id=w.location_id WHERE w.status NOT IN ('Completed','Closed','Cancelled')"+where,args))]
+        material_blockers=_material_blocker_map(conn,open_work_ids)
+        material_blocked_work=[]
+        if material_blockers:
+            marks=','.join('?'*len(material_blockers))
+            blocked_info=rows(conn.execute(f"SELECT id,wo_no,title,priority,status,work_type FROM work_orders WHERE id IN ({marks}) ORDER BY CASE priority WHEN 'Emergency' THEN 5 WHEN 'Critical' THEN 4 WHEN 'High' THEN 3 WHEN 'Medium' THEN 2 ELSE 1 END DESC,id",list(material_blockers.keys())))
+            material_blocked_work=[dict(b)|{'shortage_items':material_blockers[int(b['id'])]} for b in blocked_info][:20]
         forecast=_maintenance_forecast(conn,90,site_id)
-        return {'kpis':{'total_assets':asset_total,'operating_assets':operating,'assets_under_maintenance':maintenance,'critical_assets':critical,'open_work_orders':openwo,'emergency_work_orders':emergency,'overdue_work_orders':overdue,'completed_work_orders':completed,'pm_compliance':pm_compliance,'mttr':round(avg_repair,1),'mtbf':round(mtbf,1) if mtbf is not None else None,'inventory_value':round(inv_value,2),'low_stock_items':low,'pending_purchase_orders':po_pending,'active_technicians':forecast['technicians'],'safety_incidents':incidents,'open_outages':open_outages,'active_dispatches':active_dispatches,'active_alarms':active_alarms,'critical_alarms':critical_alarms,'maintenance_cost':round(sum(x['cost'] for x in costs),2),'utility_performance':round(100*operating/max(asset_total,1),1),'asset_health_score':portfolio_health,'forecast_demand_hours_90d':forecast['summary']['demand_hours'],'forecast_peak_utilization':forecast['summary']['peak_utilization_pct'],'parts_shortage_jobs_90d':forecast['summary']['parts_shortage_jobs']},'wo_by_status':statuses,'asset_health':health,'cost_by_asset':costs,'recent_activity':recent}
+        return {'kpis':{'total_assets':asset_total,'operating_assets':operating,'assets_under_maintenance':maintenance,'critical_assets':critical,'open_work_orders':openwo,'emergency_work_orders':emergency,'overdue_work_orders':overdue,'completed_work_orders':completed,'pm_compliance':pm_compliance,'mttr':round(avg_repair,1),'mtbf':round(mtbf,1) if mtbf is not None else None,'inventory_value':round(inv_value,2),'low_stock_items':low,'pending_purchase_orders':po_pending,'active_technicians':forecast['technicians'],'safety_incidents':incidents,'open_outages':open_outages,'active_dispatches':active_dispatches,'active_alarms':active_alarms,'critical_alarms':critical_alarms,'maintenance_cost':round(sum(x['cost'] for x in costs),2),'utility_performance':round(100*operating/max(asset_total,1),1),'asset_health_score':portfolio_health,'forecast_demand_hours_90d':forecast['summary']['demand_hours'],'forecast_peak_utilization':forecast['summary']['peak_utilization_pct'],'parts_shortage_jobs_90d':forecast['summary']['parts_shortage_jobs'],'material_blocked_work_orders':len(material_blockers)},'wo_by_status':statuses,'asset_health':health,'cost_by_asset':costs,'recent_activity':recent,'material_blocked_work':material_blocked_work}
 
 # ---------- reference / operations / map ----------
 @app.get('/api/reference')
@@ -1153,6 +1335,9 @@ def list_work(status:str='',priority:str='',q:str='',assigned_to:Optional[int]=N
     if q:sql+=' AND (w.wo_no LIKE ? OR w.title LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ?)';like=f'%{q}%';args += [like]*4
     sql+=' ORDER BY CASE w.priority WHEN \'Emergency\' THEN 5 WHEN \'Critical\' THEN 4 WHEN \'High\' THEN 3 WHEN \'Medium\' THEN 2 ELSE 1 END DESC,w.id DESC LIMIT ? OFFSET ?';args+=[limit,offset]
     with db() as conn:return rows(conn.execute(sql,args))
+@app.get('/api/work-orders/backlog')
+def work_backlog(site_id:Optional[int]=None,limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
+    with db() as conn:return _ranked_work_backlog(conn,site_id=site_id,limit=limit,offset=offset)
 @app.get('/api/work-orders/{wo_id}')
 def get_work(wo_id:int,user=Depends(current_user)):
     with db() as conn:
@@ -1191,14 +1376,41 @@ def update_work(wo_id:int,body:WorkOrderPatch,user=Depends(require_roles(*WRITE_
             if 'priority' in changes:_ensure_work_sla(conn,wo_id,force=True)
             if 'assigned_to' in changes and changes['assigned_to']:notify(conn,'Work order assigned',f"{old['wo_no']} — {changes.get('title',old['title'])}",'Info',changes['assigned_to'],None,'work',old['wo_no'])
         return {'ok':True}
-TRANSITIONS={'Draft':{'submit':'Submitted'},'Rejected':{'resubmit':'Submitted'},'Submitted':{'approve':'Approved'},'Approved':{'assign':'Assigned'},'Assigned':{'start':'In Progress'},'In Progress':{'pause':'Assigned','complete':'Completed'},'Completed':{'close':'Closed'}}
+TRANSITIONS={'Draft':{'submit':'Submitted','cancel':'Cancelled'},'Rejected':{'resubmit':'Submitted','cancel':'Cancelled'},'Submitted':{'approve':'Approved','cancel':'Cancelled'},'Approved':{'assign':'Assigned','cancel':'Cancelled'},'Assigned':{'start':'In Progress','cancel':'Cancelled'},'In Progress':{'pause':'Assigned','complete':'Completed'},'Completed':{'close':'Closed'}}
 ACTION_ROLES={
     'approve':('admin','maintenance_manager','supervisor'),
     'assign':('admin','maintenance_manager','planner','supervisor'),
     'close':('admin','maintenance_manager','supervisor'),
     'submit':('admin','maintenance_manager','planner','supervisor'),
     'resubmit':('admin','maintenance_manager','planner','supervisor'),
+    'cancel':('admin','maintenance_manager','planner','supervisor'),
 }
+
+def _active_dispatch_holder(conn, wo_id:int):
+    return conn.execute(
+        "SELECT d.id,u.username FROM dispatch_assignments d JOIN users u ON u.id=d.technician_user_id"
+        " WHERE d.work_order_id=? AND d.status IN ('Dispatched','Accepted','En Route','On Site') LIMIT 1",
+        (wo_id,),
+    ).fetchone()
+
+def _settle_cancelled_work(conn, wo_id:int, user_id:int, notes:str=''):
+    """Settle approvals and reservations when a work order is cancelled."""
+    resolve_approval(conn,'Work Management','work_order',wo_id,'reject',user_id,notes or 'Work order cancelled')
+    released=[]
+    open_reservations=rows(conn.execute(
+        "SELECT id,reservation_no,inventory_item_id,status FROM inventory_reservations"
+        " WHERE work_order_id=? AND status IN ('Reserved','Partially Issued')",
+        (wo_id,),
+    ))
+    for r in open_reservations:
+        conn.execute("UPDATE inventory_reservations SET status='Released',released_at=? WHERE id=?",(now(),r['id']))
+        _sync_reserved_stock(conn,r['inventory_item_id'])
+        req=conn.execute('SELECT id,status FROM work_order_requirements WHERE work_order_id=? AND inventory_item_id=?',(wo_id,r['inventory_item_id'])).fetchone()
+        if req and req['status']=='Reserved':
+            conn.execute("UPDATE work_order_requirements SET status='Required' WHERE id=?",(req['id'],))
+        audit(conn,user_id,'RELEASE RESERVATION','Inventory',r['reservation_no'],r['status'],'Released')
+        released.append(r['reservation_no'])
+    return released
 @app.post('/api/work-orders/{wo_id}/transition')
 def transition_work(wo_id:int,body:TransitionIn,user=Depends(require_roles(*WORK_ROLES))):
     with db() as conn:
@@ -1207,12 +1419,16 @@ def transition_work(wo_id:int,body:TransitionIn,user=Depends(require_roles(*WORK
         if action in ACTION_ROLES and user['role'] not in ACTION_ROLES[action]: raise HTTPException(403,f"Role {user['role']} cannot perform {action}")
         if user['role']=='technician' and action in ('start','pause','complete') and w['assigned_to']!=user['id']: raise HTTPException(403,'Technicians can only execute work assigned to them')
         if action=='assign' and not w['assigned_to']: raise HTTPException(409,'Assign a technician before moving to Assigned')
+        if action=='cancel':
+            holder=_active_dispatch_holder(conn,wo_id)
+            if holder: raise HTTPException(409,'Cancel the active dispatch before cancelling the work order')
         fields={'status':target,'updated_at':now()}
         if action=='start':fields['actual_start']=now()
         if action=='complete':fields['actual_finish']=now();fields['completion_notes']=body.notes or w['completion_notes'];fields['technician_signature']=body.signature or w.get('technician_signature','')
         conn.execute('UPDATE work_orders SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?',(*fields.values(),wo_id))
         if action=='start':_mark_sla_response(conn,wo_id,fields['actual_start'])
         if action=='complete':_mark_sla_resolution(conn,wo_id,fields['actual_finish'])
+        if action=='cancel':_settle_cancelled_work(conn,wo_id,user['id'],body.notes)
         if action in ('submit','resubmit'):
             create_approval(conn,'Work Management','work_order',wo_id,w['wo_no'],f"Approve {w['wo_no']} — {w['title']}",user['id'],assigned_user_id=w['supervisor_id'],assigned_role=None if w['supervisor_id'] else 'maintenance_manager')
         if action=='approve':resolve_approval(conn,'Work Management','work_order',wo_id,'approve',user['id'],body.notes)
