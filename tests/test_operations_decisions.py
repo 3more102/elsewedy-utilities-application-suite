@@ -93,6 +93,13 @@ def test_why_red_open_outages_shares_sum_to_total():
 def test_why_red_overdue_buckets_and_unknown_key():
     with TestClient(app) as client:
         headers = _auth(client)
+        before = client.get('/api/operations/why-red?key=overdue_work_orders', headers=headers)
+        assert before.status_code == 200, before.text
+        before_payload = before.json()
+        before_unassigned = next(
+            (c['count'] for c in before_payload['contributors'] if c['label'] == 'unassigned'),
+            0,
+        )
         suffix = uuid.uuid4().hex[:8]
         past = _iso(datetime.now() - timedelta(days=3))
         wo_ids = []
@@ -112,9 +119,14 @@ def test_why_red_overdue_buckets_and_unknown_key():
             result = client.get('/api/operations/why-red?key=overdue_work_orders', headers=headers)
             assert result.status_code == 200, result.text
             payload = result.json()
-            # The unassigned overdue probe must appear under a named cause.
-            joined = ' '.join(c['detail'] for c in payload['contributors'])
-            assert f'WO-WHY-{suffix}' in joined
+            # Evidence details are intentionally capped per cause to keep the
+            # response bounded. Verify the stable aggregate contract instead
+            # of depending on this probe landing in that display sample.
+            unassigned = next(
+                c for c in payload['contributors'] if c['label'] == 'unassigned'
+            )
+            assert payload['total'] == before_payload['total'] + 1
+            assert unassigned['count'] == before_unassigned + 1
 
             missing = client.get('/api/operations/why-red?key=nope', headers=headers)
             assert missing.status_code == 404
