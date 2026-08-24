@@ -1,0 +1,36 @@
+name: Temporary pagination branch sync
+on:
+  push:
+    branches:
+      - oxalpha/euas-list-pagination
+    paths:
+      - .github/workflows/tmp-sync-pagination.yml
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: oxalpha/euas-list-pagination
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Merge current main without rewriting history
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin main
+          git merge --no-edit origin/main
+      - name: Regenerate deterministic engineering evidence
+        run: |
+          python scripts/engineering_evidence.py > ENGINEERING_EVIDENCE.json
+      - name: Remove temporary workflow
+        run: git rm .github/workflows/tmp-sync-pagination.yml
+      - name: Commit synchronized branch
+        run: |
+          git add ENGINEERING_EVIDENCE.json
+          git commit -m 'merge: sync pagination hardening with current main'
+          git push origin HEAD:oxalpha/euas-list-pagination
