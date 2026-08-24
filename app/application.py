@@ -1919,12 +1919,45 @@ def upload_document(title:str=Form(...),category:str=Form(...),asset_id:Optional
         raise
     with db() as conn:
         no=next_no(conn,'documents','document_no','DOC-',6001);cur=conn.execute('''INSERT INTO documents(document_no,title,category,file_name,stored_name,mime_type,asset_id,work_order_id,location_id,project_id,vendor_id,uploaded_by,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(no,title,category,original,stored,file.content_type or '',asset_id,work_order_id,location_id,project_id,vendor_id,user['id'],now()));audit(conn,user['id'],'UPLOAD','Documents',no,'',original);return {'id':cur.lastrowid,'document_no':no,'size_bytes':size}
+# Media types are derived from the server-generated stored-file suffix, never
+# from the client-supplied upload Content-Type, so a hostile client cannot
+# have EUAS serve attacker-chosen active content types (e.g. text/html) from
+# the document store. Anything unmapped falls back to inert octet-stream.
+_DOCUMENT_MEDIA_TYPES = {
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.txt': 'text/plain',
+    '.csv': 'text/csv',
+    '.doc': 'application/msword',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xls': 'application/vnd.ms-excel',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.zip': 'application/zip',
+}
+
+
+def _document_media_type(stored_name: str) -> str:
+    suffix = Path(stored_name or '').suffix.lower()
+    return _DOCUMENT_MEDIA_TYPES.get(suffix, 'application/octet-stream')
+
+
+def _document_download_name(file_name: str) -> str:
+    # Strip header-breaking control characters and quotes before the value is
+    # echoed into the Content-Disposition response header.
+    cleaned = ''.join('_' if (ord(ch) < 32 or ord(ch) > 126 or ch in '"\\') else ch for ch in str(file_name or ''))[:150]
+    return cleaned.strip() or 'document'
+
+
 @app.get('/api/documents/{doc_id}/download')
 def download_document(doc_id:int,user=Depends(current_user)):
     with db() as conn:d=get_or_404(conn,'SELECT * FROM documents WHERE id=?',(doc_id,),'Document not found')
     p=UPLOAD_DIR/d['stored_name']
     if not p.exists():raise HTTPException(404,'Stored file missing')
-    return FileResponse(p,filename=d['file_name'],media_type=d['mime_type'] or 'application/octet-stream')
+    safe_name=_document_download_name(d['file_name'])
+    return FileResponse(p,filename=safe_name,media_type=_document_media_type(d['stored_name']),content_disposition_type='attachment')
 
 # ---------- service levels / integration events ----------
 @app.get('/api/sla/summary')
