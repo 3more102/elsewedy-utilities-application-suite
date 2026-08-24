@@ -321,11 +321,15 @@ def write_snapshot(conn, f: ExecutiveFilters, payload: dict) -> bool:
 def compute_reliability(conn, f: ExecutiveFilters) -> dict:
     w = f.window()
     scope_sql, scope_args = _asset_scope(f)
+    # The denominator population must be exactly the scoped asset set.
+    # Never append a disjunction here: ``AND`` binds tighter than ``OR``, so
+    # a condition like ``x IS NOT NULL OR 1=1{scope}`` silently drops the
+    # scope for every commissioned asset and inflates availability/SAIDI.
     assets = _rows(conn.execute(
         'SELECT a.id, s.id site_id FROM assets a'
         ' LEFT JOIN locations l ON l.id=a.location_id'
         ' LEFT JOIN sites s ON s.id=l.site_id'
-        ' WHERE a.commissioning_date IS NOT NULL OR 1=1' + scope_sql,
+        ' WHERE 1=1' + scope_sql,
         scope_args,
     ))
     asset_ids = [a['id'] for a in assets]
@@ -1637,7 +1641,9 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
 
         A planned-outage count must never be explained using Forced/unplanned
         outage rows; each driver here corresponds to one non-forced outage
-        starting inside the explained window.
+        starting inside the explained window. The metric counts records by
+        ``start_at``, so drivers include every counted record — even an open
+        or future scheduled outage whose elapsed overlap is currently zero.
         """
         win_start_dt = datetime.fromisoformat(win_start + 'T00:00:00')
         win_end_dt = datetime.fromisoformat(win_end + 'T23:59:59')
@@ -1649,11 +1655,12 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
                 sql,
                 [win_start + 'T00:00:00', win_end + 'T23:59:59'] + extra_args)):
             hours = _outage_overlap_hours(row['start_at'], row.get('end_at'), win_start_dt, win_end_dt)
-            if hours <= 0:
-                continue
+            status = str(row.get('status') or '')
+            state = ('ongoing' if not row.get('end_at') and status != 'Closed'
+                     else 'scheduled' if hours <= 0 else 'recorded')
             drivers.append({
                 'kind': 'planned_outage',
-                'label': f"{row['asset_no']} planned outage",
+                'label': (f"{row['asset_no']} planned outage ({state})"),
                 'hours': round(hours, 2),
                 'link': {'module': 'operations', 'record': row['outage_no'], 'id': row['id']},
             })

@@ -32,23 +32,24 @@ def _auth(client):
 
 
 def _insert_asset(conn, suffix, label, site_id, *, criticality, asset_type_id,
-                  category='Transformer'):
+                  category='Transformer', commissioning=None):
     stamp = now()
     cur = conn.execute(
         '''INSERT INTO assets(asset_no,name,category,asset_type_id,criticality,
-                              condition,status,location_id,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                              condition,status,location_id,commissioning_date,
+                              created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
         (f'AST-{label}-{suffix}', f'{label} asset {suffix}', category,
          asset_type_id, criticality, 'Good', 'Operating',
          int(conn.execute('SELECT id FROM locations WHERE site_id=? ORDER BY id LIMIT 1',
                           (site_id,)).fetchone()[0]),
-         stamp, stamp),
+         commissioning, stamp, stamp),
     )
     return int(cur.lastrowid)
 
 
 def _insert_outage(conn, suffix, tag, asset_id, site_id, outage_type,
-                   start_at, end_at):
+                   start_at, end_at, status='Closed'):
     user_id = int(conn.execute(
         "SELECT id FROM users WHERE username='omar'").fetchone()[0])
     stamp = now()
@@ -56,17 +57,19 @@ def _insert_outage(conn, suffix, tag, asset_id, site_id, outage_type,
         '''INSERT INTO asset_outages(
                outage_no,asset_id,site_id,outage_type,status,start_at,end_at,
                reported_by,created_at,updated_at)
-           VALUES(?,?,?,?,'Closed',?,?,?,?,?)''',
-        (f'OUT-{tag}-{suffix}', asset_id, site_id, outage_type,
+           VALUES(?,?,?,?,?,?,?,?,?,?)''',
+        (f'OUT-{tag}-{suffix}', asset_id, site_id, outage_type, status,
          start_at.isoformat(timespec='seconds'),
-         end_at.isoformat(timespec='seconds'),
+         end_at.isoformat(timespec='seconds') if end_at else None,
          user_id, stamp, stamp),
     )
 
 
 def _seed_scope(conn):
     """Two sites in two regions; each with a critical transformer plus one
-    low-criticality pump. Site A additionally gets a planned outage."""
+    low-criticality pump. Site A additionally gets a planned outage and an
+    open scheduled planned outage. Assets carry commissioning dates so the
+    denominator-scope regression is exercised against commissioned records."""
     suffix = uuid.uuid4().hex[:8].upper()
     cur = conn.execute(
         '''INSERT INTO asset_types(code,name,utility_domain) VALUES(?,?,?)''',
@@ -94,13 +97,40 @@ def _seed_scope(conn):
     assets = {
         'a_crit': _insert_asset(conn, suffix, 'CRA', sites['a'],
                                 criticality='Critical',
-                                asset_type_id=transformer_type_id),
+                                asset_type_id=transformer_type_id,
+                                commissioning='2020-01-01'),
         'a_low': _insert_asset(conn, suffix, 'LRA', sites['a'],
                                criticality='Low', category='Pump',
-                               asset_type_id=pump_type_id),
+                               asset_type_id=pump_type_id,
+                               commissioning='2020-01-01'),
         'b_crit': _insert_asset(conn, suffix, 'CRB', sites['b'],
                                 criticality='Critical',
-                                asset_type_id=transformer_type_id),
+                                asset_type_id=transformer_type_id,
+                                commissioning='2020-01-01'),
+    }
+
+    forced_start = datetime.now() - timedelta(days=2)
+    _insert_outage(conn, suffix, 'FA', assets['a_crit'], sites['a'], 'Forced',
+                   forced_start, forced_start + timedelta(hours=2))
+    _insert_outage(conn, suffix, 'FB', assets['b_crit'], sites['b'], 'Forced',
+                   forced_start, forced_start + timedelta(hours=3))
+    _insert_outage(conn, suffix, 'FL', assets['a_low'], sites['a'], 'Forced',
+                   forced_start, forced_start + timedelta(hours=5))
+    planned_start = datetime.now() - timedelta(days=4)
+    _insert_outage(conn, suffix, 'PA', assets['a_crit'], sites['a'], 'Planned',
+                   planned_start, planned_start + timedelta(hours=1))
+    # Open, still-ongoing scheduled planned outage starting in the future:
+    # counted by the metric via start_at, with zero elapsed overlap so far.
+    scheduled_start = datetime.now() + timedelta(hours=2)
+    _insert_outage(conn, suffix, 'PS', assets['a_crit'], sites['a'], 'Planned',
+                   scheduled_start, None, status='Open')
+
+    return {
+        'site_a': sites['a'],
+        'region_a': 'Region Alpha',
+        'asset_type_transformer': transformer_type_id,
+        'asset_type_pump': pump_type_id,
+        'scheduled_planned_suffix': f'OUT-PS-{suffix}',
     }
 
     forced_start = datetime.now() - timedelta(days=2)
@@ -243,3 +273,72 @@ def test_planned_outage_why_cites_only_planned_records():
                     'SELECT outage_type FROM asset_outages WHERE id=?',
                     (driver['source_id'],)).fetchone()
                 assert str(row['outage_type']) == 'Forced'
+
+
+# --------------------------------------------------------------------------- #
+# 4. Availability denominator is exactly the scoped asset population
+# --------------------------------------------------------------------------- #
+
+def test_scoped_availability_denominator_excludes_commissioned_out_of_scope_assets():
+    """Commissioning dates must not exempt assets from executive scope.
+
+    SQL binds ``AND`` tighter than ``OR``; the previous denominator predicate
+    (``commissioning_date IS NOT NULL OR 1=1{scope}``) therefore admitted every
+    commissioned asset in the database into period_hours and the SAIDI customer
+    basis regardless of the requested site/criticality.
+    """
+    with TestClient(app) as client:
+        _auth(client)
+        with db() as conn:
+            seed = _seed_scope(conn)
+
+        with db() as conn:
+            scoped = compute_reliability(
+                conn, ExecutiveFilters(period_days=30, site_id=seed['site_a'],
+                                       criticality='Critical'))
+
+        # Exactly one scoped asset: a 30-day window holds 720 asset-hours and
+        # one two-hour forced outage.
+        assert scoped['period_hours'] == 720.0
+        assert scoped['total_downtime_hours'] == 2.0
+        assert scoped['availability_pct'] == round(100 * (720 - 2) / 720, 2)
+        # Customer basis covers only the scoped site's declared customers.
+        assert scoped['customers_basis'] == 'configured'
+        assert scoped['customer_count_total'] == 1000
+        assert scoped['saidi_minutes'] == round(2 * 60 * 1000 / 1000, 2)
+
+
+# --------------------------------------------------------------------------- #
+# 5. Scheduled/open planned outages stay resolvable WHY evidence
+# --------------------------------------------------------------------------- #
+
+def test_planned_outage_why_includes_zero_elapsed_scheduled_records():
+    """The metric counts planned outages by start_at; drivers must too.
+
+    An open planned outage scheduled to start inside the window has zero
+    elapsed overlap, but discarding it would leave a nonzero KPI value with
+    missing contributor evidence for exactly that record.
+    """
+    with TestClient(app) as client:
+        headers = _auth(client)
+        with db() as conn:
+            seed = _seed_scope(conn)
+
+        response = client.get(
+            '/api/kpi/explanation',
+            headers=headers,
+            params={'family': 'reliability', 'metric': 'planned_outages',
+                    'site_id': seed['site_a'], 'period_days': 30},
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+
+        with db() as conn:
+            expected = int(conn.execute(
+                'SELECT id FROM asset_outages WHERE outage_no=?',
+                (seed['scheduled_planned_suffix'],)).fetchone()[0])
+        scheduled = [d for d in payload['drivers']
+                     if d['source_id'] == expected]
+        assert scheduled, 'scheduled planned outage missing from drivers'
+        assert scheduled[0]['kind'] == 'planned_outage'
+        assert scheduled[0]['magnitude'] == 0.0
