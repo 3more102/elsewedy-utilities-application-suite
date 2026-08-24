@@ -533,8 +533,27 @@ def notify_once(conn,title,message,severity='Info',user_id=None,role_code=None,m
     if existing:return False
     notify(conn,title,message,severity,user_id,role_code,module,record_id);return True
 
+_CSV_FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
+
+
+def _csv_safe_cell(value):
+    """Neutralize spreadsheet formula injection in exported cells.
+
+    User-controlled strings (asset names, work-order titles, notes, ...) are
+    echoed into CSV downloads that operators open with spreadsheet
+    applications. A leading =, +, - or @ would be evaluated as a formula by
+    Excel/LibreOffice, so such cells are prefixed with a single quote. The
+    cell stays readable and no legitimate value is silently altered.
+    """
+    if not isinstance(value, str) or not value.startswith(_CSV_FORMULA_PREFIXES):
+        return value
+    return "'" + value
+
+
 def csv_response(filename, headers, data_rows):
-    buf=io.StringIO();w=csv.writer(buf);w.writerow(headers);w.writerows(data_rows)
+    buf=io.StringIO();w=csv.writer(buf)
+    w.writerow([_csv_safe_cell(h) for h in headers])
+    w.writerows([[_csv_safe_cell(cell) for cell in row] for row in data_rows])
     return StreamingResponse(iter([buf.getvalue()]),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="{filename}"'})
 
 def _generate_due_pm(conn, actor_id:int, target:date):
@@ -1310,7 +1329,8 @@ def delete_asset(asset_id:int,user=Depends(require_roles('admin','asset_manager'
 @app.get('/api/assets-export.csv')
 def export_assets(user=Depends(current_user)):
     with db() as conn:data=rows(conn.execute(ASSET_SELECT+' ORDER BY a.asset_no'))
-    out=io.StringIO(); fields=['asset_no','name','category','manufacturer','model','serial_no','criticality','condition','status','site_name','location_name','department','responsible_person','current_value','next_maintenance'];w=csv.DictWriter(out,fieldnames=fields,extrasaction='ignore');w.writeheader();w.writerows(data)
+    out=io.StringIO(); fields=['asset_no','name','category','manufacturer','model','serial_no','criticality','condition','status','site_name','location_name','department','responsible_person','current_value','next_maintenance'];w=csv.DictWriter(out,fieldnames=fields,extrasaction='ignore');w.writeheader()
+    for record in data:w.writerow({k:_csv_safe_cell(v) for k,v in record.items()})
     return StreamingResponse(iter([out.getvalue()]),media_type='text/csv',headers={'Content-Disposition':'attachment; filename=EUAS_assets.csv'})
 @app.post('/api/meters/{meter_id}/readings')
 def add_meter_reading(meter_id:int,body:MeterReadingIn,user=Depends(require_roles(*WORK_ROLES))):
