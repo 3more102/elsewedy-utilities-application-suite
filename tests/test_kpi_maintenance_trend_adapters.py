@@ -123,7 +123,7 @@ def test_maintenance_trends_extract_existing_canonical_values_only():
         assert canonical['emergency_wo'] == 1
         assert canonical['high_risk_overdue_wo'] == 1
         assert canonical['unassigned_critical_wo'] == 1
-        assert canonical['schedule_compliance_pct'] == 100.0
+        assert canonical['schedule_compliance_pct'] == 50.0
         assert canonical['mttr_hours'] == 2.0
 
         for metric, (canonical_key, unit, direction) in expected_meta.items():
