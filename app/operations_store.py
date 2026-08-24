@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Query
 
 from . import application as _application
 from .auth import current_user
@@ -904,6 +904,243 @@ def blocker_chain(conn, wo_id: int) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Operations inbox (role-aware, flood-safe)
+# ---------------------------------------------------------------------------
+_INBOX_CAP = 20
+_ALARM_OWNER_ROLES = ('admin', 'maintenance_manager', 'asset_manager')
+_PLANNER_ROLES = ('admin', 'maintenance_manager', 'planner')
+_STORE_ROLES = ('admin', 'storekeeper', 'procurement', 'maintenance_manager')
+
+
+def _operations_inbox(conn, user: dict) -> dict:
+    uid = int(user['id'])
+    role = str(user.get('role') or '')
+    generated = _now_iso()
+
+    my_actions: dict[str, list] = {}
+    my_risks: dict[str, list] = {}
+    system_events: list[dict] = []
+
+    # Approvals waiting on me (by user or by role).
+    approvals = _rows(conn.execute(
+        '''SELECT a.id,a.approval_no,a.module,a.record_code,a.title,a.requested_at,
+                  a.assigned_role,a.assigned_user_id
+           FROM approval_requests a
+           WHERE a.status='Pending'
+             AND (a.assigned_user_id=? OR (a.assigned_role=? AND a.assigned_user_id IS NULL))
+           ORDER BY a.requested_at ASC LIMIT ?''',
+        (uid, role, _INBOX_CAP),
+    ))
+    if approvals:
+        my_actions['approvals'] = [
+            {
+                'approval_no': a['approval_no'],
+                'module': a['module'],
+                'record_code': a['record_code'],
+                'title': a['title'],
+                'requested_at': a['requested_at'],
+                'entity_type': 'approval_request',
+                'entity_id': int(a['id']),
+            }
+            for a in approvals
+        ]
+
+    # Work assigned to me and still open.
+    my_work = _rows(conn.execute(
+        '''SELECT w.id,w.wo_no,w.title,w.priority,w.status,w.target_finish,
+                  sl.resolution_status,sl.response_due,sl.resolution_due
+           FROM work_orders w LEFT JOIN work_order_sla sl ON sl.work_order_id=w.id
+           WHERE w.assigned_to=? AND w.status NOT IN ('Completed','Closed','Cancelled')
+           ORDER BY CASE w.priority WHEN 'Emergency' THEN 5 WHEN 'Critical' THEN 4
+                    WHEN 'High' THEN 3 WHEN 'Medium' THEN 2 ELSE 1 END DESC, w.id
+           LIMIT ?''',
+        (uid, _INBOX_CAP),
+    ))
+    if my_work:
+        today = _application.date.today().isoformat()
+        now_ts = datetime.now()
+        items = []
+        for w in my_work:
+            overdue = bool(w['target_finish'] and str(w['target_finish'])[:10] < today)
+            sla_risk = bool(
+                w['resolution_due'] and not overdue
+                and _parse_ts(w['resolution_due'])
+                and _parse_ts(w['resolution_due']) < now_ts + timedelta(hours=24)
+                and w['resolution_status'] != 'Breached'
+            )
+            items.append({
+                **w,
+                'overdue': overdue,
+                'sla_24h_risk': sla_risk,
+                'entity_type': 'work_order',
+                'entity_id': int(w['id']),
+            })
+        my_actions['assigned_work'] = items
+
+    # Critical alarms awaiting acknowledgment for operating roles.
+    if role in _ALARM_OWNER_ROLES:
+        alarms = _rows(conn.execute(
+            '''SELECT oa.id,oa.alarm_no,oa.severity,oa.message,oa.opened_at,a.asset_no
+               FROM operational_alarms oa JOIN assets a ON a.id=oa.asset_id
+               WHERE oa.status='Open' AND oa.severity='Critical'
+               ORDER BY oa.opened_at ASC LIMIT ?''',
+            (_INBOX_CAP,),
+        ))
+        if alarms:
+            my_actions['alarms_to_acknowledge'] = [
+                {
+                    **a,
+                    'entity_type': 'operational_alarm',
+                    'entity_id': int(a['id']),
+                }
+                for a in alarms
+            ]
+
+    # SLA escalations touching my work or my span of control.
+    if role in _ALARM_OWNER_ROLES + ('supervisor',):
+        breaches = _rows(conn.execute(
+            '''SELECT sl.work_order_id,w.wo_no,w.title,w.assigned_to,
+                      sl.response_status,sl.resolution_status,sl.escalated_level
+               FROM work_order_sla sl JOIN work_orders w ON w.id=sl.work_order_id
+               WHERE sl.response_status='Breached' OR sl.resolution_status='Breached'
+                  OR sl.escalated_level>0
+               ORDER BY sl.updated_at DESC LIMIT ?''',
+            (_INBOX_CAP,),
+        ))
+        mine = [b for b in breaches if b['assigned_to'] == uid] or breaches
+        if mine:
+            my_risks['sla_escalations'] = [
+                {**b, 'entity_type': 'work_order', 'entity_id': int(b['work_order_id'])}
+                for b in mine[:_INBOX_CAP]
+            ]
+
+    # Deteriorating critical assets for asset-owner roles.
+    if role in _ALARM_OWNER_ROLES:
+        deteriorating = _rows(conn.execute(
+            '''SELECT s.asset_id,s.score,s.risk_band,s.calculated_at,a.asset_no,a.name asset_name
+               FROM asset_health_snapshots s JOIN assets a ON a.id=s.asset_id
+               WHERE s.id IN (SELECT MAX(id) FROM asset_health_snapshots GROUP BY asset_id)
+                 AND s.score<=50 AND a.criticality IN ('Critical','High')
+               ORDER BY s.score ASC LIMIT ?''',
+            (_INBOX_CAP,),
+        ))
+        if deteriorating:
+            my_risks['deterioration_watchlist'] = [
+                {**d, 'entity_type': 'asset', 'entity_id': int(d['asset_id'])}
+                for d in deteriorating
+            ]
+
+    # Overdue jobs I own (already in assigned_work but surfaced as risk too).
+    if my_work:
+        today = _application.date.today().isoformat()
+        overdue = [
+            {
+                'wo_no': w['wo_no'],
+                'target_finish': w['target_finish'],
+                'entity_type': 'work_order',
+                'entity_id': int(w['id']),
+            }
+            for w in my_work
+            if w['target_finish'] and str(w['target_finish'])[:10] < today
+        ]
+        if overdue:
+            my_risks['my_overdue_jobs'] = overdue
+
+    # Material shortages for store/procurement roles.
+    if role in _STORE_ROLES:
+        shortages = _rows(conn.execute(
+            '''SELECT id,item_no,name,current_stock,reserved_stock,reorder_point
+               FROM inventory_items WHERE current_stock-reserved_stock<=reorder_point
+               ORDER BY current_stock-reserved_stock ASC LIMIT ?''',
+            (_INBOX_CAP,),
+        ))
+        if shortages:
+            my_risks['stock_shortages'] = [
+                {**s, 'entity_type': 'inventory_item', 'entity_id': int(s['id'])}
+                for s in shortages
+            ]
+
+    # System events: outages opened/restored in the last 24 hours.
+    cutoff = (datetime.now() - timedelta(hours=24)).isoformat(timespec='seconds')
+    outages = _rows(conn.execute(
+        '''SELECT o.outage_no,o.status,o.start_at,o.end_at,a.asset_no
+           FROM asset_outages o JOIN assets a ON a.id=o.asset_id
+           WHERE o.start_at>=? OR (o.end_at IS NOT NULL AND o.end_at>=?)
+           ORDER BY COALESCE(o.end_at,o.start_at) DESC LIMIT 10''',
+        (cutoff, cutoff),
+    ))
+    for o in outages:
+        restored = o['end_at'] is not None and o['status'] != 'Open'
+        system_events.append({
+            'kind': 'outage_restored' if restored else 'outage_open',
+            'label': f"{o['outage_no']} on {o['asset_no']} "
+                     + ('restored' if restored else 'opened'),
+            'ts': o['end_at'] or o['start_at'],
+            'entity_type': 'outage',
+            'entity_no': o['outage_no'],
+        })
+    system_events.sort(key=lambda e: e['ts'], reverse=True)
+
+    action_count = sum(len(v) for v in my_actions.values())
+    risk_count = sum(len(v) for v in my_risks.values())
+    return {
+        'generated_at': generated,
+        'role': role,
+        'counts': {'actions': action_count, 'risks': risk_count, 'events': len(system_events)},
+        'my_actions': my_actions,
+        'my_risks': my_risks,
+        'system_events': system_events,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Command search across operational entities
+# ---------------------------------------------------------------------------
+_SEARCH_SPECS = (
+    ('asset', 'assets a', 'a.id,a.asset_no no,a.name title,a.status detail',
+     'a.asset_no LIKE ? OR a.name LIKE ?', ('asset_no',)),
+    ('site', 'sites s', 's.id,s.site_code no,s.name title,s.region detail',
+     's.site_code LIKE ? OR s.name LIKE ?', None),
+    ('work_order', 'work_orders w', "w.id,w.wo_no no,w.title title,w.status detail",
+     'w.wo_no LIKE ? OR w.title LIKE ?', None),
+    ('purchase_order', 'purchase_orders p', 'p.id,p.po_no no,p.status title,p.order_date detail',
+     'p.po_no LIKE ?', None),
+    ('requisition', 'purchase_requisitions p', 'p.id,p.pr_no no,p.title title,p.status detail',
+     'p.pr_no LIKE ? OR p.title LIKE ?', None),
+    ('alarm', 'operational_alarms oa', 'oa.id,oa.alarm_no no,oa.message title,oa.status detail',
+     'oa.alarm_no LIKE ? OR oa.message LIKE ?', None),
+    ('employee', 'users u LEFT JOIN roles r ON r.id=u.role_id',
+     'u.id,u.username no,u.full_name title,r.code detail',
+     'u.full_name LIKE ? OR u.username LIKE ?', None),
+    ('location', 'locations l LEFT JOIN sites s ON s.id=l.site_id',
+     'l.id,l.location_code no,l.name title,s.name detail',
+     'l.location_code LIKE ? OR l.name LIKE ?', None),
+)
+
+
+def command_search(conn, q: str, limit_per_type: int = 5) -> dict:
+    term = (q or '').strip()
+    if not term:
+        return {'query': '', 'results': {}, 'total': 0}
+    like = f'%{term}%'
+    results: dict[str, list] = {}
+    total = 0
+    for kind, source, columns, predicate, _unused in _SEARCH_SPECS:
+        placeholders = predicate.count('?')
+        # LIMIT is interpolated as a validated integer; the LIKE term is bound.
+        sql = f'SELECT {columns} FROM {source} WHERE {predicate} LIMIT {int(limit_per_type)}'
+        rows_ = _rows(conn.execute(sql, tuple([like] * placeholders)))
+        if not rows_:
+            continue
+        entries = rows_[:limit_per_type]
+        results[kind] = [
+            {**e, 'entity_type': kind, 'entity_id': int(e['id'])} for e in entries
+        ]
+        total += len(entries)
+    return {'query': term, 'results': results, 'total': total}
+
+
 def install_operations_routes() -> None:
     app = _application.app
     marker = '_euas_operations_routes'
@@ -941,6 +1178,20 @@ def install_operations_routes() -> None:
     def operations_blocker_chain_route(wo_id: int, user=Depends(current_user)):
         with db() as conn:
             return blocker_chain(conn, wo_id)
+
+    @app.get('/api/operations/inbox')
+    def operations_inbox_route(user=Depends(current_user)):
+        with db() as conn:
+            return _operations_inbox(conn, user)
+
+    @app.get('/api/command-search')
+    def command_search_route(
+        q: str = '',
+        limit: int = Query(5, ge=1, le=20),
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            return command_search(conn, q, limit)
 
     app.openapi_schema = None
     setattr(app.state, marker, True)
