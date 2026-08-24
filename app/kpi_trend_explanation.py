@@ -331,6 +331,32 @@ def _repeat_failure_drivers(conn, f, limit: int = 10) -> list[dict]:
     return drivers
 
 
+def _pm_compliance_drivers(conn, f, limit: int = 10) -> list[dict]:
+    """Overdue-plan contributors for the PM compliance rate.
+
+    Consumes the canonical ``pm_compliance`` explanation section; each
+    contributor is a calendar plan the metric itself counts as overdue, so
+    ``contributor`` attribution applies.
+    """
+    from .kpi_service import explain_kpi_changes
+
+    section = (explain_kpi_changes(conn, f).get('pm_compliance') or {})
+    drivers = []
+    for driver in (section.get('drivers') or [])[:limit]:
+        link = driver.get('link') or {}
+        drivers.append({
+            'kind': 'overdue_pm',
+            'label': driver.get('label'),
+            'magnitude': driver.get('days_overdue'),
+            'unit': 'days overdue',
+            'attribution': 'contributor',
+            'source_type': 'pm_plan',
+            'source_id': link.get('id'),
+            'drill': link,
+        })
+    return drivers
+
+
 def explain_metric(conn, f, *, family: str, metric: str) -> dict:
     """Current vs previous window for one metric, with measured drivers.
 
@@ -373,6 +399,8 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
         drivers = _reliability_outage_drivers(conn, f, metric)
     elif family == 'maintenance' and metric == 'repeat_failure_rate_pct':
         drivers = _repeat_failure_drivers(conn, f)
+    elif family == 'maintenance' and metric == 'pm_compliance_pct':
+        drivers = _pm_compliance_drivers(conn, f)
     elif family == 'maintenance' and metric in {
             'open_work_orders', 'overdue_work_orders', 'emergency_work_orders',
             'high_risk_overdue_work_orders', 'unassigned_critical_work_orders',

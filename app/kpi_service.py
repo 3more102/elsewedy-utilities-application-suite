@@ -590,6 +590,24 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         + scope_sql, [w['period_end']] + scope_args).fetchone()[0])
     pm_compliance = round(100 * (pm_total - pm_overdue) / pm_total, 1) if pm_total else 100.0
 
+    # Overdue plan contributors share the exact joins, scope and predicates
+    # of the overdue count above (and therefore of pm_compliance_pct), so a
+    # listed plan can never fall outside the metric's own scope. Ranked by
+    # priority, then by how far past due the plan was at period end.
+    pm_overdue_plans = _rows(conn.execute(
+        'SELECT p.id,p.pm_no,p.name,p.priority,p.next_due,a.asset_no,a.criticality,'
+        'CAST(julianday(?) - julianday(p.next_due) AS INT) days_overdue'
+        ' FROM maintenance_plans p JOIN assets a ON a.id=p.asset_id'
+        ' LEFT JOIN locations l ON l.id=a.location_id'
+        ' LEFT JOIN sites s ON s.id=l.site_id'
+        " WHERE p.active=1 AND p.trigger_type='Calendar'"
+        ' AND p.next_due IS NOT NULL AND p.next_due<?' + scope_sql +
+        ' ORDER BY CASE p.priority WHEN \'Emergency\' THEN 5'
+        " WHEN 'Critical' THEN 4 WHEN 'High' THEN 3"
+        " WHEN 'Medium' THEN 2 ELSE 1 END DESC,"
+        ' days_overdue DESC LIMIT 10',
+        [w['period_end'], w['period_end']] + scope_args))
+
     scheduled = int(conn.execute(
         'SELECT COUNT(*)' + base + ' AND w.target_finish>=? AND w.target_finish<?'
         " AND w.status<>'Cancelled'",
@@ -663,6 +681,7 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         'high_risk_overdue_wo': high_risk_overdue,
         'unassigned_critical_wo': unassigned_critical,
         'pm_compliance_pct': pm_compliance,
+        'pm_overdue_plans': pm_overdue_plans,
         'schedule_compliance_pct': schedule_compliance,
         'backlog_hours': round(backlog_hours, 1),
         'backlog_weeks': round(backlog_hours / weekly_capacity, 1) if weekly_capacity else None,
@@ -1749,6 +1768,20 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
         'current': maint_now['pm_compliance_pct'],
         'previous': maint_prev['pm_compliance_pct'],
         'delta': round(maint_now['pm_compliance_pct'] - maint_prev['pm_compliance_pct'], 1),
+        'drivers': [
+            {
+                'kind': 'overdue_pm',
+                'label': (
+                    f"{r['pm_no']} on {r['asset_no']} overdue "
+                    f"{max(int(r['days_overdue'] or 0), 0)} d"
+                ),
+                'days_overdue': max(int(r['days_overdue'] or 0), 0),
+                'priority': r['priority'],
+                'link': {'module': 'maintenance', 'record': r['pm_no'],
+                         'id': r['id']},
+            }
+            for r in maint_now.get('pm_overdue_plans', [])
+        ],
     }
     explanations['backlog'] = {
         'current': maint_now['open_wo'],
