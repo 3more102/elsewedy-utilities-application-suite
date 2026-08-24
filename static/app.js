@@ -155,8 +155,42 @@ function materialBlockedPanel(d){
   ])
   const body=`<p class="trend">Open work orders whose remaining requirement exceeds reservations plus free stock. Shortages block execution until receiving or re-allocation.</p>
     ${table(['WO','Title','Priority','Status','Shortage lines'],rowsHtml)}
-    <div class="form-actions"><button class="btn" data-action-procurement="1">Open procurement module</button><button class="btn" data-action-inventory="1">Open inventory module</button></div>`
+    <div class="form-actions"><button class="btn" id="mb-load-shortages">Show exact shortage lines</button><button class="btn" data-action-procurement="1">Open procurement module</button><button class="btn" data-action-inventory="1">Open inventory module</button></div>
+    <div id="mb-shortage-lines"></div>`
   return kpiFamilyPanel('Material-Blocked Work',`${count} job(s) waiting on materials`,body)
+}
+async function loadShortageExpediteLines(){
+  const wrap=$('#mb-shortage-lines');if(!wrap)return
+  wrap.innerHTML='<div class="empty">Loading…</div>'
+  try{
+    const sh=await api('/api/kpi/parts/shortages')
+    const canRaise=roleIn('admin','storekeeper','maintenance_manager','procurement','planner')
+    wrap.innerHTML=(sh.lines.length?table(['WO','Priority','Part','Outstanding',''],sh.lines.map(l=>[
+      `<a href="#" class="mb-open-link" data-wo="${l.wo_id}">${esc(l.wo_no)}</a>`,
+      status(l.priority),
+      `${esc(l.item_no)} — ${esc(l.item_name)}`,
+      `<b>${fmt(l.outstanding_short)} ${esc(l.unit||'')}</b>`,
+      canRaise?`<button class="btn small" data-expedite="${l.wo_id}" data-item="${l.item_id}" data-qty="${l.outstanding_short}" data-short="${esc(l.item_no)}" title="Opens the standard Create Purchase Requisition flow, prefilled with the outstanding quantity. Submission stays subject to procurement permissions and audit.">Expedite</button>`:''
+    ])):empty('No shortage lines blocking open work'))
+    $$('#mb-shortage-lines .mb-open-link').forEach(a=>{a.onclick=e=>{e.preventDefault();workDetail(Number(a.dataset.wo))}})
+    $$('[data-expedite]').forEach(b=>b.onclick=async()=>{
+      try{
+        const items=S.cache.inventory||await api('/api/inventory');S.cache.inventory=items
+        const item=items.find(x=>x.id===Number(b.dataset.item))
+        if(!item){toast('Item not found in inventory cache');return}
+        newPR();
+        setTimeout(()=>{
+          const f=$('#dynamic-form');if(!f)return
+          const set=(name,value)=>{const el=f.querySelector(`[name="${name}"]`);if(el&&value!=null)el.value=value}
+          set('title',`Expedite ${b.dataset.short} for open work order shortage`)
+          set('inventory_item_id',String(item.id))
+          set('quantity',b.dataset.qty)
+          set('estimated_unit_cost',item.unit_price??0)
+          set('justification',`Reservation-exact shortage of ${b.dataset.qty} blocking open work (${b.dataset.short}). Raised from the executive dashboard.`)
+        },60)
+      }catch(err){toast(err.message)}
+    })
+  }catch(e){wrap.innerHTML=empty(e.message)}
 }
 function bindKpiDashboardHandlers(){
   $$('.rel-contributor-link').forEach(a=>{a.onclick=e=>{e.preventDefault();kpiContributorDetail(Number(a.dataset.idx))}})
@@ -164,6 +198,7 @@ function bindKpiDashboardHandlers(){
   $$('.wf-contributor-link').forEach(a=>{a.onclick=e=>{e.preventDefault();kpiWfDetail(Number(a.dataset.idx))}})
   $$('.wo-contributor-link').forEach(a=>{a.onclick=e=>{e.preventDefault();kpiWoDetail(Number(a.dataset.idx))}})
   $$('.mb-open-link').forEach(a=>{a.onclick=e=>{e.preventDefault();openMaterialBlockedWorkOrder(Number(a.dataset.idx))}})
+  const mbShortages=$('[data-action-mb-shortages]')||$('#mb-load-shortages');if(mbShortages)mbShortages.onclick=()=>loadShortageExpediteLines()
   $$('[data-action-dispatch]').forEach(b=>{b.onclick=()=>{closeModal();go('dispatch')}})
   $$('[data-action-procurement]').forEach(b=>{b.onclick=()=>{closeModal();go('procurement')}})
   $$('[data-action-inventory]').forEach(b=>{b.onclick=()=>{closeModal();go('inventory')}})
