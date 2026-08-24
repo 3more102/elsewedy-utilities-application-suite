@@ -226,6 +226,25 @@ def process_outbox_atomic(conn) -> dict:
             ):
                 delivered += 1
         except Exception as exc:
+            # A failure that spends the final attempt turns this event into a
+            # poison message: nothing will retry it automatically. Alert
+            # operators in the same transaction that records the failed
+            # generation; notify_once keeps a single unread alert per event.
+            exhausted = int(item['attempts']) >= int(_application.OUTBOX_MAX_ATTEMPTS)
+            if exhausted:
+                _application.notify_once(
+                    conn,
+                    'Outbox delivery exhausted',
+                    (
+                        f"{item['event_no']} ({item['event_type']}) failed after "
+                        f"{item['attempts']} attempts: {str(exc)[:200]}"
+                    ),
+                    'Warning',
+                    None,
+                    'maintenance_manager',
+                    'Integration Events',
+                    f"outbox-exhausted:{item['event_no']}",
+                )
             if _finalize_claim(
                 conn,
                 item,

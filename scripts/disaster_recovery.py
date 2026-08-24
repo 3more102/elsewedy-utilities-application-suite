@@ -243,6 +243,13 @@ def restore_backup(
     manifest = _load_manifest(backup_dir)
     backend = manifest["database_backend"]
 
+    backup_schema = manifest.get("schema_version")
+    if isinstance(backup_schema, int) and backup_schema > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Backup schema version {backup_schema} is newer than application "
+            f"schema version {SCHEMA_VERSION}; refusing to downgrade the target database"
+        )
+
     if backend == "sqlite":
         source = backup_dir / "database.sqlite3"
         sqlite_target = sqlite_target.resolve()
