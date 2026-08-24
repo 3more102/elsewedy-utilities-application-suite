@@ -571,7 +571,287 @@ def compute_inventory_kpis(conn, slow_moving_days: int = 90) -> dict:
     }
 
 
+MAINTENANCE_KPI_DEFINITIONS: dict[str, dict] = {
+    'open_work_orders': {
+        'name': 'Open Work Orders',
+        'definition': 'Work orders not yet completed, closed or cancelled.',
+        'formula': "count(work_orders where status NOT IN ('Completed','Closed','Cancelled'))",
+        'unit': 'work orders',
+        'direction': 'lower_is_better',
+        'target': 0.0,
+        'warning_threshold': 40.0,
+        'critical_threshold': 80.0,
+        'sources': ['work_orders'],
+    },
+    'overdue_work_orders': {
+        'name': 'Overdue Work Orders',
+        'definition': 'Open work orders past their target finish date.',
+        'formula': 'count(open work orders with target_finish < today)',
+        'unit': 'work orders',
+        'direction': 'lower_is_better',
+        'target': 0.0,
+        'warning_threshold': 5.0,
+        'critical_threshold': 15.0,
+        'sources': ['work_orders'],
+    },
+    'emergency_work_orders': {
+        'name': 'Emergency Work Orders',
+        'definition': 'Open work orders raised at emergency priority.',
+        'formula': "count(open work orders with priority='Emergency')",
+        'unit': 'work orders',
+        'direction': 'lower_is_better',
+        'target': 0.0,
+        'warning_threshold': 2.0,
+        'critical_threshold': 5.0,
+        'sources': ['work_orders'],
+    },
+    'high_criticality_backlog': {
+        'name': 'High-Criticality Backlog',
+        'definition': (
+            'Open work orders at emergency or critical priority — the risk-'
+            'weighted core of the backlog.'
+        ),
+        'formula': "count(open work orders with priority IN ('Emergency','Critical'))",
+        'unit': 'work orders',
+        'direction': 'lower_is_better',
+        'target': 0.0,
+        'warning_threshold': 3.0,
+        'critical_threshold': 8.0,
+        'sources': ['work_orders'],
+    },
+    'backlog_hours': {
+        'name': 'Backlog Hours',
+        'definition': 'Estimated remaining labour for all open work orders.',
+        'formula': 'sum(estimated_hours) over open work orders',
+        'unit': 'hours',
+        'direction': 'lower_is_better',
+        'target': 0.0,
+        'warning_threshold': 200.0,
+        'critical_threshold': 500.0,
+        'sources': ['work_orders'],
+    },
+    'wo_aging_days_avg': {
+        'name': 'Average Open Work Order Age',
+        'definition': 'Mean age of open work orders since creation.',
+        'formula': 'avg(today - created_at) over open work orders',
+        'unit': 'days',
+        'direction': 'lower_is_better',
+        'target': 14.0,
+        'warning_threshold': 30.0,
+        'critical_threshold': 60.0,
+        'sources': ['work_orders'],
+    },
+    'pm_compliance_pct': {
+        'name': 'PM Compliance',
+        'definition': (
+            'Share of active calendar-based maintenance plans that are not '
+            'past their next-due date.'
+        ),
+        'formula': '(active plans - plans past next_due) / active plans x 100',
+        'unit': '%',
+        'direction': 'higher_is_better',
+        'target': 95.0,
+        'warning_threshold': 90.0,
+        'critical_threshold': 80.0,
+        'sources': ['maintenance_plans'],
+    },
+    'completion_sla_pct': {
+        'name': 'Completion SLA Attainment',
+        'definition': (
+            'Share of work orders resolved within the window that met their '
+            'resolution SLA; unavailable when no resolution was recorded.'
+        ),
+        'formula': 'resolved with resolution_status=Met / all resolved with known status x 100',
+        'unit': '%',
+        'direction': 'higher_is_better',
+        'target': 95.0,
+        'warning_threshold': 90.0,
+        'critical_threshold': 80.0,
+        'sources': ['work_order_sla', 'work_orders'],
+    },
+}
+
+_OPEN_WO_EXCLUSION = ('Completed', 'Closed', 'Cancelled')
+
+
+def _open_wo_where(site_id: Optional[int]) -> tuple[str, list]:
+    where = f"w.status NOT IN ({','.join('?' * len(_OPEN_WO_EXCLUSION))})"
+    args: list = list(_OPEN_WO_EXCLUSION)
+    if site_id is not None:
+        where += ''' AND EXISTS (
+              SELECT 1 FROM assets ja
+              LEFT JOIN locations jl ON jl.id=ja.location_id
+              WHERE ja.id=w.asset_id AND jl.site_id=?)'''
+        args.append(site_id)
+    return where, args
+
+
+def compute_maintenance_kpis(
+    conn,
+    period_days: int = 90,
+    site_id: Optional[int] = None,
+) -> dict:
+    today = date.today()
+    today_iso = today.isoformat()
+    window_start = today - timedelta(days=period_days)
+
+    where, args = _open_wo_where(site_id)
+    open_rows = [
+        dict(row)
+        for row in conn.execute(
+            f'''SELECT w.id,w.wo_no,w.title,w.priority,w.status,w.target_finish,
+                       w.estimated_hours,w.created_at,a.asset_no
+                FROM work_orders w LEFT JOIN assets a ON a.id=w.asset_id
+                WHERE {where} ORDER BY w.id DESC''',
+            args,
+        ).fetchall()
+    ]
+
+    open_count = len(open_rows)
+    backlog_hours = 0.0
+    aging_total = 0.0
+    overdue = []
+    emergency_count = 0
+    high_criticality = 0
+    priority_weight = {'Emergency': 5, 'Critical': 4, 'High': 3, 'Medium': 2, 'Low': 1}
+    for wo in open_rows:
+        estimated = float(wo.get('estimated_hours') or 0)
+        backlog_hours += estimated
+        try:
+            created = datetime.fromisoformat(str(wo['created_at'])[:19])
+            age_days = (today - created.date()).days
+        except ValueError:
+            age_days = 0
+        aging_total += max(age_days, 0)
+        target = str(wo.get('target_finish') or '')
+        days_overdue = None
+        if target:
+            try:
+                days_overdue = (today - date.fromisoformat(target[:10])).days
+            except ValueError:
+                days_overdue = None
+        if days_overdue is not None and days_overdue > 0:
+            overdue.append((wo, days_overdue))
+        if wo['priority'] == 'Emergency':
+            emergency_count += 1
+        if wo['priority'] in ('Emergency', 'Critical'):
+            high_criticality += 1
+
+    overdue.sort(key=lambda pair: (-(pair[1] * priority_weight.get(pair[0]['priority'], 1)), pair[1]))
+    contributors = [
+        {
+            'wo_id': int(wo['id']),
+            'wo_no': wo['wo_no'],
+            'title': wo['title'],
+            'asset_no': wo.get('asset_no'),
+            'priority': wo['priority'],
+            'days_overdue': int(days_overdue),
+            'estimated_hours': float(wo.get('estimated_hours') or 0),
+        }
+        for wo, days_overdue in overdue[:5]
+    ]
+
+    # Weekly completion capacity from the measurement window.
+    if site_id is not None:
+        completed = conn.execute(
+            '''SELECT COALESCE(SUM(w.actual_hours),0),COUNT(*) FROM work_orders w
+               WHERE w.status IN ('Completed','Closed')
+                 AND COALESCE(w.actual_finish,w.updated_at)>=?
+                 AND EXISTS (SELECT 1 FROM assets ja
+                             LEFT JOIN locations jl ON jl.id=ja.location_id
+                             WHERE ja.id=w.asset_id AND jl.site_id=?)''',
+            [window_start.isoformat(), site_id],
+        ).fetchone()
+    else:
+        completed = conn.execute(
+            '''SELECT COALESCE(SUM(actual_hours),0),COUNT(*) FROM work_orders
+               WHERE status IN ('Completed','Closed')
+                 AND COALESCE(actual_finish,updated_at)>=?''',
+            [window_start.isoformat()],
+        ).fetchone()
+    completed_hours = float(completed[0] or 0)
+    weeks = max(period_days / 7.0, 1.0)
+    weekly_capacity = completed_hours / weeks
+
+    pm_total = int(conn.execute('SELECT COUNT(*) FROM maintenance_plans WHERE active=1').fetchone()[0])
+    pm_over = int(conn.execute(
+        """SELECT COUNT(*) FROM maintenance_plans WHERE active=1 AND trigger_type='Calendar'
+           AND next_due IS NOT NULL AND next_due<?""",
+        (today_iso,),
+    ).fetchone()[0])
+
+    sla_where = "s.resolution_status IN ('Met','Breached')"
+    sla_args: list = [window_start.isoformat()]
+    sla_join = ''
+    if site_id is not None:
+        sla_join = '''LEFT JOIN locations l ON l.id=w.location_id
+                      LEFT JOIN sites s2 ON s2.id=l.site_id'''
+        sla_where += ' AND s2.id=?'
+        sla_args.append(site_id)
+    sla_row = conn.execute(
+        f'''SELECT SUM(CASE WHEN s.resolution_status='Met' THEN 1 ELSE 0 END),COUNT(*)
+            FROM work_order_sla s JOIN work_orders w ON w.id=s.work_order_id {sla_join}
+            WHERE {sla_where} AND COALESCE(w.actual_finish,w.updated_at)>=?''',
+        sla_args,
+    ).fetchone()
+    sla_met, sla_total = int(sla_row[0] or 0), int(sla_row[1] or 0)
+
+    values = {
+        'open_work_orders': float(open_count),
+        'overdue_work_orders': float(len(overdue)),
+        'emergency_work_orders': float(emergency_count),
+        'high_criticality_backlog': float(high_criticality),
+        'backlog_hours': round(backlog_hours, 2),
+        'wo_aging_days_avg': round(aging_total / open_count, 2) if open_count else 0.0,
+        'pm_compliance_pct': round(100 * (pm_total - pm_over) / pm_total, 2) if pm_total else 100.0,
+        'completion_sla_pct': round(100 * sla_met / sla_total, 2) if sla_total else None,
+    }
+
+    kpis = {}
+    for kpi_id, definition in MAINTENANCE_KPI_DEFINITIONS.items():
+        kpis[kpi_id] = {**definition, 'id': kpi_id, 'value': values[kpi_id]}
+
+    return {
+        'kpi_family': 'maintenance_execution',
+        'as_of': today_iso,
+        'period_days': period_days,
+        'site_id': site_id,
+        'weekly_completion_hours': round(weekly_capacity, 2),
+        'resolved_in_window': int(completed[1] or 0),
+        'kpis': kpis,
+        'contributors': contributors,
+        'data_freshness': {'generated_at': _application.now()},
+    }
+
+
 def install_inventory_kpi_routes(app) -> None:
+    @app.get('/api/kpis/maintenance')
+    def maintenance_kpis_route(
+        period_days: int = Query(90, ge=30, le=3650),
+        site_id: Optional[int] = None,
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            return compute_maintenance_kpis(conn, period_days, site_id)
+
+    @app.get('/api/kpis/maintenance.csv')
+    def maintenance_kpis_csv_route(
+        period_days: int = Query(90, ge=30, le=3650),
+        site_id: Optional[int] = None,
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            result = compute_maintenance_kpis(conn, period_days, site_id)
+        rows_out = [
+            [kpi['id'], kpi['name'], kpi['value'], kpi['unit'], kpi['direction']]
+            for kpi in result['kpis'].values()
+        ]
+        return _application.csv_response(
+            'EUAS_maintenance_kpis.csv',
+            ['KPI', 'Name', 'Value', 'Unit', 'Direction'],
+            rows_out,
+        )
+
     @app.get('/api/kpis/inventory')
     def inventory_kpis_route(
         slow_moving_days: int = Query(90, ge=7, le=730),

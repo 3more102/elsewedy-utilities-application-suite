@@ -175,15 +175,17 @@ def test_app_js_consumes_backend_families_without_client_recomputation():
     # The dashboard must call the real families...
     assert '/api/kpis/reliability' in source
     assert '/api/kpis/inventory' in source
-    assert '/api/sites/${siteId}/customer-count' in source.replace('`', "'").replace('${siteId}', '${siteId}') or '/api/sites/' in source
+    assert '/api/kpis/maintenance' in source
+    assert '/api/sites/' in source
     # ...expose drill-downs backed by contributor data...
-    for handler in ('kpiContributorDetail', 'kpiItemDetail',
+    for handler in ('kpiContributorDetail', 'kpiItemDetail', 'kpiWoDetail',
                     'openCustomerCounts', 'saveCustomerCount',
-                    'reliabilityPanel', 'inventoryPanel'):
+                    'reliabilityPanel', 'inventoryPanel', 'maintenancePanel'):
         assert handler in source, handler
     # ...and never recompute utility indices in the browser.
     lowered = source.lower()
-    for forbidden in ('saidi=', 'saifi=', 'caidi=', 'function computesaidi'):
+    for forbidden in ('saidi=', 'saifi=', 'caidi=', 'function computesaidi',
+                      'function computemtb', 'function computeavailability'):
         assert forbidden not in lowered, forbidden
 
 
