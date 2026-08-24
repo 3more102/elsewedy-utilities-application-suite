@@ -50,6 +50,13 @@ PERMISSION_CATALOG: dict[str, tuple[str, tuple[str, ...]]] = {
         'Configure per-site customer population for reliability indices',
         ('admin',),
     ),
+    'analytics.hse.read': (
+        'Read safety and incident KPI intelligence',
+        (
+            'admin', 'maintenance_manager', 'executive',
+            'asset_manager', 'planner', 'supervisor', 'hse',
+        ),
+    ),
     'assets.create': (
         'Create assets',
         ('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor'),
@@ -206,6 +213,7 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('GET', '/api/kpi/deterioration'): 'analytics.executive.read',
     ('GET', '/api/kpi/assets/{asset_id}'): 'analytics.executive.read',
     ('GET', '/api/kpi/parts/shortages'): 'analytics.executive.read',
+    ('GET', '/api/kpi/hse'): 'analytics.hse.read',
     ('PATCH', '/api/sites/{site_id}'): 'sites.customers.manage',
     ('POST', '/api/assets'): 'assets.create',
     ('PATCH', '/api/assets/{asset_id}'): 'assets.update',

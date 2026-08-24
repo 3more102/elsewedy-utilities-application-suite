@@ -323,7 +323,28 @@ async function renderAnalytics(){
       ${wf.workload_by_technician.length?barChart(wf.workload_by_technician.map(t=>({label:t.name,v:t.open_wo})),'label','v'):empty('No assigned open work')}
     </div></section>
   </div>
-  <section class="panel" style="margin-bottom:14px"><div class="panel-head"><div><h3>Material Shortages Blocking Work</h3><p>Exact outstanding quantities per requirement — reserve, expedite or re-plan. Click a row to open the work order.</p></div><div><button class="btn small" id="kpi-shortages-refresh">Load Shortages</button></div></div><div class="panel-body" id="kpi-shortage-body">${empty('Load to compute reservation-exact shortage lines')}</div></section>`;
+  <section class="panel" style="margin-bottom:14px"><div class="panel-head"><div><h3>Material Shortages Blocking Work</h3><p>Exact outstanding quantities per requirement — reserve, expedite or re-plan. Click a row to open the work order.</p></div><div><button class="btn small" id="kpi-shortages-refresh">Load Shortages</button></div></div><div class="panel-body" id="kpi-shortage-body">${empty('Load to compute reservation-exact shortage lines')}</div></section>
+
+  <h3 class="section-sub">Safety & HSE</h3>
+  <div class="kpi-grid">
+    ${kpiCard('Open Incidents',k.hse.open_incidents,'HS','Safety register',k.hse.open_incidents?'warn':'good')}
+    ${kpiCard('High-Risk Open',k.hse.high_risk_open,'HR',esc(k.hse.high_risk_definition),k.hse.high_risk_open?'warn':'good')}
+    ${kpiCard('Incidents This Window',k.hse.incidents_current+' ('+(k.hse.incidents_delta>=0?'+':'')+k.hse.incidents_delta+')','IW',`${k.hse.incidents_previous} previous period`)}
+    ${kpiCard('Days Since High-Risk',k.hse.days_since_last_high_risk==null?'—':fmt(k.hse.days_since_last_high_risk),'DS',k.hse.days_since_last_high_risk==null?'None on record':'Risk score ≥ 12')}
+  </div>
+  <div class="panel-grid">
+    <section class="panel"><div class="panel-head"><div><h3>Weekly Incident Trend</h3><p>Incidents and high-risk incidents per week — click a contributor to open the safety register.</p></div></div><div class="panel-body">
+      ${(k.hse.trend||[]).length?sparkBars(k.hse.trend,'incidents','period'):empty('No incidents recorded in window')}
+      <div class="table-wrap" style="margin-top:10px"><table class="data-table"><thead><tr><th>Contributor</th><th>Incidents</th><th>High risk</th><th>Example</th></tr></thead><tbody>
+        ${[...k.hse.contributors_by_site.map(x=>({kind:'Site',...x})),...k.hse.contributors_by_type.map(x=>({kind:'Type',...x})),...k.hse.contributors_by_asset.map(x=>({kind:'Asset',...x}))].slice(0,8).map(x=>`<tr class="drill-row" data-kind="hse" style="cursor:pointer"><td>${x.kind}: ${esc(x.label)}</td><td>${x.incidents}</td><td>${x.high_risk}</td><td style="font-size:10px">${esc(x.example_incident_no||'')}</td></tr>`).join('')||'<tr><td colspan="4">'+empty('No incidents in window')+'</td></tr>'}
+      </tbody></table></div>
+    </div></section>
+    <section class="panel"><div class="panel-head"><div><h3>Safety Metrics Honesty</h3><p>What EUAS can and cannot compute from stored data</p></div></div><div class="panel-body">
+      <div class="detail-box"><span>Risk bands (existing taxonomy)</span><p style="margin:4px 0 0;font-size:11px">${Object.entries(k.hse.risk_band_distribution||{}).map(([b,n])=>`${b}: ${n}`).join(' · ')||'No records'}</p></div>
+      <div class="detail-box" style="margin-top:8px"><span>Explicitly unavailable</span>${Object.entries(k.hse.unavailable||{}).map(([m,r])=>`<p style="margin:4px 0 0;font-size:11px"><strong>${esc(m)}</strong>: ${esc(r)}</p>`).join('')}</div>
+      <p class="section-sub">${esc(k.hse.correlation_note)}</p>
+    </div></section>
+  </div>`;
 
   const reload=()=>render();
   $('#kpi-days').onchange=e=>{KPI_STATE.days=Number(e.target.value);reload()};
@@ -350,6 +371,7 @@ async function renderAnalytics(){
       if(kind==='work'&&id){await go('work');setTimeout(()=>workDetail(Number(id)),250)}
       else if(kind==='asset'&&id){await go('assets');setTimeout(()=>assetDetail(Number(id)),250)}
       else if(kind==='asset-kpi'&&id){await assetKpiDossier(Number(id))}
+      else if(kind==='hse'){await go('hse')}
       else if(kind==='channel'){await go('telemetry')}
     };
   });

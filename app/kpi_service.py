@@ -236,6 +236,8 @@ def source_watermark(conn) -> Optional[str]:
              UNION ALL SELECT MAX(created_at) FROM technician_absences
              UNION ALL SELECT MAX(created_at) FROM inventory_transactions
              UNION ALL SELECT MAX(posted_at) FROM maintenance_cost_ledger
+             UNION ALL SELECT MAX(created_at) FROM safety_incidents
+             UNION ALL SELECT MAX(occurred_at) FROM safety_incidents
            )''').fetchone()[0]
 
 
@@ -1097,6 +1099,182 @@ def compute_cost_kpis(conn, f: ExecutiveFilters) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# HSE / incident intelligence (real safety_incidents data only)
+# --------------------------------------------------------------------------- #
+
+HSE_HIGH_RISK_SCORE = 12  # matches the domain's own 'High HSE risk' escalation
+
+
+def _risk_band(risk_score) -> str:
+    """Existing EUAS risk-band mapping (see legacy analytics endpoint)."""
+    try:
+        score = float(risk_score or 0)
+    except (TypeError, ValueError):
+        return 'Low'
+    if score >= 15:
+        return 'Extreme'
+    if score >= 10:
+        return 'High'
+    if score >= 5:
+        return 'Medium'
+    return 'Low'
+
+
+def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
+    """Safety/incident KPIs from safety_incidents only.
+
+    Metrics that would require data EUAS does not store (investigation due
+    dates, structured corrective-action lifecycle, exposure hours) are reported
+    explicitly as unavailable instead of approximated. Contributor rankings are
+    correlations drawn from actual incident records, not inferred causality.
+    """
+    w = f.window()
+    scope_sql, scope_args = _asset_scope(f, alias_a='a')
+    base = (
+        ' FROM safety_incidents h'
+        ' LEFT JOIN sites s ON s.id=h.site_id'
+        ' LEFT JOIN locations l ON l.id=h.location_id'
+        ' LEFT JOIN assets a ON a.id=h.asset_id'
+        ' WHERE 1=1' + scope_sql)
+
+    open_where = " AND h.status NOT IN ('Closed','Cancelled')"
+
+    def _count(extra_where: str, extra_args: list | None = None) -> int:
+        return int(conn.execute(
+            'SELECT COUNT(*)' + base + extra_where,
+            list(scope_args) + (extra_args or [])).fetchone()[0])
+
+    open_incidents = _count(open_where)
+    high_risk_open = _count(open_where + ' AND h.risk_score>=?',
+                            [HSE_HIGH_RISK_SCORE])
+
+    cur_args = [w['period_start'] + 'T00:00:00', w['period_end'] + 'T23:59:59']
+    prev_args = [w['previous_start'] + 'T00:00:00', w['previous_end'] + 'T23:59:59']
+    incidents_current = _count(' AND h.created_at>=? AND h.created_at<?', cur_args)
+    incidents_previous = _count(' AND h.created_at>=? AND h.created_at<?', prev_args)
+    high_risk_current = _count(
+        ' AND h.risk_score>=? AND h.created_at>=? AND h.created_at<?',
+        [HSE_HIGH_RISK_SCORE] + cur_args)
+    high_risk_previous = _count(
+        ' AND h.risk_score>=? AND h.created_at>=? AND h.created_at<?',
+        [HSE_HIGH_RISK_SCORE] + prev_args)
+
+    severity_distribution = {str(n): 0 for n in range(1, 6)}
+    for r in _rows(conn.execute(
+            'SELECT h.severity, COUNT(*) c' + base +
+            ' AND h.created_at>=? AND h.created_at<? GROUP BY h.severity',
+            scope_args + cur_args)):
+        severity_distribution[str(int(r['severity']))] = int(r['c'])
+    risk_bands: dict[str, int] = {}
+    for r in _rows(conn.execute(
+            'SELECT h.risk_score, COUNT(*) c' + base + ' GROUP BY h.risk_score',
+            scope_args)):
+        band = _risk_band(r['risk_score'])
+        risk_bands[band] = risk_bands.get(band, 0) + int(r['c'])
+
+    # Weekly trend inside the current window.
+    trend_rows = _rows(conn.execute(
+        'SELECT h.created_at, h.risk_score' + base +
+        ' AND h.created_at>=? AND h.created_at<?',
+        scope_args + cur_args))
+    weekly: dict[str, dict] = {}
+    today_d = date.today()
+    for r in trend_rows:
+        try:
+            d = datetime.fromisoformat(str(r['created_at'])[:19]).date()
+        except (TypeError, ValueError):
+            continue
+        bucket = (d - timedelta(days=d.weekday())).isoformat()
+        b = weekly.setdefault(bucket, {'period': None, 'incidents': 0, 'high_risk': 0})
+        b['incidents'] += 1
+        if float(r['risk_score'] or 0) >= HSE_HIGH_RISK_SCORE:
+            b['high_risk'] += 1
+    trend = []
+    for key in sorted(weekly):
+        b = weekly[key]
+        b['period'] = key
+        trend.append(b)
+
+    # Days since last high-risk incident (occurrence date preferred).
+    last_high = conn.execute(
+        'SELECT MAX(COALESCE(h.occurred_at,h.created_at))' + base +
+        ' AND h.risk_score>=?', scope_args + [HSE_HIGH_RISK_SCORE]).fetchone()[0]
+    days_since_high = None
+    if last_high:
+        try:
+            days_since_high = (today_d - datetime.fromisoformat(str(last_high)[:19]).date()).days
+        except (TypeError, ValueError):
+            days_since_high = None
+
+    def _contributors(group_expr: str, label_field: str, id_field: str | None) -> list[dict]:
+        rows_ = _rows(conn.execute(
+            f'SELECT {group_expr} group_value, COUNT(*) c,'
+            f" SUM(CASE WHEN h.risk_score>={HSE_HIGH_RISK_SCORE} THEN 1 ELSE 0 END) high,"
+            f' MIN(h.id) example_id, MIN(h.incident_no) example_no' + base +
+            ' AND h.created_at>=? AND h.created_at<?' +
+            (f' AND {id_field} IS NOT NULL' if id_field else '') +
+            ' GROUP BY ' + group_expr + ' ORDER BY c DESC LIMIT 8',
+            scope_args + cur_args))
+        return [{'label': r['group_value'], 'incidents': int(r['c']),
+                 'high_risk': int(r['high'] or 0),
+                 'example_incident_id': r['example_id'],
+                 'example_incident_no': r['example_no']} for r in rows_]
+
+    by_site = _contributors('s.name', 's.name', 'h.site_id')
+    by_type = _contributors('h.incident_type', 'h.incident_type', 'h.incident_type')
+    by_asset = _contributors('a.asset_no', 'a.asset_no', 'h.asset_id')
+
+    # Repeat locations/assets: more than one incident in the trailing 90 days.
+    cutoff90 = (datetime.now() - timedelta(days=90)).isoformat(timespec='seconds')
+    repeat_locations = _rows(conn.execute(
+        'SELECT l.id location_id, l.name location_name, COUNT(*) incidents' + base +
+        ' AND h.location_id IS NOT NULL AND h.created_at>=?' +
+        ' GROUP BY l.id HAVING COUNT(*)>=2 ORDER BY incidents DESC LIMIT 10',
+        scope_args + [cutoff90]))
+    repeat_assets = _rows(conn.execute(
+        'SELECT a.id asset_id, a.asset_no, a.name asset_name, COUNT(*) incidents' + base +
+        ' AND h.asset_id IS NOT NULL AND h.created_at>=?' +
+        ' GROUP BY a.id HAVING COUNT(*)>=2 ORDER BY incidents DESC LIMIT 10',
+        scope_args + [cutoff90]))
+
+    return {
+        'open_incidents': open_incidents,
+        'high_risk_open': high_risk_open,
+        'high_risk_definition': f'risk_score >= {HSE_HIGH_RISK_SCORE} (domain escalation threshold)',
+        'incidents_current': incidents_current,
+        'incidents_previous': incidents_previous,
+        'incidents_delta': incidents_current - incidents_previous,
+        'incidents_delta_pct': (
+            round(100 * (incidents_current - incidents_previous) / incidents_previous, 1)
+            if incidents_previous else None),
+        'high_risk_current': high_risk_current,
+        'high_risk_previous': high_risk_previous,
+        'high_risk_delta': high_risk_current - high_risk_previous,
+        'days_since_last_high_risk': days_since_high,
+        'severity_distribution_window': severity_distribution,
+        'risk_band_distribution': risk_bands,
+        'trend': trend,
+        'contributors_by_site': by_site,
+        'contributors_by_type': by_type,
+        'contributors_by_asset': by_asset,
+        'repeat_locations_90d': [
+            {**r, 'incidents': int(r['incidents'])} for r in repeat_locations],
+        'repeat_assets_90d': [
+            {**r, 'incidents': int(r['incidents'])} for r in repeat_assets],
+        'correlation_note': ('contributor rankings correlate incident records; '
+                             'causality requires completed investigation data'),
+        'unavailable': {
+            'overdue_investigations':
+                'no investigation due-date field exists on safety_incidents',
+            'corrective_action_closure_rate':
+                'corrective actions are stored as free text without lifecycle state',
+            'trir_ltifr_exposure_rates':
+                'no exposure-hours denominator data is stored',
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Parts-shortage drill-down (KPI -> action)
 # --------------------------------------------------------------------------- #
 
@@ -1582,6 +1760,7 @@ def _compute_live_snapshot(conn, f: ExecutiveFilters) -> dict:
         'inventory_procurement': inventory,
         'workforce': workforce,
         'costs': costs,
+        'hse': compute_hse_kpis(conn, f),
         'risk_backlog_summary': backlog['summary'],
         'top_risk_contributors': backlog['rows'][:10],
         'explanations': explain_kpi_changes(conn, f),

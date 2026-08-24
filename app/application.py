@@ -929,6 +929,7 @@ def list_workflow_events(module:str='',record_type:str='',record_id:Optional[int
 
 # ---------- executive utilities KPI layer ----------
 _KPI_ROLES = ('admin', 'maintenance_manager', 'executive', 'asset_manager', 'planner', 'supervisor')
+_HSE_KPI_ROLES = _KPI_ROLES + ('hse',)
 
 
 def _kpi_filters(
@@ -1020,6 +1021,26 @@ def kpi_parts_shortages(
     with db() as conn:
         return compute_parts_shortages(conn, f, limit=limit)
 
+@app.get('/api/kpi/hse')
+def kpi_hse(
+    period_end: Optional[str] = None,
+    period_days: int = Query(30, ge=1, le=365),
+    site_id: Optional[int] = None,
+    region: Optional[str] = None,
+    user=Depends(require_roles(*_HSE_KPI_ROLES)),
+):
+    """Safety/incident KPI family from real safety_incidents data.
+
+    Metrics EUAS cannot compute honestly (investigation due dates, corrective
+    action lifecycle, exposure-hour rates) are returned as explicitly
+    unavailable. HSE officers can read safety intelligence through the same
+    aggregation pipeline without gaining executive analytics breadth.
+    """
+    f = _kpi_filters(period_end, period_days, site_id, region)
+    from .kpi_service import compute_hse_kpis
+    with db() as conn:
+        return compute_hse_kpis(conn, f)
+
 @app.get('/api/kpi/assets/{asset_id}')
 def kpi_asset_profile(
     asset_id: int,
@@ -1056,7 +1077,8 @@ def update_site_customers(site_id: int, body: SiteCustomersIn, user=Depends(requ
         return {'id': site_id, 'site_code': site['site_code'],
                 'customers_served': body.customers_served}
 
-# ---------- launchpad / dashboard ----------@app.get('/api/launchpad')
+# ---------- launchpad / dashboard ----------
+@app.get('/api/launchpad')
 def launchpad(user=Depends(current_user)):
     apps=[
       ('assets','Asset Management','Enterprise asset registry & hierarchy','AS'),('work','Work Management','Plan, assign and execute work','WO'),('maintenance','Preventive Maintenance','Calendar, meter and condition plans','PM'),('workforce','Workforce Planning','Crafts, shifts, absences and capacity','WF'),('inventory','Inventory','Spares, warehouses and transactions','IN'),('procurement','Procurement','PR, approval, PO and receipt','PO'),('approvals','Approval Center','Unified operational approval queue','AP'),('operations','Utilities Operations','Electrical, water and infrastructure','OP'),('telemetry','Telemetry & Alarms','SCADA-style readings, thresholds and alarm response','TM'),('field','Field Service','Technician mobile workspace','FS'),('dispatch','Technician Dispatch','Dispatch board, ETA and field arrival','DP'),('map','GIS / Locations','Sites, assets, work and alerts','GI'),('inspections','Inspection Management','Digital inspection forms','IP'),('hse','Safety & HSE','Incidents, hazards and actions','HS'),('contracts','Contracts','Utility service and supply agreements','CT'),('vendors','Vendors','Supplier and OEM management','VN'),('projects','Projects','Budgets, progress and milestones','PJ'),('documents','Documents','Technical records and attachments','DC'),('analytics','Analytics','Reliability, cost and performance','AN'),('automation','Automation & Reports','Scheduled controls, exports, backups and observability','AU'),('administration','Administration','Users, RBAC and audit','AD')]
