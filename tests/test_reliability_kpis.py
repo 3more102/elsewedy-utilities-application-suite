@@ -275,7 +275,8 @@ def test_customer_count_update_is_admin_only_and_audited():
                 (f'KPI-{suffix}'.upper(),),
             ).fetchall()
         assert len(audit_rows) == 1
-        assert "'customer_count'" in audit_rows[0]['old_value']
+        assert 'customer_count' in audit_rows[0]['old_value']
+        assert 'null' in audit_rows[0]['old_value']
         assert '1200' in audit_rows[0]['new_value']
 
         with db() as conn:

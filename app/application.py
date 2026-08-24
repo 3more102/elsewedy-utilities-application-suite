@@ -822,6 +822,10 @@ class WorkOrderIn(BaseModel):
 class WorkOrderPatch(BaseModel):
     title:Optional[str]=None; description:Optional[str]=None; priority:Optional[str]=None; assigned_to:Optional[int]=None; supervisor_id:Optional[int]=None; target_start:Optional[str]=None; target_finish:Optional[str]=None; estimated_hours:Optional[float]=None; safety_requirements:Optional[str]=None; instructions:Optional[str]=None; comments:Optional[str]=None; completion_notes:Optional[str]=None
 class TransitionIn(BaseModel): action:str; notes:str=''; signature:str=''
+class CBMDecisionIn(BaseModel): suggested_action:Optional[str]=None
+class SiteCustomerCountPatch(BaseModel): customer_count:Optional[int]=Field(default=None,ge=0)
+class FMEAIn(BaseModel): asset_id:int; function_text:str; failure_mode:str; failure_cause:str=''; failure_effect:str=''; severity:int=Field(ge=1,le=10); occurrence:int=Field(ge=1,le=10); detection:int=Field(ge=1,le=10)
+class FMEAPatch(BaseModel): function_text:Optional[str]=None; failure_mode:Optional[str]=None; failure_cause:Optional[str]=None; failure_effect:Optional[str]=None; severity:Optional[int]=Field(default=None,ge=1,le=10); occurrence:Optional[int]=Field(default=None,ge=1,le=10); detection:Optional[int]=Field(default=None,ge=1,le=10)
 class SLAPolicyPatch(BaseModel): response_minutes:Optional[int]=Field(default=None,gt=0); resolution_minutes:Optional[int]=Field(default=None,gt=0); active:Optional[bool]=None
 class NoteIn(BaseModel): note:str
 class FieldAssetUpdate(BaseModel): condition:Optional[str]=None; meter_reading:Optional[float]=None
