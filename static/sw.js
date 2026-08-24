@@ -4,6 +4,7 @@ const ASSETS=[
   '/static/styles.css',
   '/static/ui-refresh.css',
   '/static/ux-enhancements.css',
+  '/static/dashboard-intelligence.css',
   '/static/productivity-enhancements.css',
   '/static/operational-enhancements.css',
   '/static/workspace-preferences.css',
