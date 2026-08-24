@@ -1,4 +1,4 @@
-"""Executive utilities KPI service (Maximo-class operational intelligence).
+﻿"""Executive utilities KPI service (Maximo-class operational intelligence).
 
 Deterministic, set-based aggregation over the existing EUAS operational tables.
 No predictive/ML claims: every signal carries an explicit ``kind`` label drawn
@@ -290,7 +290,7 @@ def write_snapshot(conn, f: ExecutiveFilters, payload: dict) -> bool:
     """Atomically upsert one scoped snapshot; never partially visible.
 
     Returns False (without raising) on storage problems so callers fall back to
-    live computation — e.g. legacy databases where the table has not migrated.
+    live computation â€” e.g. legacy databases where the table has not migrated.
     """
     import json as _json
     watermark = source_watermark(conn)
@@ -1316,6 +1316,88 @@ def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
 # Parts-shortage drill-down (KPI -> action)
 # --------------------------------------------------------------------------- #
 
+
+
+# --------------------------------------------------------------------------- #
+# PM demand vs workforce capacity risk (reuses the canonical forecast)
+# --------------------------------------------------------------------------- #
+
+def compute_pm_capacity_risk(conn, f: ExecutiveFilters, horizon_days: int = 84) -> dict:
+    """High-criticality PMs whose next-due date lands in over-loaded weeks.
+
+    Demand/capacity math is delegated to the canonical
+    app.application._maintenance_forecast (declared technician schedules,
+    absences, efficiency); this family only cross-references high-criticality
+    plan due dates against those week buckets and never invents capacity.
+    """
+    from .application import _maintenance_forecast  # deferred canonical engine
+
+    horizon_days = max(14, min(int(horizon_days), 365))
+    start = date.today()
+    end = start + timedelta(days=horizon_days)
+
+    def _week_bucket(d: date) -> str:
+        return (d - timedelta(days=d.weekday())).isoformat()
+
+    scope_sql, scope_args = _asset_scope(f)
+    plans = _rows(conn.execute(
+        '''SELECT p.id, p.pm_no, p.name pm_name, p.next_due, a.criticality,
+                  a.asset_no, s.name site_name
+             FROM maintenance_plans p
+             JOIN assets a ON a.id=p.asset_id
+             LEFT JOIN locations l ON l.id=a.location_id
+             LEFT JOIN sites s ON s.id=l.site_id
+            WHERE p.active=1 AND p.next_due IS NOT NULL''' + scope_sql,
+        scope_args))
+    critical_plans = []
+    for p in plans:
+        try:
+            due = date.fromisoformat(str(p['next_due'])[:10])
+        except (TypeError, ValueError):
+            continue
+        if start <= due <= end and p.get('criticality') == 'Critical':
+            critical_plans.append({**p, '_bucket': _week_bucket(due)})
+
+    forecast = _maintenance_forecast(conn, horizon_days, f.site_id)
+    buckets = {b['week_start']: b for b in forecast['weeks']}
+    overloaded: dict[str, dict] = {}
+    unplaced = 0
+    for p in critical_plans:
+        bucket = buckets.get(p['_bucket'])
+        if bucket is None:
+            unplaced += 1
+            continue
+        if bucket['utilization_pct'] > 100 or bucket['capacity_state'] == 'Over Capacity':
+            entry = overloaded.setdefault(p['_bucket'], {
+                'week_start': bucket['week_start'],
+                'utilization_pct': bucket['utilization_pct'],
+                'capacity_state': bucket['capacity_state'],
+                'demand_hours': bucket['demand_hours'],
+                'capacity_hours': bucket['capacity_hours'],
+                'critical_pms': [],
+                'sites_at_risk': [],
+            })
+            entry['critical_pms'].append({
+                'pm_no': p['pm_no'], 'name': p['pm_name'], 'next_due': p['next_due'],
+                'asset_no': p['asset_no'], 'site_name': p['site_name']})
+            if p['site_name'] and p['site_name'] not in entry['sites_at_risk']:
+                entry['sites_at_risk'].append(p['site_name'])
+
+    capacity_configured = forecast.get('capacity_source') == 'workforce_schedule'
+    return {
+        'horizon_days': horizon_days,
+        'capacity_source': forecast.get('capacity_source'),
+        'capacity_available': bool(forecast.get('summary', {}).get('capacity_hours')),
+        'critical_pm_total': len(critical_plans),
+        'critical_pm_in_overloaded_weeks': sum(
+            len(e['critical_pms']) for e in overloaded.values()),
+        'overloaded_weeks': sorted(overloaded.values(),
+                                   key=lambda e: -e['utilization_pct']),
+        'unplaced_critical_pms': unplaced,
+        'unavailable_note': (
+            None if capacity_configured
+            else 'workforce capacity derived from role fallback, not declared schedules'),
+    }
 def compute_parts_shortages(conn, f: ExecutiveFilters, limit: int = 50) -> dict:
     """Exact per-line material shortages blocking open work.
 
@@ -1390,7 +1472,7 @@ def snapshot_export_rows(snapshot: dict) -> list[list]:
     """Deterministic flat rows for CSV export of one executive snapshot.
 
     Reuses an already-computed snapshot payload; export never recalculates.
-    Values are scalars only — nested contributor/trend structures are out of
+    Values are scalars only â€” nested contributor/trend structures are out of
     scope for the tabular contract and remain available through the JSON API.
     """
     r = snapshot['reliability']
@@ -1507,7 +1589,7 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
         'current': rel_now['total_downtime_hours'] / rel_now['outage_count'] if rel_now['outage_count'] else None,
         'delta': mttr_delta,
         'drivers': [
-            {'kind': 'long_repair', 'label': f"{r['asset_no'] or '—'} repair {r['wo_no']}",
+            {'kind': 'long_repair', 'label': f"{r['asset_no'] or 'â€”'} repair {r['wo_no']}",
              'hours': float(r['actual_hours'] or 0)}
             for r in slowest if (r['actual_hours'] or 0) > 0],
     }
@@ -1619,7 +1701,7 @@ def compute_deterioration_signals(conn, f: ExecutiveFilters, limit: int = 30) ->
             'subject_type': 'channel',
             'id': ch['id'],
             'code': ch['channel_code'],
-            'label': f"{ch['asset_no']} — {ch['name']}",
+            'label': f"{ch['asset_no']} â€” {ch['name']}",
             'detail': {
                 'slope_pct_of_span_per_day': slope_pct,
                 'excursions_30d': excursions,
@@ -1639,7 +1721,7 @@ def compute_deterioration_signals(conn, f: ExecutiveFilters, limit: int = 30) ->
                 'subject_type': 'channel',
                 'id': ch['id'],
                 'code': ch['channel_code'],
-                'label': f"{ch['asset_no']} — recurring alarm {ch['name']}",
+                'label': f"{ch['asset_no']} â€” recurring alarm {ch['name']}",
                 'detail': {'basis': 'active alarm recurrence count >= 3'},
                 'link': {'module': 'telemetry', 'record': ch['channel_code'], 'asset_id': ch['asset_id']},
             })
@@ -1651,7 +1733,7 @@ def compute_deterioration_signals(conn, f: ExecutiveFilters, limit: int = 30) ->
             'subject_type': 'asset',
             'id': r['id'],
             'code': r['asset_no'],
-            'label': f"{r['asset_no']} — {r['failures_90d']} corrective failures in 90 days",
+            'label': f"{r['asset_no']} â€” {r['failures_90d']} corrective failures in 90 days",
             'detail': {'failures_90d': r['failures_90d'], 'last_failure': r['last_failure']},
             'link': {'module': 'assets', 'record': r['asset_no'], 'asset_id': r['id']},
         })
