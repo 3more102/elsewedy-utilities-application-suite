@@ -7,17 +7,35 @@
 
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const TREND_SAMPLES = 3;
-  const INTELLIGENCE = new Map([
-    ['Open Work Orders', {family: 'maintenance', metric: 'open_work_orders', periodDays: 30}],
-    ['Overdue Work', {family: 'maintenance', metric: 'overdue_work_orders', periodDays: 30}],
-    ['Emergency Work', {family: 'maintenance', metric: 'emergency_work_orders', periodDays: 30}],
-    ['PM Compliance', {family: 'maintenance', metric: 'pm_compliance_pct', periodDays: 30}],
-    ['MTBF', {family: 'maintenance', metric: 'mtbf_hours', periodDays: 365}],
-    ['MTTR', {family: 'maintenance', metric: 'mttr_hours', periodDays: 365}],
-    ['Safety Incidents', {family: 'hse', metric: 'open_incidents', periodDays: 30}],
-    ['Active Alarms', {family: 'condition', metric: 'active_alarms', periodDays: 30}],
-    ['Maintenance Cost', {family: 'cost', metric: 'maintenance_cost_window', periodDays: 30}],
+  const KPI_ROLES = new Set([
+    'admin', 'maintenance_manager', 'executive', 'asset_manager', 'planner', 'supervisor'
   ]);
+
+  // Wire only cards whose displayed legacy value is semantically equivalent
+  // to the canonical KPI for the same scope/as-of basis. Similar labels are
+  // not sufficient. Snapshot-only/live-state metrics and cards with different
+  // formulas or periods are deliberately excluded until the dashboard itself
+  // is migrated to the canonical snapshot surface.
+  const INTELLIGENCE = new Map([
+    ['Overdue Work', {family: 'maintenance', metric: 'overdue_work_orders', periodDays: 30}],
+    ['PM Compliance', {
+      family: 'maintenance', metric: 'pm_compliance_pct', periodDays: 30,
+      portfolioOnly: true,
+    }],
+  ]);
+
+  function canUseCanonicalIntelligence() {
+    return typeof S !== 'undefined' && KPI_ROLES.has(S.user?.role);
+  }
+
+  function currentIntelligenceConfig(label) {
+    if (!canUseCanonicalIntelligence()) return null;
+    const config = INTELLIGENCE.get(label);
+    if (!config) return null;
+    const siteValue = document.querySelector('#site-selector')?.value;
+    if (config.portfolioOnly && siteValue) return null;
+    return config;
+  }
 
   function ensureStylesheet() {
     if (document.querySelector('link[data-euas-dashboard-intelligence]')) return;
@@ -64,7 +82,12 @@
     const dateValue = content.querySelector('#dash-date')?.value;
     const siteValue = document.querySelector('#site-selector')?.value;
     if (dateValue) params.set('period_end', dateValue);
-    if (siteValue) params.set('site_id', siteValue);
+    if (siteValue) {
+      if (config.portfolioOnly) {
+        throw new Error('Canonical intelligence for this card is portfolio-only.');
+      }
+      params.set('site_id', siteValue);
+    }
     if (includeSamples) params.set('samples', String(TREND_SAMPLES));
     return params;
   }
@@ -188,7 +211,7 @@
       const value = text(card.querySelector('.kpi-value'));
       const hint = text(card.querySelector('.trend'));
       const trend = card.querySelector('.trend');
-      const config = INTELLIGENCE.get(label);
+      const config = currentIntelligenceConfig(label);
 
       card.classList.remove('kpi-positive', 'kpi-attention', 'kpi-critical');
       if (trend?.classList.contains('bad')) {
@@ -492,7 +515,7 @@
   async function loadTrends(grid) {
     const jobs = [...grid.querySelectorAll(':scope > .kpi.kpi-explainable')]
       .map(card => {
-        const config = INTELLIGENCE.get(text(card.querySelector('.kpi-label')));
+        const config = currentIntelligenceConfig(text(card.querySelector('.kpi-label')));
         return config ? {card, config} : null;
       })
       .filter(Boolean);
