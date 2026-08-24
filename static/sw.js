@@ -1,9 +1,10 @@
-const CACHE='euas-shell-v3.9.0-ui12';
+const CACHE='euas-shell-v3.9.0-ui13';
 const ASSETS=[
   '/',
   '/static/styles.css',
   '/static/ui-refresh.css',
   '/static/ux-enhancements.css',
+  '/static/kpi-intelligence.css',
   '/static/productivity-enhancements.css',
   '/static/operational-enhancements.css',
   '/static/workspace-preferences.css',
@@ -14,6 +15,7 @@ const ASSETS=[
   '/static/csp-action-bridge.js',
   '/static/ux-enhancements.js',
   '/static/dashboard-enhancements.js',
+  '/static/kpi-intelligence.js',
   '/static/productivity-enhancements.js',
   '/static/operational-enhancements.js',
   '/static/workspace-preferences.js',
