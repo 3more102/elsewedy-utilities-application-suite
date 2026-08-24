@@ -39,12 +39,13 @@ def _seed_scope(conn):
            VALUES(?,?,?,?)''',
         (f'LMAX-{suffix}', f'Maximo KPI bay {suffix}', 'Area', site_id),
     )
+    location_id = int(location.lastrowid)
     asset = conn.execute(
         '''INSERT INTO assets(asset_no,name,category,criticality,condition,status,
                               location_id,created_at,updated_at)
            VALUES(?,?,?,?,?,?,?,?,?)''',
         (f'AST-MAX-{suffix}', f'Maximo KPI asset {suffix}', 'Transformer',
-         'Critical', 'Good', 'Operating', int(location.lastrowid), stamp, stamp),
+         'Critical', 'Good', 'Operating', location_id, stamp, stamp),
     )
     asset_id = int(asset.lastrowid)
 
@@ -53,22 +54,23 @@ def _seed_scope(conn):
     actual = (datetime.now() - timedelta(days=3)).isoformat(timespec='seconds')
     conn.execute(
         '''INSERT INTO work_orders(
-               wo_no,title,priority,status,work_type,asset_id,estimated_hours,
-               actual_hours,target_finish,actual_finish,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+               wo_no,title,priority,status,work_type,asset_id,location_id,
+               estimated_hours,actual_hours,target_finish,actual_finish,
+               created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
         (f'WO-MAX-DONE-{suffix}', 'Scheduled maintenance probe', 'Medium',
-         'Completed', 'Preventive Maintenance', asset_id, 4.0, 3.0,
+         'Completed', 'Preventive Maintenance', asset_id, location_id, 4.0, 3.0,
          target, actual, actual, stamp),
     )
 
     # One overdue emergency backlog item supplies a real drill contributor.
     conn.execute(
         '''INSERT INTO work_orders(
-               wo_no,title,priority,status,work_type,asset_id,estimated_hours,
-               target_finish,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?)''',
+               wo_no,title,priority,status,work_type,asset_id,location_id,
+               estimated_hours,target_finish,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
         (f'WO-MAX-OPEN-{suffix}', 'Emergency backlog probe', 'Emergency',
-         'Approved', 'Emergency', asset_id, 8.0,
+         'Approved', 'Emergency', asset_id, location_id, 8.0,
          (date.today() - timedelta(days=5)).isoformat(), stamp, stamp),
     )
 
@@ -115,6 +117,14 @@ def test_maintenance_trends_extract_existing_canonical_values_only():
             canonical = compute_maintenance_kpis(
                 conn, ExecutiveFilters(period_days=30, site_id=site_id)
             )
+
+        # Prove the fixture exercises real scoped maintenance and reliability
+        # data rather than comparing two accidental zero/empty results.
+        assert canonical['emergency_wo'] == 1
+        assert canonical['high_risk_overdue_wo'] == 1
+        assert canonical['unassigned_critical_wo'] == 1
+        assert canonical['schedule_compliance_pct'] == 100.0
+        assert canonical['mttr_hours'] == 2.0
 
         for metric, (canonical_key, unit, direction) in expected_meta.items():
             response = client.get(
