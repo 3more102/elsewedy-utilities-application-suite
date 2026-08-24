@@ -109,9 +109,9 @@ _TREND_FAMILIES: dict[str, dict] = {
                                       'direction': 'higher_is_better',
                                       'path': 'technicians_available'},
             'unassigned_critical_work': {'label': 'Unassigned Critical Work',
-                                         'unit': 'work orders',
-                                         'direction': 'lower_is_better',
-                                         'path': 'unassigned_critical_work'},
+                                          'unit': 'work orders',
+                                          'direction': 'lower_is_better',
+                                          'as_count': 'unassigned_critical_work'},
         },
     },
     'condition': {
@@ -427,6 +427,45 @@ def _maintenance_cost_drivers(conn, f, limit: int = 10) -> list[dict]:
     return drivers
 
 
+def _workforce_unassigned_drivers(conn, f, *, current: dict,
+                                  limit: int = 10) -> list[dict]:
+    """Unassigned critical work orders composing the workforce metric.
+
+    Consumes the canonical ``unassigned_critical_work`` section of the same
+    compute payload the metric count comes from; every cited work order is
+    one of the counted records, hence ``contributor`` attribution. Magnitude
+    is how far past its own target the record already sits (0 when not yet
+    due) — derived deterministically from the record itself.
+    """
+    today = date.fromisoformat(
+        str(f.period_end or date.today().isoformat())[:10])
+    drivers = []
+    for row in (current.get('unassigned_critical_work') or [])[:limit]:
+        days_past = 0
+        target = row.get('target_finish')
+        if target:
+            try:
+                days_past = max(0, (today -
+                                    date.fromisoformat(str(target)[:10])).days)
+            except (TypeError, ValueError):
+                days_past = 0
+        drivers.append({
+            'kind': 'unassigned_critical_work',
+            'label': (
+                f"{row['wo_no']} {row.get('priority')} unassigned on "
+                f"{row.get('asset_no') or 'unlocated asset'}"
+            ),
+            'magnitude': days_past,
+            'unit': 'days past target' if days_past else 'not yet due',
+            'attribution': 'contributor',
+            'source_type': 'work_order',
+            'source_id': int(row['id']),
+            'drill': {'module': 'work', 'record': row['wo_no'],
+                      'id': int(row['id'])},
+        })
+    return drivers
+
+
 def _hse_incident_drivers(conn, f, *, metric: str, limit: int = 10) -> list[dict]:
     """Open-incident contributors for the HSE family.
 
@@ -511,6 +550,8 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
         drivers = _hse_incident_drivers(conn, f, metric=metric)
     elif family == 'cost':
         drivers = _maintenance_cost_drivers(conn, f)
+    elif family == 'workforce' and metric == 'unassigned_critical_work':
+        drivers = _workforce_unassigned_drivers(conn, f, current=current)
     elif family == 'maintenance' and metric in {
             'open_work_orders', 'overdue_work_orders', 'emergency_work_orders',
             'high_risk_overdue_work_orders', 'unassigned_critical_work_orders',
