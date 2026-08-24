@@ -612,6 +612,17 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         scope_args + [(date.today() - timedelta(days=90)).isoformat()]).fetchone()[0])
     repeat_failure_rate = round(100 * rel_failures / completed_90, 1) if completed_90 else 0.0
 
+    # Chronic bad actors are extracted with exactly the joins, scope and
+    # predicates of the rate above, so a listed contributor can never be
+    # excluded from (or invisible to) the displayed scoped rate.
+    repeat_failure_assets = _rows(conn.execute(
+        'SELECT a.id,a.asset_no,a.name,COUNT(*) failures_90d,'
+        'MAX(w.actual_finish) last_failure' + base +
+        " AND w.status IN ('Completed','Closed') AND w.work_type LIKE 'Corrective%'"
+        ' AND COALESCE(w.actual_finish,w.created_at)>=?'
+        ' GROUP BY a.id HAVING COUNT(*)>=2 ORDER BY failures_90d DESC,a.asset_no LIMIT 10',
+        scope_args + [(date.today() - timedelta(days=90)).isoformat()]))
+
     mttr = mtbf = None
     rel = compute_reliability(conn, f)
     if rel['outage_count']:
@@ -659,6 +670,7 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         'mtbf_hours': mtbf,
         'mttr_hours': mttr,
         'repeat_failure_rate_pct': repeat_failure_rate,
+        'repeat_failure_assets': repeat_failure_assets,
         'by_priority': by_priority,
         'overdue_by_age_bucket': age_buckets,
     }
@@ -1748,11 +1760,10 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
         'previous': maint_prev['emergency_wo'],
         'delta': maint_now['emergency_wo'] - maint_prev['emergency_wo'],
     }
-    # Chronic bad actors come straight from the canonical asset computation
-    # (>=2 corrective completions in 90 days, executive-scoped). These are
-    # the literal records composing the repeat-failure numerator, so no
-    # second extraction exists here.
-    asset_kpis = compute_asset_kpis(conn, f)
+    # Chronic bad actors come straight from the canonical maintenance
+    # computation, whose contributor query shares the exact joins, scope and
+    # predicates of the repeat-failure rate itself. No second extraction
+    # with different scoping may be introduced.
     explanations['repeat_failures'] = {
         'current': maint_now['repeat_failure_rate_pct'],
         'previous': None,
@@ -1769,7 +1780,7 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
                 'link': {'module': 'assets', 'record': r['asset_no'],
                          'id': r['id']},
             }
-            for r in asset_kpis.get('repeat_failure_assets', [])
+            for r in maint_now.get('repeat_failure_assets', [])
         ],
     }
     return explanations
