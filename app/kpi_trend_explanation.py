@@ -383,6 +383,34 @@ def _schedule_compliance_drivers(conn, f, limit: int = 10) -> list[dict]:
     return drivers
 
 
+def _hse_incident_drivers(conn, f, *, metric: str, limit: int = 10) -> list[dict]:
+    """Open-incident contributors for the HSE family.
+
+    Consumes the canonical ``hse_*`` explanation sections; every cited
+    incident is one of the open records composing the metric count.
+    """
+    from .kpi_service import explain_kpi_changes
+
+    section_key = ('hse_high_risk_open'
+                   if metric == 'high_risk_incidents_open'
+                   else 'hse_open_incidents')
+    section = (explain_kpi_changes(conn, f).get(section_key) or {})
+    drivers = []
+    for driver in (section.get('drivers') or [])[:limit]:
+        link = driver.get('link') or {}
+        drivers.append({
+            'kind': driver.get('kind'),
+            'label': driver.get('label'),
+            'magnitude': driver.get('risk_score'),
+            'unit': 'risk score',
+            'attribution': 'contributor',
+            'source_type': 'safety_incident',
+            'source_id': link.get('id'),
+            'drill': link,
+        })
+    return drivers
+
+
 def explain_metric(conn, f, *, family: str, metric: str) -> dict:
     """Current vs previous window for one metric, with measured drivers.
 
@@ -434,6 +462,9 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
         # compute_reliability; those outage records are the composing
         # evidence, so the reliability driver path serves both metrics.
         drivers = _reliability_outage_drivers(conn, f, metric)
+    elif family == 'hse' and metric in {'open_incidents',
+                                        'high_risk_incidents_open'}:
+        drivers = _hse_incident_drivers(conn, f, metric=metric)
     elif family == 'maintenance' and metric in {
             'open_work_orders', 'overdue_work_orders', 'emergency_work_orders',
             'high_risk_overdue_work_orders', 'unassigned_critical_work_orders',
