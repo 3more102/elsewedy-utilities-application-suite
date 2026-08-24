@@ -79,6 +79,12 @@ def transition_work_atomic(conn, wo_id: int, body, user: dict) -> dict:
         raise HTTPException(403, 'Technicians can only execute work assigned to them')
     if action == 'assign' and not work['assigned_to']:
         raise WorkflowTransitionConflict('Assign a technician before moving to Assigned')
+    if action == 'cancel':
+        holder = _application._active_dispatch_holder(conn, wo_id)
+        if holder:
+            raise WorkflowTransitionConflict(
+                'Cancel the active dispatch before cancelling the work order'
+            )
 
     stamp = now()
     fields: dict[str, object] = {'status': target, 'updated_at': stamp}
@@ -109,6 +115,8 @@ def transition_work_atomic(conn, wo_id: int, body, user: dict) -> dict:
         _application._mark_sla_response(conn, wo_id, fields['actual_start'])
     if action == 'complete':
         _application._mark_sla_resolution(conn, wo_id, fields['actual_finish'])
+    if action == 'cancel':
+        _application._settle_cancelled_work(conn, wo_id, user['id'], body.notes)
     if action in ('submit', 'resubmit'):
         _application.create_approval(
             conn,

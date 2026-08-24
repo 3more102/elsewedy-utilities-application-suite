@@ -1191,14 +1191,41 @@ def update_work(wo_id:int,body:WorkOrderPatch,user=Depends(require_roles(*WRITE_
             if 'priority' in changes:_ensure_work_sla(conn,wo_id,force=True)
             if 'assigned_to' in changes and changes['assigned_to']:notify(conn,'Work order assigned',f"{old['wo_no']} — {changes.get('title',old['title'])}",'Info',changes['assigned_to'],None,'work',old['wo_no'])
         return {'ok':True}
-TRANSITIONS={'Draft':{'submit':'Submitted'},'Rejected':{'resubmit':'Submitted'},'Submitted':{'approve':'Approved'},'Approved':{'assign':'Assigned'},'Assigned':{'start':'In Progress'},'In Progress':{'pause':'Assigned','complete':'Completed'},'Completed':{'close':'Closed'}}
+TRANSITIONS={'Draft':{'submit':'Submitted','cancel':'Cancelled'},'Rejected':{'resubmit':'Submitted','cancel':'Cancelled'},'Submitted':{'approve':'Approved','cancel':'Cancelled'},'Approved':{'assign':'Assigned','cancel':'Cancelled'},'Assigned':{'start':'In Progress','cancel':'Cancelled'},'In Progress':{'pause':'Assigned','complete':'Completed'},'Completed':{'close':'Closed'}}
 ACTION_ROLES={
     'approve':('admin','maintenance_manager','supervisor'),
     'assign':('admin','maintenance_manager','planner','supervisor'),
     'close':('admin','maintenance_manager','supervisor'),
     'submit':('admin','maintenance_manager','planner','supervisor'),
     'resubmit':('admin','maintenance_manager','planner','supervisor'),
+    'cancel':('admin','maintenance_manager','planner','supervisor'),
 }
+
+def _active_dispatch_holder(conn, wo_id:int):
+    return conn.execute(
+        "SELECT d.id,u.username FROM dispatch_assignments d JOIN users u ON u.id=d.technician_user_id"
+        " WHERE d.work_order_id=? AND d.status IN ('Dispatched','Accepted','En Route','On Site') LIMIT 1",
+        (wo_id,),
+    ).fetchone()
+
+def _settle_cancelled_work(conn, wo_id:int, user_id:int, notes:str=''):
+    """Settle approvals and reservations when a work order is cancelled."""
+    resolve_approval(conn,'Work Management','work_order',wo_id,'reject',user_id,notes or 'Work order cancelled')
+    released=[]
+    open_reservations=rows(conn.execute(
+        "SELECT id,reservation_no,inventory_item_id,status FROM inventory_reservations"
+        " WHERE work_order_id=? AND status IN ('Reserved','Partially Issued')",
+        (wo_id,),
+    ))
+    for r in open_reservations:
+        conn.execute("UPDATE inventory_reservations SET status='Released',released_at=? WHERE id=?",(now(),r['id']))
+        _sync_reserved_stock(conn,r['inventory_item_id'])
+        req=conn.execute('SELECT id,status FROM work_order_requirements WHERE work_order_id=? AND inventory_item_id=?',(wo_id,r['inventory_item_id'])).fetchone()
+        if req and req['status']=='Reserved':
+            conn.execute("UPDATE work_order_requirements SET status='Required' WHERE id=?",(req['id'],))
+        audit(conn,user_id,'RELEASE RESERVATION','Inventory',r['reservation_no'],r['status'],'Released')
+        released.append(r['reservation_no'])
+    return released
 @app.post('/api/work-orders/{wo_id}/transition')
 def transition_work(wo_id:int,body:TransitionIn,user=Depends(require_roles(*WORK_ROLES))):
     with db() as conn:
@@ -1207,12 +1234,16 @@ def transition_work(wo_id:int,body:TransitionIn,user=Depends(require_roles(*WORK
         if action in ACTION_ROLES and user['role'] not in ACTION_ROLES[action]: raise HTTPException(403,f"Role {user['role']} cannot perform {action}")
         if user['role']=='technician' and action in ('start','pause','complete') and w['assigned_to']!=user['id']: raise HTTPException(403,'Technicians can only execute work assigned to them')
         if action=='assign' and not w['assigned_to']: raise HTTPException(409,'Assign a technician before moving to Assigned')
+        if action=='cancel':
+            holder=_active_dispatch_holder(conn,wo_id)
+            if holder: raise HTTPException(409,'Cancel the active dispatch before cancelling the work order')
         fields={'status':target,'updated_at':now()}
         if action=='start':fields['actual_start']=now()
         if action=='complete':fields['actual_finish']=now();fields['completion_notes']=body.notes or w['completion_notes'];fields['technician_signature']=body.signature or w.get('technician_signature','')
         conn.execute('UPDATE work_orders SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?',(*fields.values(),wo_id))
         if action=='start':_mark_sla_response(conn,wo_id,fields['actual_start'])
         if action=='complete':_mark_sla_resolution(conn,wo_id,fields['actual_finish'])
+        if action=='cancel':_settle_cancelled_work(conn,wo_id,user['id'],body.notes)
         if action in ('submit','resubmit'):
             create_approval(conn,'Work Management','work_order',wo_id,w['wo_no'],f"Approve {w['wo_no']} — {w['title']}",user['id'],assigned_user_id=w['supervisor_id'],assigned_role=None if w['supervisor_id'] else 'maintenance_manager')
         if action=='approve':resolve_approval(conn,'Work Management','work_order',wo_id,'approve',user['id'],body.notes)

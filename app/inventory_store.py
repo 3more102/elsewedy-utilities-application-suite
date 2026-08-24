@@ -84,6 +84,7 @@ from .dispatch_startup import install_dispatch_assignment_startup
 from .dispatch_store import install_dispatch_assignment_route
 from .inspection_authorization import install_inspection_authorization_contract
 from .inspection_store import install_inspection_submission_route
+from .kpi_store import install_kpi_routes
 from .outbox_observability import install_outbox_observability
 from .outbox_store import install_outbox_atomicity
 from .outage_store import install_outage_routes
@@ -121,9 +122,12 @@ install_procurement_routes()
 install_atomic_approval_route()
 install_approval_routes()
 install_asset_routes()
+from .apm_store import install_apm_routes
+install_apm_routes()
 install_reservation_routes()
 install_workflow_transition_routes()
 install_dispatch_assignment_route()
 install_alarm_work_order_route()
 install_alarm_lifecycle_routes()
 install_inspection_submission_route()
+install_kpi_routes()
