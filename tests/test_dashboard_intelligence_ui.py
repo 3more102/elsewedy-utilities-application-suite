@@ -21,7 +21,7 @@ def test_dashboard_intelligence_uses_canonical_kpi_contracts():
     assert "maintenance_cost_window" in js
     assert "drivers" in js
     assert "drill" in js
-    assert "correlation" in js
+    assert "attribution" in js
     assert "innerHTML" not in js
     assert "onclick=" not in js
     assert "style=" not in js
