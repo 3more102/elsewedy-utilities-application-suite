@@ -6,6 +6,7 @@
     opsWhyRed:'s',
     opsTimeline:'s',
     opsDrill:'nn',
+    opsChain:'n',
     openReportSnapshot:'n',
     toggleTask:'nn',
     issueReservation:'nn',

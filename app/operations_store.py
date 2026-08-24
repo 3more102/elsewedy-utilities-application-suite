@@ -299,6 +299,7 @@ def _situations(conn, site_id: Optional[int] = None) -> list[dict]:
             n = blocker_counts.get(int(w['id']), 0)
             if n:
                 shortest.append({
+                    'wo_id': int(w['id']),
                     'wo_no': w['wo_no'],
                     'shortage_items': n,
                     'approvals': approval_map.get(w['wo_no']),
