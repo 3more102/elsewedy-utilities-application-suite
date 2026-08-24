@@ -429,3 +429,35 @@ def test_parts_shortage_drilldown_exact_lines_permissions_and_scope():
         other = client.get('/api/kpi/parts/shortages', headers=admin,
                            params={'site_id': cai}).json()
         assert not any(x['wo_no'] == 'WO-KPI-SHORT' for x in other['lines'])
+
+
+def test_executive_kpi_csv_export_matches_snapshot_and_permissions():
+    _ensure_db()
+    with TestClient(app) as client:
+        admin = auth(client)
+        tech = auth(client, 'tech1', 'Tech@2026')
+        assert client.get('/api/exports/executive-kpis.csv',
+                          headers=tech).status_code == 403
+        r = client.get('/api/exports/executive-kpis.csv', headers=admin,
+                       params={'period_days': 30})
+        assert r.status_code == 200, r.text
+        assert 'text/csv' in r.headers.get('content-type', '')
+
+        import csv as _csv
+        import io as _io
+        rows = list(_csv.reader(_io.StringIO(r.text)))
+        assert rows[0] == ['Family', 'Metric', 'Value', 'Previous', 'Delta']
+        metrics = {(x[0], x[1]): x[2] for x in rows[1:]}
+
+        # Export must reuse the snapshot pipeline: values equal the JSON API.
+        snap = client.get('/api/kpi/executive', headers=admin,
+                          params={'refresh': 'true'}).json()
+        assert float(metrics[('reliability', 'availability_pct')]) == \
+            snap['reliability']['availability_pct']
+        assert int(metrics[('maintenance', 'open_wo')]) == snap['maintenance']['open_wo']
+        assert int(metrics[('hse', 'open_incidents')]) == snap['hse']['open_incidents']
+        assert metrics[('meta', 'freshness_state')] in {'current', 'stale'}
+
+        # Unconfigured reliability indices export an explicit unavailable state.
+        saidi = metrics[('reliability', 'saidi_minutes')]
+        assert saidi == 'unavailable' or float(saidi) >= 0

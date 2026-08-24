@@ -1987,6 +1987,31 @@ def metrics(user=Depends(require_roles('admin','maintenance_manager','executive'
     for code,count in sorted(_REQUEST_METRICS['status'].items()):lines.append(f'euas_http_responses_total{{status="{code}"}} {count}')
     return '\n'.join(lines)+'\n'
 
+@app.get('/api/exports/executive-kpis.csv')
+def export_executive_kpis(
+    period_end: Optional[str] = None,
+    period_days: int = Query(30, ge=1, le=365),
+    site_id: Optional[int] = None,
+    region: Optional[str] = None,
+    asset_type_id: Optional[int] = None,
+    criticality: Optional[str] = None,
+    user=Depends(require_roles(*_KPI_ROLES)),
+):
+    """Scoped executive KPI snapshot as CSV.
+
+    Reuses the materialized snapshot pipeline (same scope keys, freshness and
+    cache semantics) — export never recalculates or bypasses authorization.
+    """
+    f = _kpi_filters(period_end, period_days, site_id, region, asset_type_id, criticality)
+    from .kpi_service import executive_snapshot, snapshot_export_rows
+    with db() as conn:
+        snapshot = executive_snapshot(conn, f)
+        rows = snapshot_export_rows(snapshot)
+    return csv_response(
+        'EUAS_executive_kpis.csv',
+        ['Family', 'Metric', 'Value', 'Previous', 'Delta'],
+        rows)
+
 @app.get('/api/exports/work-orders.csv')
 def export_work_orders(user=Depends(current_user)):
     with db() as conn:data=rows(conn.execute(WO_SELECT+' ORDER BY w.id DESC'))

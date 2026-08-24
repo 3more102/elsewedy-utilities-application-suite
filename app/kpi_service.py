@@ -1348,6 +1348,70 @@ def compute_parts_shortages(conn, f: ExecutiveFilters, limit: int = 50) -> dict:
     }
 
 
+def snapshot_export_rows(snapshot: dict) -> list[list]:
+    """Deterministic flat rows for CSV export of one executive snapshot.
+
+    Reuses an already-computed snapshot payload; export never recalculates.
+    Values are scalars only — nested contributor/trend structures are out of
+    scope for the tabular contract and remain available through the JSON API.
+    """
+    r = snapshot['reliability']
+    m = snapshot['maintenance']
+    a = snapshot['assets']
+    c = snapshot['condition']
+    ip = snapshot['inventory_procurement']
+    wf = snapshot['workforce']
+    cost = snapshot['costs']
+    hse = snapshot.get('hse', {})
+    fresh = snapshot['freshness']
+
+    def row(family, metric, value, previous='', delta=''):
+        return [family, metric, value, previous, delta]
+
+    rows = [
+        row('meta', 'calculated_at', fresh['calculated_at']),
+        row('meta', 'freshness_state', fresh['state']),
+        row('meta', 'latest_source_timestamp', fresh.get('latest_source_timestamp') or ''),
+        row('reliability', 'availability_pct', r['availability_pct'],
+            r['availability_previous_pct'], ''),
+        row('reliability', 'saidi_minutes', r['saidi_minutes'] if r['saidi_minutes'] is not None else 'unavailable'),
+        row('reliability', 'saifi', r['saifi'] if r['saifi'] is not None else 'unavailable'),
+        row('reliability', 'caidi_minutes', r['caidi_minutes'] if r['caidi_minutes'] is not None else 'unavailable'),
+        row('reliability', 'unplanned_outages', r['unplanned_outages']),
+        row('reliability', 'planned_outages', r['planned_outages']),
+        row('maintenance', 'open_wo', m['open_wo']),
+        row('maintenance', 'overdue_wo', m['overdue_wo']),
+        row('maintenance', 'emergency_wo', m['emergency_wo']),
+        row('maintenance', 'pm_compliance_pct', m['pm_compliance_pct']),
+        row('maintenance', 'schedule_compliance_pct', m['schedule_compliance_pct']),
+        row('maintenance', 'backlog_hours', m['backlog_hours']),
+        row('maintenance', 'mtbf_hours', m['mtbf_hours'] if m['mtbf_hours'] is not None else 'no failures'),
+        row('maintenance', 'mttr_hours', m['mttr_hours'] if m['mttr_hours'] is not None else 'no failures'),
+        row('assets', 'total', a['total']),
+        row('assets', 'down', a['down']),
+        row('assets', 'critical_down', a['critical_down']),
+        row('condition', 'active_alarms', c['active_alarms']),
+        row('condition', 'critical_active_alarms', c['critical_active_alarms']),
+        row('inventory', 'stockout_items', ip['stockout_items']),
+        row('inventory', 'work_blocked_by_parts', ip['work_blocked_by_parts']),
+        row('procurement', 'overdue_purchase_orders', ip['overdue_purchase_orders']),
+        row('workforce', 'technicians_available', wf['technicians_available']),
+        row('workforce', 'sla_breached_open', wf['sla_breached_open']),
+        row('costs', 'maintenance_cost_window', cost['maintenance_cost_window'],
+            cost['maintenance_cost_previous'], cost['cost_delta']),
+    ]
+    if hse:
+        rows += [
+            row('hse', 'open_incidents', hse['open_incidents']),
+            row('hse', 'high_risk_open', hse['high_risk_open']),
+            row('hse', 'incidents_current', hse['incidents_current'],
+                hse['incidents_previous'], hse['incidents_delta']),
+            row('hse', 'days_since_last_high_risk',
+                hse['days_since_last_high_risk'] if hse['days_since_last_high_risk'] is not None else 'none recorded'),
+        ]
+    return rows
+
+
 # --------------------------------------------------------------------------- #
 # Explainable KPI changes (period vs previous period)
 # --------------------------------------------------------------------------- #
