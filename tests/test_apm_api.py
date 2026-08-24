@@ -86,6 +86,42 @@ def _add_alarm(conn, code: str, asset_id: int, channel_id: int, opened_at: str, 
     )
 
 
+def test_health_formula_reference_resolves_to_a_real_document_anchor():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    headers = _login('exec', 'Viewer@2026')
+    with db() as conn:
+        asset_id = _make_asset(conn, 'AST-APM-DOC')
+        conn.commit()
+    try:
+        with TestClient(app) as client:
+            result = client.get(f'/api/reliability/health/{asset_id}', headers=headers)
+            assert result.status_code == 200, result.text
+            payload = result.json()
+
+        reference = payload['formula']
+        assert reference.startswith('docs/')
+        doc_path, _, anchor = reference.partition('#')
+        doc = root / doc_path
+        assert doc.is_file(), f'advertised formula document missing: {doc_path}'
+        if anchor:
+            def slug(line: str) -> str:
+                text = line.strip()
+                if not text.startswith('#'):
+                    return ''
+                return text.lstrip('#').strip().lower().replace(' ', '-')
+            assert any(
+                slug(line) == anchor
+                for line in doc.read_text(encoding='utf-8').splitlines()
+            ), (
+                f'anchor #{anchor} not found in {doc_path}'
+            )
+    finally:
+        with db() as conn:
+            conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))
+
+
 # ---------------------------------------------------------------------------
 # Authentication scoping
 # ---------------------------------------------------------------------------
