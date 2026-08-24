@@ -374,7 +374,25 @@ async function renderAnalytics(){
       const sh=await api('/api/kpi/parts/shortages?'+sq);
       const s=sh.summary;
       $('#kpi-shortage-body').innerHTML=`<div class="kpi-grid" style="margin-bottom:10px">${kpiCard('Blocked WOs',s.blocked_work_orders,'B','')}${kpiCard('Short Lines',s.short_lines,'L','')}${kpiCard('High-Risk Lines',s.high_risk_lines,'H','Emergency/Critical/High','warn')}</div>`+
-        (sh.lines.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>WO</th><th>Priority</th><th>Part</th><th>Required</th><th>Reserved</th><th>Free</th><th>Outstanding</th></tr></thead><tbody>${sh.lines.map(l=>`<tr class="drill-row" data-kind="work" data-id="${l.wo_id}" style="cursor:pointer"><td>${esc(l.wo_no)}</td><td>${status(l.priority)}</td><td>${esc(l.item_no)} — ${esc(l.item_name)}</td><td>${fmt(l.required_qty)} ${esc(l.unit||'')}</td><td>${fmt(l.reserved_for_work)}</td><td>${fmt(l.free_stock)}</td><td><strong class="${l.outstanding_short>0?'':'good'}">${fmt(l.outstanding_short)}</strong></td></tr>`).join('')}</tbody></table></div>`:empty('No shortages blocking open work'));
+        (sh.lines.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>WO</th><th>Priority</th><th>Part</th><th>Required</th><th>Reserved</th><th>Free</th><th>Outstanding</th><th></th></tr></thead><tbody>${sh.lines.map(l=>`<tr><td class="drill-row" data-kind="work" data-id="${l.wo_id}" style="cursor:pointer">${esc(l.wo_no)}</td><td>${status(l.priority)}</td><td>${esc(l.item_no)} — ${esc(l.item_name)}</td><td>${fmt(l.required_qty)} ${esc(l.unit||'')}</td><td>${fmt(l.reserved_for_work)}</td><td>${fmt(l.free_stock)}</td><td><strong class="${l.outstanding_short>0?'':'good'}">${fmt(l.outstanding_short)}</strong></td><td>${roleIn('admin','storekeeper','maintenance_manager','procurement','planner')?`<button class="btn small" data-expedite="${l.wo_id}" data-item="${l.item_id}" data-qty="${l.outstanding_short}" data-short="${esc(l.item_no)}" data-unit="${esc(l.unit||'ea')}" title="Opens the standard Create Purchase Requisition flow, prefilled with the outstanding quantity. Submission stays subject to procurement permissions and audit.">Expedite</button>`:''}</td></tr>`).join('')}</tbody></table></div>`:empty('No shortages blocking open work'));
+      $$('[data-expedite]').forEach(b=>b.onclick=async()=>{
+        try{
+          const items=S.cache.inventory||await api('/api/inventory');
+          S.cache.inventory=items;
+          const item=items.find(x=>x.id===Number(b.dataset.item));
+          if(!item){toast('Open the item record to expedite (item not in inventory cache)');return}
+          newPR();
+          setTimeout(()=>{
+            const f=$('#dynamic-form');if(!f)return;
+            const set=(name,value)=>{const el=f.querySelector(`[name="${name}"]`);if(el&&value!=null)el.value=value};
+            set('title',`Expedite ${b.dataset.short} for open work order shortage`);
+            set('inventory_item_id',String(item.id));
+            set('quantity',b.dataset.qty);
+            set('estimated_unit_cost',item.unit_price??0);
+            set('justification',`Reservation-exact shortage of ${b.dataset.qty} ${b.dataset.unit} blocking open work (${b.dataset.short}). Raised from executive analytics.`);
+          },60);
+        }catch(err){toast(err.message)}
+      });
       $$('#kpi-shortage-body .drill-row').forEach(row=>{row.onclick=async()=>{await go('work');setTimeout(()=>workDetail(Number(row.dataset.id)),250)}});
     }catch(err){$('#kpi-shortage-body').innerHTML=empty(err.message)}
   };

@@ -533,3 +533,58 @@ def test_pm_capacity_risk_endpoint_authorization():
                 'capacity_source'} <= set(body.keys())
         assert client.get('/api/kpi/pm-risk', headers=admin,
                           params={'horizon_days': 5}).status_code == 422
+
+
+def test_shortage_expedite_flow_through_standard_procurement_endpoint():
+    """The analytics Expedite bridge targets the existing requisition API:
+    create -> submit -> approve leaves an audited trail tied to the WO."""
+    _ensure_db()
+    now = datetime.now().isoformat(timespec='seconds')
+    with db() as conn:
+        tr = int(conn.execute("SELECT id FROM assets WHERE asset_no='TR-001'").fetchone()[0])
+        wo_cur = conn.execute(
+            '''INSERT INTO work_orders(wo_no,title,priority,status,work_type,asset_id,
+                 estimated_hours,created_at,updated_at)
+               VALUES('WO-KPI-EXPED','Expedite regression','Critical','Approved','Preventive',
+                      ?,1,?,?)''', (tr, now, now))
+        wo_id = int(wo_cur.lastrowid)
+        wh = int(conn.execute('SELECT id FROM warehouses ORDER BY id LIMIT 1').fetchone()[0])
+        conn.execute(
+            '''INSERT INTO inventory_items(item_no,name,category,warehouse_id,current_stock,
+                 reserved_stock,min_level,max_level,reorder_point,unit_price,unit)
+               VALUES('KPI-EXPED-1','Expedited part','Electrical',?,0,0,0,5,0,120,'ea')''', (wh,))
+        item_id = int(conn.execute(
+            "SELECT id FROM inventory_items WHERE item_no='KPI-EXPED-1'").fetchone()[0])
+
+    with TestClient(app) as client:
+        admin = auth(client)
+        tech = auth(client, 'tech1', 'Tech@2026')
+        # Unauthorized role cannot raise requisitions.
+        denied = client.post('/api/procurement/requisitions', headers=tech, json={
+            'title': 'nope',
+            'items': [{'inventory_item_id': item_id, 'description': 'x',
+                       'quantity': 5, 'estimated_unit_cost': 120}],
+        })
+        assert denied.status_code == 403
+
+        # Authorized storekeeper raises the requisition against the blocked WO.
+        created = client.post('/api/procurement/requisitions', headers=auth(client, 'store', 'Store@2026'), json={
+            'title': 'Expedite KPI-EXPED-1 for open work order shortage',
+            'work_order_id': wo_id,
+            'justification': 'Reservation-exact shortage of 5 ea blocking open work.',
+            'items': [{'inventory_item_id': item_id, 'description': 'Expedited part',
+                       'quantity': 5, 'estimated_unit_cost': 120}],
+        })
+        assert created.status_code == 200, created.text
+        pr_no = created.json()['pr_no']
+
+        # Standard lifecycle still applies: submit then approve.
+        assert client.post(f'/api/procurement/requisitions/{created.json()["id"]}/submit',
+                           headers=admin).status_code == 200
+        approved = client.post(f'/api/procurement/requisitions/{created.json()["id"]}/approve',
+                               headers=admin)
+        assert approved.status_code == 200, approved.text
+
+        # Audit trail records the creation with the requisition number.
+        audits = client.get('/api/audit', headers=admin, params={'q': pr_no}).json()
+        assert any(x['action'].upper().startswith('CREATE') for x in audits)
