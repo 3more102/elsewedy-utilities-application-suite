@@ -20,7 +20,7 @@ def test_sla_escalation_and_durable_outbox():
         ref=client.get('/api/reference',headers=admin).json()
         tech=next(x for x in ref['users'] if x['username']=='tech1')
         supervisor=next(x for x in ref['users'] if x['username']=='supervisor')
-        tr=next(x for x in client.get('/api/assets',headers=admin).json() if x['asset_no']=='TR-001')
+        tr=next(x for x in client.get('/api/assets',headers=admin,params={'q':'TR-001'}).json() if x['asset_no']=='TR-001')
 
         policies=client.get('/api/sla/policies',headers=admin)
         assert policies.status_code==200,policies.text
@@ -129,7 +129,7 @@ def test_signed_webhook_delivery_contract(monkeypatch):
 
     with TestClient(app) as client:
         admin=auth(client)
-        tr=next(x for x in client.get('/api/assets',headers=admin).json() if x['asset_no']=='TR-001')
+        tr=next(x for x in client.get('/api/assets',headers=admin,params={'q':'TR-001'}).json() if x['asset_no']=='TR-001')
         created=client.post('/api/work-orders',headers=admin,json={'title':'Webhook delivery regression','asset_id':tr['id'],'priority':'Low'})
         assert created.status_code==200
         wo_no=created.json()['wo_no']

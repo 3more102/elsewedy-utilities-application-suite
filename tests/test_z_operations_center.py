@@ -15,7 +15,7 @@ def test_automation_observability_exports_and_backup():
         admin=auth(client)
         ref=client.get('/api/reference',headers=admin).json()
         tech=next(x for x in ref['users'] if x['username']=='tech1')
-        tr=next(x for x in client.get('/api/assets',headers=admin).json() if x['asset_no']=='TR-001')
+        tr=next(x for x in client.get('/api/assets',headers=admin,params={'q':'TR-001'}).json() if x['asset_no']=='TR-001')
 
         # Create a clearly overdue assigned work order so the automation engine has an alertable record.
         created=client.post('/api/work-orders',headers=admin,json={

@@ -25,7 +25,7 @@ def test_euas_end_to_end():
         admin = auth(client)
         ref = client.get('/api/reference', headers=admin).json()
         users = {x['username']: x['id'] for x in ref['users']}
-        assets = client.get('/api/assets', headers=admin).json()
+        assets = client.get('/api/assets', headers=admin, params={'q': 'TR-001'}).json()
         tr = next(x for x in assets if x['asset_no'] == 'TR-001')
 
         # Required demo record exists.

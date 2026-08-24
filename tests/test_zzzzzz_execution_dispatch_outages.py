@@ -14,7 +14,7 @@ def test_reservations_dispatch_and_outage_reliability():
         admin=auth(client)
         tech1=auth(client,'tech1','Tech@2026')
         tech2=auth(client,'tech2','Tech2@2026')
-        assets=client.get('/api/assets',headers=admin).json()
+        assets=client.get('/api/assets',headers=admin,params={'q':'TR-001'}).json()
         tr=next(a for a in assets if a['asset_no']=='TR-001')
         inv=client.get('/api/inventory',headers=admin).json()
         spare=max(inv,key=lambda x: float(x['available_stock']))
