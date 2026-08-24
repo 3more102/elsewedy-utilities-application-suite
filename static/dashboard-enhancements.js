@@ -11,17 +11,20 @@
     'admin', 'maintenance_manager', 'executive', 'asset_manager', 'planner', 'supervisor'
   ]);
 
-  // Wire only cards whose displayed legacy value is semantically equivalent
-  // to the canonical KPI for the same scope/as-of basis. Similar labels are
-  // not sufficient. Snapshot-only/live-state metrics and cards with different
-  // formulas or periods are deliberately excluded until the dashboard itself
-  // is migrated to the canonical snapshot surface.
+  // Wire only cards whose displayed value is semantically equivalent to the
+  // canonical KPI for the same scope/as-of basis. Emergency Work, MTBF and
+  // MTTR are safe here because the executive cards are now populated by the
+  // canonical 30-day snapshot adapter before this intelligence is consumed.
+  // Point-in-time/live-state metrics remain excluded from historical trends.
   const INTELLIGENCE = new Map([
     ['Overdue Work', {family: 'maintenance', metric: 'overdue_work_orders', periodDays: 30}],
+    ['Emergency Work', {family: 'maintenance', metric: 'emergency_work_orders', periodDays: 30}],
     ['PM Compliance', {
       family: 'maintenance', metric: 'pm_compliance_pct', periodDays: 30,
       portfolioOnly: true,
     }],
+    ['MTBF', {family: 'maintenance', metric: 'mtbf_hours', periodDays: 30}],
+    ['MTTR', {family: 'maintenance', metric: 'mttr_hours', periodDays: 30}],
   ]);
 
   function canUseCanonicalIntelligence() {
