@@ -942,6 +942,101 @@ def test_site_burst_correlation_across_assets_and_scope():
 
 
 # ---------------------------------------------------------------------------
+# Reliability CSV exports
+# ---------------------------------------------------------------------------
+EXPORT_PATHS = [
+    '/api/exports/reliability/bad-actors.csv',
+    '/api/exports/reliability/deterioration-watchlist.csv',
+    '/api/exports/reliability/fmea.csv',
+]
+
+
+@pytest.mark.parametrize('path', EXPORT_PATHS)
+def test_reliability_exports_require_authentication(path):
+    with TestClient(app) as client:
+        assert client.get(path).status_code == 401
+
+
+def test_reliability_exports_render_seeded_records():
+    from datetime import datetime, timedelta
+
+    exec_headers = _login('exec', 'Viewer@2026')
+    admin = _login('omar', 'EUAS@2026')
+
+    with db() as conn:
+        site_id, loc_id = _make_scoped_site(conn, 'EXP-A')
+        asset_id = _make_site_asset(conn, 'AST-EXPORT-A', loc_id)
+        chan_id = _make_channel(conn, 'TEL-EXPORT-A', asset_id, warning_high=80)
+        _add_readings(conn, chan_id, [55, 62, 68, 75, 82, 86])
+        opened = _iso(datetime.now() - timedelta(minutes=10))
+        for index in range(2):
+            _add_site_alarm(
+                conn, f'ALM-EXPORT-{index}', asset_id, chan_id, site_id,
+                _iso(datetime.now() - timedelta(minutes=10 + index)),
+            )
+        conn.commit()
+
+    fmea_id = None
+    try:
+        with TestClient(app) as client:
+            created = client.post('/api/reliability/fmea', headers=admin, json={
+                'asset_id': asset_id,
+                'function_text': 'Contain process fluid',
+                'failure_mode': 'ExportProbeMode',
+                'severity': 5, 'occurrence': 4, 'detection': 3,
+            })
+            assert created.status_code == 200, created.text
+            fmea_id = created.json()['id']
+
+            watchlist = client.get(
+                f'/api/exports/reliability/deterioration-watchlist.csv?site_id={site_id}',
+                headers=exec_headers,
+            )
+            assert watchlist.status_code == 200, watchlist.text
+            assert 'text/csv' in watchlist.headers['content-type']
+            body = watchlist.text
+            assert body.splitlines()[0].startswith('Asset,Asset Name,Channel')
+            assert 'AST-EXPORT-A' in body and 'TEL-EXPORT-A' in body
+            other_site_view = client.get(
+                '/api/exports/reliability/deterioration-watchlist.csv'
+                f'?site_id={site_id}&window_days=30',
+                headers=exec_headers,
+            )
+            assert 'AST-EXPORT-A' in other_site_view.text
+
+            actors = client.get('/api/exports/reliability/bad-actors.csv', headers=admin)
+            assert actors.status_code == 200, actors.text
+            actor_body = actors.text
+            assert actor_body.splitlines()[0].startswith('Asset,Name,Site,Bad Actor Points')
+            assert 'AST-EXPORT-A' in actor_body
+
+            catalog = client.get('/api/exports/reliability/fmea.csv', headers=exec_headers)
+            assert catalog.status_code == 200, catalog.text
+            catalog_body = catalog.text
+            assert catalog_body.splitlines()[0].startswith('FMEA No,Asset,Function')
+            assert 'ExportProbeMode' in catalog_body
+    finally:
+        with db() as conn:
+            if fmea_id:
+                conn.execute('DELETE FROM fmea_records WHERE id=?', (fmea_id,))
+            conn.execute("DELETE FROM operational_alarms WHERE alarm_no LIKE 'ALM-EXPORT-%'")
+            conn.execute('DELETE FROM telemetry_readings WHERE channel_id=?', (chan_id,))
+            conn.execute('DELETE FROM telemetry_channels WHERE id=?', (chan_id,))
+            conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))
+            conn.execute('DELETE FROM locations WHERE site_id=?', (site_id,))
+            conn.execute('DELETE FROM sites WHERE id=?', (site_id,))
+
+
+def test_bad_actor_export_enforces_role_ceiling():
+    technician = _login('tech1', 'Tech@2026')
+    with TestClient(app) as client:
+        denied = client.get(
+            '/api/exports/reliability/bad-actors.csv', headers=technician
+        )
+        assert denied.status_code == 403
+
+
+# ---------------------------------------------------------------------------
 # FMEA catalog listing
 # ---------------------------------------------------------------------------
 def test_fmea_catalog_listing_filters_and_pagination():

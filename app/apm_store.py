@@ -1260,6 +1260,70 @@ def install_apm_routes() -> None:
                 conn, asset_id=asset_id, status=status, limit=limit, offset=offset
             )
 
+    # ------------------------------------------------------------------
+    # CSV exports for the APM intelligence views
+    # ------------------------------------------------------------------
+    @app.get('/api/exports/reliability/bad-actors.csv')
+    def export_bad_actors_csv(
+        window_days: int = _application.Query(365, ge=30, le=1095),
+        site_id: Optional[int] = None,
+        user=Depends(require_roles(*RELIABILITY_MANAGE_ROLES, 'planner', 'supervisor', 'executive')),
+    ):
+        with db() as conn:
+            ranked = bad_actors_view(conn, window_days=window_days, limit=100, site_id=site_id)
+        return _application.csv_response(
+            'EUAS_reliability_bad_actors.csv',
+            ['Asset', 'Name', 'Site', 'Bad Actor Points', 'Failures', 'Emergency Work',
+             'Downtime Hours', 'Alarms', 'Maintenance Cost', 'MTBF Hours', 'MTTR Hours',
+             'Drivers'],
+            [[
+                e['asset_no'], e['name'], e.get('site_name') or '', e['bad_actor_points'],
+                e['corrective_completions'], e['emergency_count'], e['downtime_hours'],
+                e['alarm_count'], e['maintenance_cost'],
+                e['mtbf_hours'] if e['mtbf_hours'] is not None else '',
+                e['mttr_hours'] if e['mttr_hours'] is not None else '',
+                '; '.join(e['drivers']),
+            ] for e in ranked],
+        )
+
+    @app.get('/api/exports/reliability/deterioration-watchlist.csv')
+    def export_watchlist_csv(
+        window_days: int = _application.Query(30, ge=1, le=365),
+        site_id: Optional[int] = None,
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            watchlist = deterioration_watchlist_view(
+                conn, window_days=window_days, site_id=site_id
+            )
+        return _application.csv_response(
+            'EUAS_deterioration_watchlist.csv',
+            ['Asset', 'Asset Name', 'Channel', 'Channel Name', 'Unit', 'Level',
+             'Signals', 'Readings', 'Site'],
+            [[
+                w['asset_no'], w['asset_name'], w['channel_code'], w['channel_name'],
+                w.get('unit') or '', w['level'], '; '.join(w['signals']),
+                w['readings'], w.get('site_name') or '',
+            ] for w in watchlist],
+        )
+
+    @app.get('/api/exports/reliability/fmea.csv')
+    def export_fmea_csv(user=Depends(current_user)):
+        with db() as conn:
+            catalog = fmea_list_view(conn, limit=500)
+        return _application.csv_response(
+            'EUAS_fmea_catalog.csv',
+            ['FMEA No', 'Asset', 'Function', 'Failure Mode', 'Failure Cause',
+             'Failure Effect', 'Severity', 'Occurrence', 'Detection', 'RPN', 'Status',
+             'Created At'],
+            [[
+                r['fmea_no'], r.get('asset_no') or '', r['function_text'],
+                r['failure_mode'], r['failure_cause'], r['failure_effect'],
+                r['severity'], r['occurrence'], r['detection'], r['rpn'], r['status'],
+                r['created_at'],
+            ] for r in catalog['records']],
+        )
+
     @app.post('/api/reliability/fmea')
     def fmea_create_route(
         body: _application.FMEAIn,
