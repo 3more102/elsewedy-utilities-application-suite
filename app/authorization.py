@@ -187,6 +187,10 @@ PERMISSION_CATALOG: dict[str, tuple[str, tuple[str, ...]]] = {
         'Trigger KPI recalculation',
         ('admin', 'maintenance_manager', 'planner', 'supervisor'),
     ),
+    'reliability.customers.manage': (
+        'Configure customers-served figures used by SAIDI/SAIFI/CAIDI',
+        ('admin', 'maintenance_manager', 'planner'),
+    ),
 }
 
 # FastAPI's matched route template is used for parameterized paths. Each entry
@@ -246,6 +250,7 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('PATCH', '/api/kpis/{kpi_id}'): 'kpi.manage',
     ('POST', '/api/kpis/{kpi_id}/recalculate'): 'kpi.recalculate',
     ('POST', '/api/kpis/recalculate-all'): 'kpi.recalculate',
+    ('PUT', '/api/reliability/customers'): 'reliability.customers.manage',
 }
 
 # Once a business route family is listed here, every state-changing route in
@@ -260,6 +265,7 @@ CAPABILITY_ENFORCED_MUTATION_PREFIXES: dict[str, tuple[str, ...]] = {
     'projects': ('/api/projects',),
     'sla_governance': ('/api/sla', '/api/governance', '/api/events/outbox'),
     'kpi': ('/api/kpis',),
+    'reliability': ('/api/reliability',),
 }
 
 CAPABILITY_MUTATION_EXEMPTIONS: dict[tuple[str, str], str] = {

@@ -393,6 +393,87 @@ def _alarm_counts(conn, ctx):
     )
 
 
+# IEEE 1366: interruptions shorter than this are momentary and excluded from
+# the sustained distribution reliability indices.
+SUSTAINED_OUTAGE_MINUTES = 5
+
+
+def _customers_served(conn, scope):
+    sql = 'SELECT COALESCE(SUM(customers_served),0) FROM site_reliability_config WHERE 1=1'
+    args: list = []
+    if scope.get('site_id'):
+        sql += ' AND site_id=?'
+        args.append(int(scope['site_id']))
+    return int(conn.execute(sql, args).fetchone()[0] or 0)
+
+
+def _sustained_customer_interruptions(conn, ctx):
+    """Sustained outages overlapping the window that carry customer impact data.
+
+    Returns (rows, missing_impact_count). Rows carry overlap_hours clamped to
+    the window so long-running historical outages cannot distort a short
+    reporting period.
+    """
+    win_start, win_end = ctx['window_start'], ctx['window_end']
+    scope = ctx.get('scope') or {}
+    sql = '''SELECT o.*,a.asset_no FROM asset_outages o LEFT JOIN assets a ON a.id=o.asset_id
+             WHERE o.outage_type IN ('Forced','Planned','Maintenance')'''
+    args: list = []
+    if scope.get('site_id'):
+        sql += ' AND o.site_id=?'
+        args.append(int(scope['site_id']))
+    if scope.get('asset_id'):
+        sql += ' AND o.asset_id=?'
+        args.append(int(scope['asset_id']))
+    outage_rows = conn.execute(sql + ' ORDER BY o.id DESC LIMIT 500', args).fetchall()
+    sustained, missing = [], 0
+    for o in outage_rows:
+        h = _overlap_hours(o['start_at'], o['end_at'], win_start, win_end)
+        if not h or h * 60.0 < SUSTAINED_OUTAGE_MINUTES:
+            continue
+        customers = o['customers_interrupted'] if 'customers_interrupted' in o.keys() else None
+        if not customers:
+            missing += 1
+            continue
+        sustained.append((o, h, int(customers)))
+    return sustained, missing
+
+
+@kpi_provider('saidi', 'saifi', 'caidi')
+def _distribution_indices(conn, ctx):
+    key = ctx['source_key']
+    sustained, missing = _sustained_customer_interruptions(conn, ctx)
+    customers_served = _customers_served(conn, ctx.get('scope') or {})
+    customer_hours = sum(h * c for _, h, c in sustained)
+    customers_interrupted_total = sum(c for _, _, c in sustained)
+
+    def contributors():
+        return [{'record_type': 'outage', 'record_id': o['id'], 'record_code': o['outage_no'],
+                 'label': o['impact'] or o['outage_no'],
+                 'detail': f'{h:.2f}h x {c} customers interrupted (asset={o["asset_no"] or "-"})'}
+                for o, h, c in sustained]
+
+    formula_base = (f'Sustained outages (>= {SUSTAINED_OUTAGE_MINUTES} min) with recorded customer impact; '
+                    f'customers served from site_reliability_config')
+    if key == 'saidi':
+        # System Average Interruption Duration Index: customer-hours / customers served.
+        value = round(customer_hours / customers_served, 4) if customers_served else None
+        return _result(value, numerator=round(customer_hours, 2), denominator=customers_served or None,
+                       contributors=contributors(), freshness=ctx['window_end'],
+                       formula=f'{formula_base}. SAIDI = customer-interruption hours ÷ customers served')
+    if key == 'saifi':
+        value = round(customers_interrupted_total / customers_served, 4) if customers_served else None
+        return _result(value, numerator=customers_interrupted_total, denominator=customers_served or None,
+                       contributors=contributors(), freshness=ctx['window_end'],
+                       formula=f'{formula_base}. SAIFI = total customers interrupted ÷ customers served')
+    # CAIDI: average restoration time = SAIDI / SAIFI = customer-hours / customers interrupted.
+    value = round(customer_hours / customers_interrupted_total, 4) if customers_interrupted_total else None
+    return _result(value, numerator=round(customer_hours, 2),
+                   denominator=customers_interrupted_total or None,
+                   contributors=contributors(), freshness=ctx['window_end'],
+                   formula=f'{formula_base}. CAIDI = customer-interruption hours ÷ total customers interrupted')
+
+
 def _breakdown_by_site(row_list, include):
     counts: dict = {}
     for w in row_list:

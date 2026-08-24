@@ -14,7 +14,8 @@ from .config import APP_NAME, APP_VERSION, STATIC_DIR, UPLOAD_DIR, SESSION_HOURS
 from .database import db, init_db, now, audit_digest
 from .audit_verification import AuditIntegrityError, replay_audit_history, verify_audit_chain_report
 from .auth import hash_password, verify_password, current_user, require_roles
-from .kpi_engine import KPI_PROVIDERS, DIRECTIONS, evaluate_status, evaluate_kpi, compute_kpi
+from .kpi_engine import (KPI_PROVIDERS, DIRECTIONS, evaluate_status, evaluate_kpi, compute_kpi,
+                         window_bounds, _sustained_customer_interruptions, _customers_served)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -718,9 +719,11 @@ class ReservationIn(BaseModel):
 class ReservationIssueIn(BaseModel):
     quantity:Optional[float]=Field(default=None,gt=0)
 class OutageIn(BaseModel):
-    asset_id:int; work_order_id:Optional[int]=None; outage_type:str='Forced'; cause_code:str=''; impact:str=''; lost_capacity:float=0; capacity_unit:str=''; start_at:Optional[str]=None
+    asset_id:int; work_order_id:Optional[int]=None; outage_type:str='Forced'; cause_code:str=''; impact:str=''; lost_capacity:float=0; capacity_unit:str=''; start_at:Optional[str]=None; customers_interrupted:Optional[int]=Field(default=None,ge=0)
 class OutageCloseIn(BaseModel):
-    end_at:Optional[str]=None; impact:Optional[str]=None
+    end_at:Optional[str]=None; impact:Optional[str]=None; customers_interrupted:Optional[int]=Field(default=None,ge=0)
+class ReliabilityCustomersIn(BaseModel):
+    site_id:int; customers_served:int=Field(ge=0)
 class TelemetryChannelIn(BaseModel):
     channel_code:Optional[str]=None; asset_id:int; name:str; metric_type:str; unit:str; source_system:str='Manual'
     warning_low:Optional[float]=None; critical_low:Optional[float]=None; warning_high:Optional[float]=None; critical_high:Optional[float]=None; active:bool=True
@@ -1033,6 +1036,58 @@ def reliability_assets(period_days:int=Query(365,ge=30,le=3650),site_id:Optional
 @app.get('/api/reliability/sites')
 def reliability_sites(period_days:int=Query(365,ge=30,le=3650),user=Depends(current_user)):
     with db() as conn:return {'period_days':period_days,'sites':_site_reliability_rows(conn,period_days)}
+
+# ---------- distribution reliability indices (SAIDI / SAIFI / CAIDI) ----------
+@app.put('/api/reliability/customers')
+def reliability_set_customers(body:ReliabilityCustomersIn,user=Depends(require_roles('admin','maintenance_manager','planner'))):
+    with db() as conn:
+        site=get_or_404(conn,'SELECT id,site_code,name FROM sites WHERE id=?',(body.site_id,),'Site not found')
+        old=conn.execute('SELECT customers_served FROM site_reliability_config WHERE site_id=?',(body.site_id,)).fetchone()
+        conn.execute('INSERT INTO site_reliability_config(site_id,customers_served,updated_at) VALUES(?,?,?) '
+                     'ON CONFLICT(site_id) DO UPDATE SET customers_served=excluded.customers_served, updated_at=excluded.updated_at',
+                     (body.site_id,body.customers_served,now()))
+        audit(conn,user['id'],'update','reliability_config',site['site_code'],
+              {'customers_served':old['customers_served'] if old else None},{'customers_served':body.customers_served})
+        return {'site_id':body.site_id,'site_code':site['site_code'],'customers_served':body.customers_served}
+
+@app.get('/api/reliability/customers')
+def reliability_get_customers(user=Depends(current_user)):
+    with db() as conn:
+        return {'sites':rows(conn.execute('''SELECT c.site_id,s.site_code,s.name site_name,c.customers_served,c.updated_at
+            FROM site_reliability_config c JOIN sites s ON s.id=c.site_id ORDER BY s.site_code'''))}
+
+def _distribution_indices_report(conn,period_days:int,site_id:Optional[int],as_of:Optional[str]=None):
+    win_start,win_end=window_bounds(period_days,as_of)
+    ctx={'source_key':'saidi','window_days':period_days,'window_start':win_start,'window_end':win_end,
+         'scope':({'site_id':site_id} if site_id else {}),'filters':None}
+    sustained,missing=_sustained_customer_interruptions(conn,ctx)
+    customers_served=_customers_served(conn,ctx['scope'])
+    customer_hours=sum(h*c for _,h,c in sustained)
+    interrupted_total=sum(c for _,_,c in sustained)
+    saidi=round(customer_hours/customers_served,4) if customers_served else None
+    saifi=round(interrupted_total/customers_served,4) if customers_served else None
+    caidi=round(customer_hours/interrupted_total,4) if interrupted_total else None
+    def outage_payload(o,h,c):
+        return {'outage_no':o['outage_no'],'asset_no':o['asset_no'],'outage_type':o['outage_type'],
+                'start_at':o['start_at'],'end_at':o['end_at'],'duration_hours':round(h,2),
+                'customers_interrupted':c,'customer_hours':round(h*c,2)}
+    return {'period':{'days':period_days,'start':win_start,'end':win_end},
+            'scope':{'site_id':site_id},
+            'customers_served':customers_served,
+            'saidi':saidi,'saifi':saifi,'caidi':caidi,
+            'units':{'saidi':'hours/customer','saifi':'interruptions/customer','caidi':'hours'},
+            'sustained_outages':[outage_payload(o,h,c) for o,h,c in sustained],
+            'data_quality':{'outages_missing_customer_impact':missing,
+                            'customers_served_configured':customers_served>0},
+            'notes':['Indices use sustained outages only (>= 5 minutes per IEEE 1366 convention).',
+                     'Values are computed exclusively from recorded outage customer impacts; '
+                     'None means the underlying configuration or evidence is missing.']}
+
+@app.get('/api/reliability/indices')
+def reliability_indices(period_days:int=Query(365,ge=1,le=3650),site_id:Optional[int]=None,
+                        as_of:Optional[str]=None,user=Depends(current_user)):
+    with db() as conn:return _distribution_indices_report(conn,period_days,site_id,as_of)
+
 
 # ---------- configurable KPI engine ----------
 KPI_READ_ROLES=('admin','asset_manager','maintenance_manager','planner','supervisor','executive')
@@ -1884,7 +1939,7 @@ def create_outage(body:OutageIn,user=Depends(require_roles('admin','asset_manage
         if body.work_order_id:get_or_404(conn,'SELECT id FROM work_orders WHERE id=?',(body.work_order_id,),'Work order not found')
         start_at=body.start_at or now();_dt(start_at)
         no=next_no(conn,'asset_outages','outage_no','OUT-',30001)
-        cur=conn.execute("INSERT INTO asset_outages(outage_no,asset_id,site_id,work_order_id,outage_type,status,cause_code,impact,lost_capacity,capacity_unit,start_at,reported_by,created_at,updated_at) VALUES(?,?,?,?,?,'Open',?,?,?,?,?,?,?,?)",(no,body.asset_id,a.get('site_id'),body.work_order_id,body.outage_type,body.cause_code,body.impact,body.lost_capacity,body.capacity_unit,start_at,user['id'],now(),now()))
+        cur=conn.execute("INSERT INTO asset_outages(outage_no,asset_id,site_id,work_order_id,outage_type,status,cause_code,impact,lost_capacity,capacity_unit,start_at,customers_interrupted,reported_by,created_at,updated_at) VALUES(?,?,?,?,?,'Open',?,?,?,?,?,?,?,?,?)",(no,body.asset_id,a.get('site_id'),body.work_order_id,body.outage_type,body.cause_code,body.impact,body.lost_capacity,body.capacity_unit,start_at,body.customers_interrupted,user['id'],now(),now()))
         if a['status'] in ('Operating','Standby'):conn.execute("UPDATE assets SET status='Under Maintenance',updated_at=? WHERE id=?",(now(),body.asset_id))
         audit(conn,user['id'],'OPEN OUTAGE','Operations',no,'',body.model_dump());emit_event(conn,'asset.outage.opened','asset',body.asset_id,{'outage_no':no,'asset_no':a['asset_no'],'type':body.outage_type,'start_at':start_at})
         notify(conn,'Asset outage opened',f'{no} — {a["asset_no"]} is unavailable','High' if body.outage_type=='Forced' else 'Warning',None,'maintenance_manager','operations',no)
@@ -1897,7 +1952,9 @@ def close_outage(outage_id:int,body:OutageCloseIn,user=Depends(require_roles('ad
         if o['status']!='Open':raise HTTPException(409,'Outage is already closed')
         end_at=body.end_at or now()
         if _dt(end_at)<=_dt(o['start_at']):raise HTTPException(400,'Outage end must be after start')
-        impact=body.impact if body.impact is not None else o['impact'];conn.execute("UPDATE asset_outages SET status='Closed',end_at=?,impact=?,updated_at=? WHERE id=?",(end_at,impact,now(),outage_id))
+        impact=body.impact if body.impact is not None else o['impact']
+        customers=body.customers_interrupted if body.customers_interrupted is not None else (o['customers_interrupted'] if 'customers_interrupted' in o.keys() else None)
+        conn.execute("UPDATE asset_outages SET status='Closed',end_at=?,impact=?,customers_interrupted=?,updated_at=? WHERE id=?",(end_at,impact,customers,now(),outage_id))
         other=conn.execute("SELECT COUNT(*) FROM asset_outages WHERE asset_id=? AND status='Open' AND id<>?",(o['asset_id'],outage_id)).fetchone()[0]
         if not other:conn.execute("UPDATE assets SET status='Operating',updated_at=? WHERE id=?",(now(),o['asset_id']))
         hours=_outage_overlap_hours(o['start_at'],end_at,_dt(o['start_at']),_dt(end_at));audit(conn,user['id'],'CLOSE OUTAGE','Operations',o['outage_no'],'Open',{'status':'Closed','duration_hours':round(hours,2)})

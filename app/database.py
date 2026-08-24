@@ -154,6 +154,9 @@ def _ensure_schema_columns(conn):
     cols=_table_columns(conn,'audit_logs')
     if 'prev_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT DEFAULT ''")
     if 'audit_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN audit_hash TEXT DEFAULT ''")
+    outage_cols=_table_columns(conn,'asset_outages')
+    if 'customers_interrupted' not in outage_cols:
+        conn.execute('ALTER TABLE asset_outages ADD COLUMN customers_interrupted INTEGER')
 
 def _backfill_audit_chain(conn):
     prev=''
@@ -453,10 +456,16 @@ def init_db(hash_password):
           asset_id INTEGER NOT NULL REFERENCES assets(id), site_id INTEGER REFERENCES sites(id), work_order_id INTEGER REFERENCES work_orders(id),
           outage_type TEXT NOT NULL DEFAULT 'Forced', status TEXT NOT NULL DEFAULT 'Open', cause_code TEXT DEFAULT '', impact TEXT DEFAULT '',
           lost_capacity REAL NOT NULL DEFAULT 0, capacity_unit TEXT DEFAULT '', start_at TEXT NOT NULL, end_at TEXT,
+          customers_interrupted INTEGER,
           reported_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_asset_outages_asset ON asset_outages(asset_id,start_at,end_at);
         CREATE INDEX IF NOT EXISTS idx_asset_outages_site ON asset_outages(site_id,status,start_at);
+        CREATE TABLE IF NOT EXISTS site_reliability_config(
+          site_id INTEGER PRIMARY KEY REFERENCES sites(id),
+          customers_served INTEGER NOT NULL,
+          updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS dispatch_assignments(
           id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch_no TEXT UNIQUE NOT NULL,
           work_order_id INTEGER NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
@@ -527,8 +536,7 @@ def init_db(hash_password):
         _backfill_audit_chain(conn)
         conn.execute('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)',(SCHEMA_VERSION,now()))
 
-        if conn.execute('SELECT COUNT(*) FROM kpi_definitions').fetchone()[0] == 0:
-            seed_kpis=[
+        seed_kpis=[
               ('KPI-PM-COMP','PM Compliance','Preventive maintenance work orders completed on or before their target finish date.','maintenance','Preventive maintenance work orders completed on/before target finish ÷ PM work orders due in window × 100','pm_compliance','%','rate','ratio',30,'higher_is_better',90,85,75),
               ('KPI-OVERDUE-WO','Overdue Work Orders','Open work orders past their target finish date.','work','Open work orders with target finish before window end','overdue_work_orders','count','count','count',30,'lower_is_better',None,5,10),
               ('KPI-BACKLOG-OPEN','Open Maintenance Backlog','All open work orders regardless of due state.','work','Open work orders at window end','backlog_open','count','count','count',30,'lower_is_better',None,None,None),
@@ -540,12 +548,17 @@ def init_db(hash_password):
               ('KPI-MTBF','MTBF (Exposure Hours)','Scoped asset exposure hours per recorded failure.','reliability','Exposure hours ÷ recorded failures in window','mtbf_hours','h','duration','ratio',90,'higher_is_better',720,240,120),
               ('KPI-AVAIL','Asset Availability','Availability across scoped assets from recorded outages.','reliability','(Exposure − outage hours) ÷ exposure × 100 over scoped assets','availability_pct','%','rate','ratio',30,'higher_is_better',99,95,90),
               ('KPI-DOWN-FORCED','Forced Downtime Hours','Unplanned (forced) outage hours inside the window.','reliability','Sum of forced-outage overlap hours in window','unplanned_downtime_hours','h','duration','sum',30,'lower_is_better',None,8,24),
-              ('KPI-ALARM-CRIT','Active Critical Alarms','Critical operational alarms currently open or acknowledged.','operations','Open/acknowledged critical operational alarms at window end','active_critical_alarms','count','count','count',7,'lower_is_better',0,2,5)]
-            for code,name,desc,cat,formula,key,unit,vtype,agg,window,direction,target,caution,alert in seed_kpis:
-                conn.execute('''INSERT OR IGNORE INTO kpi_definitions(code,name,description,category,domain,unit,value_type,aggregation,
-                    source_key,formula,time_window_days,direction,target_value,caution_value,alert_value,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                    (code,name,desc,cat,('Maintenance' if cat=='maintenance' else 'Work Management' if cat=='work' else 'Reliability' if cat=='reliability' else 'Operations'),unit,vtype,agg,key,formula,window,direction,target,caution,alert,now(),now()))
+              ('KPI-ALARM-CRIT','Active Critical Alarms','Critical operational alarms currently open or acknowledged.','operations','Open/acknowledged critical operational alarms at window end','active_critical_alarms','count','count','count',7,'lower_is_better',0,2,5),
+              ('KPI-SAIDI','SAIDI','System Average Interruption Duration Index from recorded outage customer impacts.','reliability','Sustained customer-interruption hours ÷ customers served (site_reliability_config)','saidi','h/cust','duration','ratio',365,'lower_is_better',None,None,None),
+              ('KPI-SAIFI','SAIFI','System Average Interruption Frequency Index from recorded outage customer impacts.','reliability','Total customers interrupted across sustained outages ÷ customers served','saifi','int/cust','rate','ratio',365,'lower_is_better',None,None,None),
+              ('KPI-CAIDI','CAIDI','Customer Average Interruption Duration Index: mean restoration time per interrupted customer.','reliability','Customer-interruption hours ÷ total customers interrupted','caidi','h','duration','ratio',365,'lower_is_better',None,None,None)]
+        # Idempotent per code so databases created before a definition existed
+        # still receive new seeds without touching admin-edited rows.
+        for code,name,desc,cat,formula,key,unit,vtype,agg,window,direction,target,caution,alert in seed_kpis:
+            conn.execute('''INSERT OR IGNORE INTO kpi_definitions(code,name,description,category,domain,unit,value_type,aggregation,
+                source_key,formula,time_window_days,direction,target_value,caution_value,alert_value,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (code,name,desc,cat,('Maintenance' if cat=='maintenance' else 'Work Management' if cat=='work' else 'Reliability' if cat=='reliability' else 'Operations'),unit,vtype,agg,key,formula,window,direction,target,caution,alert,now(),now()))
 
         if conn.execute('SELECT COUNT(*) FROM roles').fetchone()[0] == 0:
             roles=[
