@@ -164,6 +164,12 @@ def _result(value, numerator=None, denominator=None, contributors=None,
     }
 
 
+def _ranked_by_weight(contributors, limit=50):
+    """Order evidence by its measured magnitude (weight), largest impact first."""
+    ranked = sorted(contributors, key=lambda c: -(c.get('weight') or 0))
+    return ranked[:limit]
+
+
 # ---------- maintenance providers ----------
 
 @kpi_provider('pm_compliance')
@@ -284,7 +290,7 @@ def _mttr(conn, ctx):
     return _result(
         value, numerator=round(total, 2), denominator=len(hours),
         contributors=[{'record_type': 'work_order', 'record_id': w['id'], 'record_code': w['wo_no'],
-                       'label': w['title'], 'detail': f'repair hours={h:.1f}'} for w, h in worst],
+                       'label': w['title'], 'detail': f'repair hours={h:.1f}', 'weight': round(h, 2)} for w, h in worst],
         breakdown=_breakdown_by_site([w for w, _ in hours], lambda w: True),
         freshness=win_end,
         formula='Mean of (actual finish − actual start) hours across corrective completions in window',
@@ -323,7 +329,7 @@ def _failures_based(conn, ctx):
     return _result(
         value, numerator=operating_hours, denominator=failures,
         contributors=[{'record_type': 'asset', 'record_id': aid, 'record_code': None,
-                       'label': f'asset #{aid}', 'detail': f'{count} failures in window'}
+                       'label': f'asset #{aid}', 'detail': f'{count} failures in window', 'weight': count}
                       for aid, count in sorted(per_asset.items(), key=lambda kv: -kv[1])[:20]],
         breakdown=_breakdown_by_site(rows_, lambda w: True), freshness=win_end,
         formula='Scoped asset exposure hours ÷ recorded failures in window')
@@ -353,7 +359,8 @@ def _outage_based(conn, ctx):
         if o['outage_type'] == 'Forced':
             forced_total += h
             contributors.append({'record_type': 'outage', 'record_id': o['id'], 'record_code': o['outage_no'],
-                                 'label': o['impact'] or o['outage_no'], 'detail': f'{h:.1f}h forced ({o["cause_code"] or "-"})'})
+                                 'label': o['impact'] or o['outage_no'],
+                                 'detail': f'{h:.1f}h forced ({o["cause_code"] or "-"})', 'weight': round(h, 2)})
         else:
             planned_total += h
     downtime = unplanned = round(forced_total, 2)
@@ -450,7 +457,8 @@ def _distribution_indices(conn, ctx):
     def contributors():
         return [{'record_type': 'outage', 'record_id': o['id'], 'record_code': o['outage_no'],
                  'label': o['impact'] or o['outage_no'],
-                 'detail': f'{h:.2f}h x {c} customers interrupted (asset={o["asset_no"] or "-"})'}
+                 'detail': f'{h:.2f}h x {c} customers interrupted (asset={o["asset_no"] or "-"})',
+                 'weight': round(h * c, 2)}
                 for o, h, c in sustained]
 
     formula_base = (f'Sustained outages (>= {SUSTAINED_OUTAGE_MINUTES} min) with recorded customer impact; '
@@ -696,8 +704,8 @@ def explain_kpi_variance(conn, definition, as_of: str | None = None):
 
     cur_map = {_key(c): c for c in current['contributors']}
     prev_map = {_key(c): c for c in previous['contributors']}
-    new_contributors = [cur_map[k] for k in cur_map if k not in prev_map]
-    resolved_contributors = [prev_map[k] for k in prev_map if k not in cur_map]
+    new_contributors = _ranked_by_weight([cur_map[k] for k in cur_map if k not in prev_map])
+    resolved_contributors = _ranked_by_weight([prev_map[k] for k in prev_map if k not in cur_map])
 
     delta = pct_change = None
     if current['value'] is not None and previous['value'] is not None:

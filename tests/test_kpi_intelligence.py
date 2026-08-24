@@ -151,6 +151,22 @@ def test_aggregate_endpoints_do_not_leak_across_scopes():
         assert all(i['wo_no'] != 'WO-INTEL-SITE' for i in board_ncs['items'])
 
 
+def test_explanation_drivers_are_ranked_by_impact():
+    """Largest outage must lead the driver list, not insertion order."""
+    with TestClient(app) as client:
+        admin = auth(client)
+        ref = client.get('/api/reference', headers=admin).json()
+        iwp = next(s for s in ref['sites'] if s['site_code'] == 'IWP-01')
+        kpis = {k['code']: k for k in client.get('/api/kpis', headers=admin).json()['kpis']}
+        forced = kpis['KPI-DOWN-FORCED']
+        explanation = client.get(f"/api/kpis/{forced['id']}/explanation",
+                                 headers=admin).json()
+        weights = [c.get('weight') or 0 for c in explanation['new_contributors']]
+        assert weights == sorted(weights, reverse=True)
+        assert all(w > 0 for w in weights)  # every driver carries measured impact
+        del iwp
+
+
 def test_unknown_kpi_ids_return_404_not_leaked_data():
     with TestClient(app) as client:
         admin = auth(client)
