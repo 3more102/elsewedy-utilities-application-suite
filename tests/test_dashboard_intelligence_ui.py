@@ -14,11 +14,11 @@ def test_dashboard_intelligence_uses_canonical_kpi_contracts():
     assert "/api/kpi/explanation" in js
     assert "period_end" in js
     assert "site_id" in js
-    assert "open_work_orders" in js
-    assert "overdue_work_orders" in js
-    assert "pm_compliance_pct" in js
-    assert "active_alarms" in js
-    assert "maintenance_cost_window" in js
+    assert "metric: 'overdue_work_orders'" in js
+    assert "metric: 'pm_compliance_pct'" in js
+    assert "portfolioOnly: true" in js
+    assert "KPI_ROLES" in js
+    assert "currentIntelligenceConfig" in js
     assert "drivers" in js
     assert "drill" in js
     assert "attribution" in js
@@ -27,6 +27,28 @@ def test_dashboard_intelligence_uses_canonical_kpi_contracts():
     assert "innerHTML" not in js
     assert "onclick=" not in js
     assert "style=" not in js
+
+
+def test_dashboard_intelligence_rejects_non_equivalent_legacy_cards():
+    js = DASHBOARD_JS.read_text(encoding="utf-8")
+
+    # These legacy dashboard cards do not share the same calculation basis as
+    # their similarly named canonical KPI, or are point-in-time state that
+    # cannot support an honest historical trend. They must not be cross-wired.
+    unsafe_metric_bindings = (
+        "metric: 'open_work_orders'",
+        "metric: 'emergency_work_orders'",
+        "metric: 'mtbf_hours'",
+        "metric: 'mttr_hours'",
+        "metric: 'open_incidents'",
+        "metric: 'active_alarms'",
+        "metric: 'maintenance_cost_window'",
+    )
+    for binding in unsafe_metric_bindings:
+        assert binding not in js
+
+    assert "if (config.portfolioOnly && siteValue) return null;" in js
+    assert "Canonical intelligence for this card is portfolio-only." in js
 
 
 def test_dashboard_intelligence_is_external_responsive_and_offline_cached():
