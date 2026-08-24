@@ -12,10 +12,10 @@ EUAS is an original **suite of integrated enterprise applications** for asset ma
 
 ## Current Engineering Status
 
-The current **`main` head** is:
+The latest **verified implementation checkpoint represented by this README** is:
 
 ```text
-main: 56796502e4e5be61ea612a7d63e7ea24428cf7f1
+56796502e4e5be61ea612a7d63e7ea24428cf7f1
 ```
 
 This is the merge of **PR #143 — expand canonical maintenance trend and WHY adapters**, validated on exact PR head `bb8892f64aedfaec06cfdf7924bc7e9825908170` by **EUAS CI #415** and **EUAS Security #380** before merge.
