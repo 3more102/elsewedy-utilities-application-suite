@@ -28,8 +28,12 @@
   let lastRequestKey = '';
   let scheduled = false;
 
+  function primaryKpiGrid() {
+    return content.querySelector('.kpi-grid:not(.strip-kpis)');
+  }
+
   function dashboardVisible() {
-    return pageTitle.textContent.trim() === 'Executive Dashboard' && !!content.querySelector('.kpi-grid');
+    return pageTitle.textContent.trim() === 'Executive Dashboard' && !!primaryKpiGrid();
   }
 
   function roleAllowed() {
@@ -106,7 +110,9 @@
 
   function applySnapshot(snapshot) {
     if (!dashboardVisible()) return;
-    const cards = [...content.querySelectorAll('.kpi')];
+    const grid = primaryKpiGrid();
+    if (!grid) return;
+    const cards = [...grid.querySelectorAll(':scope > .kpi')];
     for (const card of cards) {
       const label = card.querySelector('.kpi-label')?.textContent?.trim();
       const binding = CARD_BINDINGS.get(label);
@@ -131,7 +137,8 @@
 
     const params = paramsForDashboard();
     const requestKey = params.toString();
-    if (requestKey === lastRequestKey && content.querySelector('[data-canonical-snapshot="true"]')) return;
+    const grid = primaryKpiGrid();
+    if (requestKey === lastRequestKey && grid?.querySelector('[data-canonical-snapshot="true"]')) return;
     lastRequestKey = requestKey;
     const run = ++generation;
 
