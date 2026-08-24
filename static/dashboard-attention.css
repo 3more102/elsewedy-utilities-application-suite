@@ -1,0 +1,204 @@
+/* Executive dashboard operational attention queue.
+   The queue mirrors existing dashboard severity states and does not calculate
+   a separate risk score. */
+
+.dashboard-attention-center{
+  margin:0 0 14px;
+  overflow:hidden;
+  border:1px solid #dfe3e8;
+  border-radius:12px;
+  background:var(--panel);
+  box-shadow:0 8px 22px rgba(16,24,40,.06);
+}
+
+.dashboard-attention-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:18px;
+  padding:13px 15px;
+  border-bottom:1px solid var(--line);
+  background:#f8fafc;
+}
+
+.dashboard-attention-head > div{min-width:0}
+
+.dashboard-attention-eyebrow{
+  display:block;
+  color:var(--muted);
+  font-size:8px;
+  font-weight:800;
+  letter-spacing:.11em;
+  text-transform:uppercase;
+}
+
+.dashboard-attention-head h3{
+  margin:2px 0 2px;
+  color:var(--ink);
+  font-size:15px;
+}
+
+.dashboard-attention-head p{
+  margin:0;
+  color:var(--muted);
+  font-size:9px;
+  line-height:1.4;
+}
+
+.dashboard-attention-count{
+  display:grid;
+  width:34px;
+  height:34px;
+  flex:0 0 34px;
+  place-items:center;
+  border:1px solid #e8b9bc;
+  border-radius:50%;
+  background:#fff5f5;
+  color:var(--red);
+  font-size:13px;
+}
+
+.dashboard-attention-list{
+  display:grid;
+}
+
+.dashboard-attention-row{
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr) auto;
+  align-items:center;
+  gap:11px;
+  min-width:0;
+  padding:10px 14px;
+  border-bottom:1px solid #edf0f2;
+}
+
+.dashboard-attention-row:last-child{border-bottom:0}
+.dashboard-attention-row.critical{background:#fffafa}
+
+.dashboard-attention-state{
+  min-width:58px;
+  border:1px solid #d7dce1;
+  border-radius:999px;
+  padding:4px 7px;
+  background:#f7f8fa;
+  color:#59636e;
+  font-size:8px;
+  font-weight:800;
+  letter-spacing:.04em;
+  text-align:center;
+  text-transform:uppercase;
+}
+
+.dashboard-attention-state.critical{
+  border-color:#e3a4a8;
+  background:#fff1f2;
+  color:#a52b31;
+}
+
+.dashboard-attention-state.attention{
+  border-color:#e4c78d;
+  background:#fff9e9;
+  color:#86600b;
+}
+
+.dashboard-attention-copy{min-width:0}
+
+.dashboard-attention-copy strong{
+  display:block;
+  overflow:hidden;
+  color:var(--ink);
+  font-size:11px;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.dashboard-attention-copy p{
+  margin:3px 0 0;
+  overflow:hidden;
+  color:var(--muted);
+  font-size:9px;
+  line-height:1.35;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.dashboard-attention-actions{
+  display:flex;
+  align-items:center;
+  gap:6px;
+}
+
+.dashboard-attention-action{
+  border:1px solid #d8adb0;
+  border-radius:7px;
+  padding:6px 9px;
+  background:#fffafa;
+  color:var(--red);
+  cursor:pointer;
+  font:inherit;
+  font-size:9px;
+  font-weight:800;
+  white-space:nowrap;
+}
+
+.dashboard-attention-action.secondary{
+  border-color:var(--line);
+  background:#fff;
+  color:#4b5563;
+}
+
+.dashboard-attention-action:hover{border-color:#be777c}
+.dashboard-attention-action:focus-visible{
+  outline:2px solid var(--red);
+  outline-offset:2px;
+}
+
+.dashboard-attention-empty,
+.dashboard-attention-remainder{
+  margin:0;
+  padding:11px 14px;
+  color:var(--muted);
+  font-size:9px;
+  line-height:1.45;
+}
+
+.dashboard-attention-remainder{
+  border-top:1px solid var(--line);
+  background:#fafbfc;
+}
+
+@media(max-width:820px){
+  .dashboard-attention-row{
+    grid-template-columns:auto minmax(0,1fr);
+  }
+  .dashboard-attention-actions{
+    grid-column:1/-1;
+    justify-content:flex-end;
+  }
+}
+
+@media(max-width:560px){
+  .dashboard-attention-head{align-items:flex-start}
+  .dashboard-attention-row{
+    grid-template-columns:1fr;
+    align-items:start;
+  }
+  .dashboard-attention-state{width:max-content}
+  .dashboard-attention-actions{
+    grid-column:auto;
+    justify-content:stretch;
+  }
+  .dashboard-attention-action{flex:1}
+  .dashboard-attention-copy p{white-space:normal}
+}
+
+@media(prefers-reduced-motion:reduce){
+  .dashboard-attention-action{transition:none!important}
+}
+
+@media(prefers-contrast:more){
+  .dashboard-attention-center,
+  .dashboard-attention-row,
+  .dashboard-attention-state,
+  .dashboard-attention-action{border-color:currentColor}
+}
