@@ -193,5 +193,92 @@ def install_executive_kpi_routes() -> None:
             rows,
         )
 
+    @app.get('/api/kpi/trend')
+    def kpi_metric_trend(
+        family: str,
+        metric: str,
+        samples: int = Query(12, ge=2, le=24),
+        period_end: Optional[str] = None,
+        period_days: int = Query(30, ge=1, le=365),
+        site_id: Optional[int] = None,
+        region: Optional[str] = None,
+        asset_type_id: Optional[int] = None,
+        criticality: Optional[str] = None,
+        user=Depends(require_roles(*KPI_ROLES)),
+    ):
+        """Chronological samples for one metric, computed by the canonical
+        service over consecutive deterministic windows (oldest first)."""
+        from .kpi_trend_explanation import compute_metric_trend
+
+        f = _kpi_filters(period_end, period_days, site_id, region,
+                         asset_type_id, criticality)
+        with db() as conn:
+            return compute_metric_trend(conn, f, family=family, metric=metric,
+                                        samples=samples)
+
+    @app.get('/api/kpi/explanation')
+    def kpi_metric_explanation(
+        family: str,
+        metric: str,
+        period_end: Optional[str] = None,
+        period_days: int = Query(30, ge=1, le=365),
+        site_id: Optional[int] = None,
+        region: Optional[str] = None,
+        asset_type_id: Optional[int] = None,
+        criticality: Optional[str] = None,
+        user=Depends(require_roles(*KPI_ROLES)),
+    ):
+        """Period-over-period measured drivers for one metric.
+
+        Drivers are observed evidence diffed between the current and previous
+        window; correlation is never asserted as cause. Drill identifiers
+        resolve to real records.
+        """
+        from .kpi_trend_explanation import explain_metric
+
+        f = _kpi_filters(period_end, period_days, site_id, region,
+                         asset_type_id, criticality)
+        with db() as conn:
+            return explain_metric(conn, f, family=family, metric=metric)
+
+    @app.post('/api/kpi/executive/refresh')
+    def kpi_executive_refresh(
+        period_end: Optional[str] = None,
+        period_days: int = Query(30, ge=1, le=365),
+        site_id: Optional[int] = None,
+        region: Optional[str] = None,
+        asset_type_id: Optional[int] = None,
+        criticality: Optional[str] = None,
+        user=Depends(require_roles('admin', 'maintenance_manager',
+                                   'planner', 'supervisor')),
+    ):
+        """Force-recompute the scoped executive snapshot (recalculate adapter).
+
+        This is the canonical refresh path — equivalent to
+        ``GET /api/kpi/executive?refresh=true`` — plus an audit record.
+        No second recalculation engine exists or may be added.
+        """
+        from .kpi_service import executive_snapshot
+
+        f = _kpi_filters(period_end, period_days, site_id, region,
+                         asset_type_id, criticality)
+        with db() as conn:
+            snapshot = executive_snapshot(conn, f, use_cache=False)
+            _application.audit(
+                conn,
+                user['id'],
+                'REFRESH KPI SNAPSHOT',
+                'Executive KPIs',
+                f"scope={f.site_id if f.site_id is not None else 'all'}",
+                '',
+                {
+                    'period_days': f.period_days,
+                    'region': f.region,
+                    'sections': sorted(k for k in snapshot.keys()
+                                       if isinstance(snapshot.get(k), dict)),
+                },
+            )
+            return snapshot
+
     app.openapi_schema = None
     setattr(app.state, marker, True)
