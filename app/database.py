@@ -6,6 +6,7 @@ import hashlib
 import json
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from . import config as _euas_config
 from .config import DB_PATH, DATABASE_URL, DB_BACKEND, SCHEMA_VERSION
 
 class HybridRow(dict):
@@ -505,6 +506,17 @@ def init_db(hash_password):
         _ensure_schema_columns(conn)
         _backfill_audit_chain(conn)
         conn.execute('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)',(SCHEMA_VERSION,now()))
+        # A database written by a NEWER release must never be opened by an
+        # older binary: columns and constraints it relies on may not exist
+        # here. Compare against the unpinned config constant because
+        # initialize_auth_database temporarily pins this module's
+        # SCHEMA_VERSION to stage the base schema before the auth migration.
+        db_version=int(conn.execute('SELECT COALESCE(MAX(version),0) FROM schema_migrations').fetchone()[0])
+        if db_version>int(_euas_config.SCHEMA_VERSION):
+            raise RuntimeError(
+                f'Database schema version {db_version} is newer than application schema version '
+                f'{_euas_config.SCHEMA_VERSION}; refusing to start. Upgrade the application before using this database.'
+            )
 
         if conn.execute('SELECT COUNT(*) FROM roles').fetchone()[0] == 0:
             roles=[
