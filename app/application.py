@@ -45,7 +45,18 @@ logger = logging.getLogger('euas')
 
 @app.middleware('http')
 async def security_headers(request: Request, call_next):
-    request_id = request.headers.get('x-request-id') or uuid.uuid4().hex
+    # Echo a caller-supplied correlation id only after stripping everything
+    # outside safe printable ASCII; the raw header must never be reflected
+    # into response headers unbounded.
+    supplied_id = request.headers.get('x-request-id', '')[:128]
+    request_id = (
+        ''.join(
+            ch
+            for ch in supplied_id
+            if 32 <= ord(ch) < 127 and ch not in '"\\<>'
+        )
+        or uuid.uuid4().hex
+    )
     started = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - started) * 1000
