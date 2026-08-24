@@ -529,3 +529,41 @@ def test_pm_capacity_risk_endpoint_authorization_and_validation():
         assert {'critical_pm_total', 'overloaded_weeks', 'capacity_source'} <= set(body)
         assert client.get('/api/kpi/pm-risk', headers=headers,
                           params={'horizon_days': 5}).status_code == 422
+
+
+def test_executive_export_filename_disambiguates_scope():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    _ensure_db()
+    with TestClient(app) as client:
+        admin = client.post('/api/auth/login',
+                            json={'username': 'omar', 'password': 'EUAS@2026'}).json()
+        headers = {'Authorization': f"Bearer {admin['token']}"}
+
+        base = client.get('/api/exports/executive-kpis.csv', headers=headers)
+        disp_base = base.headers.get('content-disposition', '')
+        assert 'EUAS_executive_kpis-all_' in disp_base
+
+        scoped = client.get('/api/exports/executive-kpis.csv', headers=headers,
+                            params={'region': 'Greater Cairo'})
+        disp_scoped = scoped.headers.get('content-disposition', '')
+        assert 'greatercairo' in disp_scoped or 'greater-cairo' in disp_scoped
+
+        # Sanitization: hostile region text cannot inject header characters.
+        hostile = client.get('/api/exports/executive-kpis.csv', headers=headers,
+                             params={'region': 'Bad\nRegion"\\//x'})
+        disp_hostile = hostile.headers.get('content-disposition', '')
+        filename_value = disp_hostile.split('filename="')[1].split('"')[0]
+        assert '\n' not in filename_value and '"' not in filename_value
+        assert filename_value.startswith('EUAS_executive_kpis-')
+
+        # Content identical across repeated exports of the same scope+window;
+        # the filename never changes the CSV body.
+        a = client.get('/api/exports/executive-kpis.csv', headers=headers,
+                       params={'criticality': 'Critical'}).text
+        b = client.get('/api/exports/executive-kpis.csv', headers=headers,
+                       params={'criticality': 'Critical'}).text
+        assert a == b
+        assert a.count('Family,Metric,Value,Previous,Delta') == 1

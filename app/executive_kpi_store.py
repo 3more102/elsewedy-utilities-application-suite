@@ -206,8 +206,26 @@ def install_executive_kpi_routes() -> None:
         with db() as conn:
             snapshot = executive_snapshot(conn, f)
             rows = snapshot_export_rows(snapshot)
+        # Filename disambiguates the scope so multi-scope exports cannot be
+        # confused on disk. Segments are sanitized to a safe charset; only
+        # scopes the caller explicitly queried appear in the name.
+        import re as _re
+
+        parts: list[str] = []
+        if site_id:
+            parts.append(f'site{int(site_id)}')
+        if region:
+            parts.append(_re.sub(r'[^A-Za-z0-9_-]', '', region)[:40].lower() or 'region')
+        if asset_type_id:
+            parts.append(f'class{int(asset_type_id)}')
+        if criticality:
+            parts.append(_re.sub(r'[^A-Za-z0-9_-]', '', criticality)[:20].lower())
+        suffix = ('-' + '-'.join(parts)) if parts else '-all'
+        filename = (
+            f'EUAS_executive_kpis{suffix}'
+            f'_{_application.date.today().strftime("%Y%m%d")}.csv')
         return _application.csv_response(
-            'EUAS_executive_kpis.csv',
+            filename,
             ['Family', 'Metric', 'Value', 'Previous', 'Delta'],
             rows,
         )
