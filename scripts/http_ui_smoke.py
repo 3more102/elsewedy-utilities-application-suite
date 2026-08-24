@@ -5,7 +5,8 @@ page instead of duplicating the asset list in CI. This makes the production
 container gate fail when a UI layer is referenced by HTML but missing from the
 image, served as an empty/fallback response, returned with an implausible
 content type, exposes the ASGI server implementation through a Server header,
-or accidentally publishes FastAPI documentation/schema introspection routes.
+accidentally publishes FastAPI documentation/schema introspection routes, or
+loses the production cross-origin isolation header contract.
 
 Example:
     python scripts/http_ui_smoke.py http://127.0.0.1:8879
@@ -73,6 +74,8 @@ def _assert_security_headers(headers: dict[str, str]) -> None:
     assert headers.get('permissions-policy', '').casefold() == 'camera=(), geolocation=(), microphone=()', headers
     assert headers.get('cross-origin-opener-policy', '').casefold() == 'same-origin', headers
     assert headers.get('cross-origin-resource-policy', '').casefold() == 'same-origin', headers
+    assert headers.get('cross-origin-embedder-policy', '').casefold() == 'require-corp', headers
+    assert headers.get('origin-agent-cluster', '') == '?1', headers
     assert headers.get('x-permitted-cross-domain-policies', '').casefold() == 'none', headers
     csp = headers.get('content-security-policy', '')
     assert "default-src 'self'" in csp, csp
