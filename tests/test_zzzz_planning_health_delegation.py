@@ -47,7 +47,7 @@ def test_health_forecast_and_approval_delegation():
         assert delegated.status_code==200,delegated.text
         delegation_id=delegated.json()['id']
 
-        tr_asset=next(x for x in client.get('/api/assets',headers=admin).json() if x['asset_no']=='TR-001')
+        tr_asset=next(x for x in client.get('/api/assets',headers=admin,params={'q':'TR-001'}).json() if x['asset_no']=='TR-001')
         wo=client.post('/api/work-orders',headers=admin,json={
             'title':'Delegated approval regression','asset_id':tr_asset['id'],'priority':'High',
             'supervisor_id':users['supervisor'],'estimated_hours':2

@@ -21,7 +21,7 @@ def test_governance_cost_timeline_reports_and_backup_registry():
         assert integrity.status_code==200,integrity.text
         assert integrity.json()['valid'] is True
 
-        tr=next(x for x in client.get('/api/assets',headers=admin).json() if x['asset_no']=='TR-001')
+        tr=next(x for x in client.get('/api/assets',headers=admin,params={'q':'TR-001'}).json() if x['asset_no']=='TR-001')
         ref=client.get('/api/reference',headers=admin).json()
         tech=next(x for x in ref['users'] if x['username']=='tech1')
         item=next(x for x in client.get('/api/inventory',headers=admin).json() if x['current_stock']-x['reserved_stock']>=1)

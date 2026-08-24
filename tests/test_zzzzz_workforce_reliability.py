@@ -58,7 +58,7 @@ def test_workforce_parts_and_reliability_planning():
         assert denied.status_code==403
 
         # Parts readiness is tied to planned requirements and live available stock.
-        tr=next(a for a in client.get('/api/assets',headers=admin).json() if a['asset_no']=='TR-001')
+        tr=next(a for a in client.get('/api/assets',headers=admin,params={'q':'TR-001'}).json() if a['asset_no']=='TR-001')
         created=client.post('/api/work-orders',headers=admin,json={
             'title':'v3.7 parts readiness regression','asset_id':tr['id'],'priority':'Medium','estimated_hours':2,
             'target_start':date.today().isoformat(),'target_finish':(date.today()+timedelta(days=1)).isoformat()
