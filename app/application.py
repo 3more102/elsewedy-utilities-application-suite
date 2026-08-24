@@ -628,7 +628,12 @@ async def _automation_loop():
         await asyncio.sleep(max(60,AUTOMATION_INTERVAL_MINUTES*60))
 
 # ---------- request models ----------
-class LoginIn(BaseModel): username:str; password:str
+class LoginIn(BaseModel):
+    # Bounded before any password hashing work happens: every failed login
+    # runs two 600,000-round PBKDF2 verifications, so unbounded pre-auth
+    # fields turn each request into a CPU amplification vector.
+    username: str = Field(min_length=1, max_length=150)
+    password: str = Field(min_length=1, max_length=1024)
 class AssetIn(BaseModel):
     asset_no: Optional[str]=None; name:str; description:str=''; asset_type_id:Optional[int]=None; category:str
     manufacturer:str=''; model:str=''; serial_no:str=''; installation_date:Optional[str]=None; commissioning_date:Optional[str]=None
@@ -664,7 +669,7 @@ class InspectionSubmit(BaseModel): responses:list[dict]; remarks:str=''; create_
 class HSEIn(BaseModel): incident_type:str; title:str; site_id:Optional[int]=None; location_id:Optional[int]=None; asset_id:Optional[int]=None; severity:int=Field(ge=1,le=5); probability:int=Field(ge=1,le=5); description:str; corrective_action:str=''; occurred_at:Optional[str]=None
 class ProjectIn(BaseModel): name:str; manager_id:Optional[int]=None; site_id:Optional[int]=None; start_date:Optional[str]=None; finish_date:Optional[str]=None; budget:float=0; status:str='Active'
 class MeterReadingIn(BaseModel): reading:float
-class UserIn(BaseModel): username:str; password:str=Field(min_length=8); full_name:str; email:Optional[str]=None; role_code:str; department:str=''; phone:str=''
+class UserIn(BaseModel): username:str=Field(min_length=1,max_length=150); password:str=Field(min_length=8,max_length=128); full_name:str; email:Optional[str]=None; role_code:str; department:str=''; phone:str=''
 class ProfilePatch(BaseModel):
     full_name: Optional[str]=Field(default=None,min_length=2,max_length=120)
     email: Optional[str]=Field(default=None,max_length=180)
