@@ -347,6 +347,10 @@ def compute_reliability(conn, f: ExecutiveFilters) -> dict:
             ' AND o.start_at<=? AND (o.end_at IS NULL OR o.end_at>=?)'
         )
         o_args: list = [win_end_iso + 'T23:59:59', win_start_iso]
+        # The outage numerator must respect exactly the asset scope used for
+        # the availability denominator (asset_ids above); otherwise a
+        # criticality- or type-scoped view would sum downtime of out-of-scope
+        # assets while dividing by in-scope asset hours.
         if f.site_id is not None:
             o_sql += ' AND o.site_id=?'
             o_args.append(f.site_id)
@@ -354,6 +358,12 @@ def compute_reliability(conn, f: ExecutiveFilters) -> dict:
             # Region scoping rides on the sites join already present in o_sql.
             o_sql += ' AND s.region=?'
             o_args.append(f.region)
+        if f.asset_type_id is not None:
+            o_sql += ' AND a2.asset_type_id=?'
+            o_args.append(f.asset_type_id)
+        if f.criticality:
+            o_sql += ' AND a2.criticality=?'
+            o_args.append(f.criticality)
         for row in _rows(conn.execute(o_sql, o_args)):
             hours = _outage_overlap_hours(row['start_at'], row.get('end_at'), win_start, win_end)
             if hours <= 0:
@@ -1566,15 +1576,51 @@ def snapshot_export_rows(snapshot: dict) -> list[list]:
 def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
     w = f.window()
 
+    def outage_scope_clause() -> tuple[str, list]:
+        """Scope fragment mirroring compute_reliability's outage filtering.
+
+        Contributors returned by WHY sections must never include a record
+        outside the requested executive scope (site/region/asset type/
+        criticality), because each driver is presented as explaining the
+        scoped KPI value computed over that same scope.
+        """
+        conditions: list[str] = []
+        args: list = []
+        if f.site_id is not None:
+            conditions.append('o.site_id=?')
+            args.append(f.site_id)
+        if f.region:
+            conditions.append('s.region=?')
+            args.append(f.region)
+        if f.asset_type_id is not None:
+            conditions.append('a.asset_type_id=?')
+            args.append(f.asset_type_id)
+        if f.criticality:
+            conditions.append('a.criticality=?')
+            args.append(f.criticality)
+        return (' AND ' + ' AND '.join(conditions)) if conditions else '', args
+
+    def _scoped_outage_sql(outage_predicate: str) -> tuple[str, list]:
+        scope_sql, scope_args = outage_scope_clause()
+        return (
+            'SELECT o.*, a.asset_no, a.name asset_name'
+            ' FROM asset_outages o'
+            ' JOIN assets a ON a.id=o.asset_id'
+            ' LEFT JOIN locations l ON l.id=a.location_id'
+            ' LEFT JOIN sites s ON s.id=l.site_id'
+            f' WHERE {outage_predicate}' + scope_sql
+        ), scope_args
+
     def outage_drivers(win_start: str, win_end: str) -> list[dict]:
         win_start_dt = datetime.fromisoformat(win_start + 'T00:00:00')
         win_end_dt = datetime.fromisoformat(win_end + 'T23:59:59')
         drivers: list[dict] = []
+        sql, extra_args = _scoped_outage_sql(
+            "o.outage_type='Forced' AND o.start_at<=?"
+            ' AND (o.end_at IS NULL OR o.end_at>=?)')
         for row in _rows(conn.execute(
-                'SELECT o.*, a.asset_no, a.name asset_name FROM asset_outages o'
-                ' JOIN assets a ON a.id=o.asset_id'
-                " WHERE o.outage_type='Forced' AND o.start_at<=? AND (o.end_at IS NULL OR o.end_at>=?)",
-                [win_end + 'T23:59:59', win_start])):
+                sql,
+                [win_end + 'T23:59:59', win_start] + extra_args)):
             hours = _outage_overlap_hours(row['start_at'], row.get('end_at'), win_start_dt, win_end_dt)
             if hours > 0:
                 drivers.append({
@@ -1586,11 +1632,40 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
         drivers.sort(key=lambda d: d['hours'], reverse=True)
         return drivers[:5]
 
+    def planned_outage_drivers(win_start: str, win_end: str) -> list[dict]:
+        """Contributors for planned-outage KPIs are planned records only.
+
+        A planned-outage count must never be explained using Forced/unplanned
+        outage rows; each driver here corresponds to one non-forced outage
+        starting inside the explained window.
+        """
+        win_start_dt = datetime.fromisoformat(win_start + 'T00:00:00')
+        win_end_dt = datetime.fromisoformat(win_end + 'T23:59:59')
+        drivers: list[dict] = []
+        sql, extra_args = _scoped_outage_sql(
+            "o.outage_type<>'Forced'"
+            ' AND o.start_at>=? AND o.start_at<=?')
+        for row in _rows(conn.execute(
+                sql,
+                [win_start + 'T00:00:00', win_end + 'T23:59:59'] + extra_args)):
+            hours = _outage_overlap_hours(row['start_at'], row.get('end_at'), win_start_dt, win_end_dt)
+            if hours <= 0:
+                continue
+            drivers.append({
+                'kind': 'planned_outage',
+                'label': f"{row['asset_no']} planned outage",
+                'hours': round(hours, 2),
+                'link': {'module': 'operations', 'record': row['outage_no'], 'id': row['id']},
+            })
+        drivers.sort(key=lambda d: d['hours'], reverse=True)
+        return drivers[:5]
+
     rel_now = compute_reliability(conn, f)
     prev_scope = ExecutiveFilters(
         period_end=w['previous_end'], period_days=f.period_days, site_id=f.site_id,
         region=f.region, asset_type_id=f.asset_type_id, criticality=f.criticality)
     rel_prev = compute_reliability(conn, prev_scope)
+    mttr_scope_sql, mttr_scope_args = _asset_scope(f)
 
     explanations: dict[str, Any] = {}
     avail_delta = round(rel_now['availability_pct'] - rel_prev['availability_pct'], 2)
@@ -1606,12 +1681,19 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
         mttr_now = rel_now['total_downtime_hours'] / rel_now['outage_count']
         mttr_prev = rel_prev['total_downtime_hours'] / rel_prev['outage_count']
         mttr_delta = round(mttr_now - mttr_prev, 2)
-    slowest = _rows(conn.execute(
-        'SELECT w.wo_no, w.title, w.actual_hours, a.asset_no FROM work_orders w'
+    slowest_sql = (
+        'SELECT w.wo_no, w.title, w.actual_hours, a.asset_no'
+        ' FROM work_orders w'
         ' LEFT JOIN assets a ON a.id=w.asset_id'
-        " WHERE w.status IN ('Completed','Closed') AND w.work_type LIKE 'Corrective%'"
+        ' LEFT JOIN locations l ON l.id=a.location_id'
+        ' LEFT JOIN sites s ON s.id=l.site_id'
+        " WHERE w.status IN ('Completed','Closed')"
+        " AND w.work_type LIKE 'Corrective%'"
         ' AND COALESCE(w.actual_finish,w.created_at)>=?'
-        ' ORDER BY w.actual_hours DESC LIMIT 3', [w['period_start']]))
+        + mttr_scope_sql +
+        ' ORDER BY w.actual_hours DESC LIMIT 3')
+    slowest = _rows(conn.execute(
+        slowest_sql, [w['period_start']] + mttr_scope_args))
     explanations['mttr'] = {
         'current': rel_now['total_downtime_hours'] / rel_now['outage_count'] if rel_now['outage_count'] else None,
         'delta': mttr_delta,
@@ -1625,6 +1707,12 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
         'outages_previous': rel_prev['outage_count'],
         'downtime_delta_hours': round(rel_now['total_downtime_hours'] - rel_prev['total_downtime_hours'], 2),
         'drivers': outage_drivers(w['period_start'], w['period_end']),
+    }
+    explanations['planned_outages'] = {
+        'current': rel_now['planned_outages'],
+        'previous': None,
+        'delta': None,
+        'drivers': planned_outage_drivers(w['period_start'], w['period_end']),
     }
 
     maint_now = compute_maintenance_kpis(conn, f)
