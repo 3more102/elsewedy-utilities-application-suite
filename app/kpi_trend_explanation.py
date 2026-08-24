@@ -17,6 +17,7 @@ from .executive_kpi_store import _kpi_filters
 
 MAX_TREND_SAMPLES = 24
 DEFAULT_TREND_SAMPLES = 12
+CONDITION_DRIVER_LIMIT = 10
 
 # family -> compute function + metric registry.
 # Metric registry: key -> {'label', 'unit', 'direction', 'path'} where ``path``
@@ -84,6 +85,17 @@ _TREND_FAMILIES: dict[str, dict] = {
                                        'unit': 'alarms',
                                        'direction': 'lower_is_better',
                                        'path': 'critical_active_alarms'},
+            'unacknowledged_alarms': {'label': 'Unacknowledged Alarms',
+                                      'unit': 'alarms',
+                                      'direction': 'lower_is_better',
+                                      'path': 'unacknowledged_alarms'},
+            'alarm_storms': {'label': 'Alarm Storms', 'unit': 'storms',
+                             'direction': 'lower_is_better',
+                             'as_count': 'alarm_storms'},
+            'repeated_alarm_assets': {'label': 'Repeated-Alarm Assets',
+                                      'unit': 'assets',
+                                      'direction': 'lower_is_better',
+                                      'as_count': 'repeated_alarm_assets'},
         },
     },
     'hse': {
@@ -113,7 +125,11 @@ def _resolve(family: str, metric: str):
     return compute, entry['metrics'][metric]
 
 
-def _extract(payload: dict, path: str):
+def _extract(payload: dict, meta: dict):
+    if 'as_count' in meta:
+        value = payload.get(meta['as_count'])
+        return len(value) if isinstance(value, (list, tuple)) else None
+    path = meta['path']
     value = payload
     for part in path.split('.'):
         if not isinstance(value, dict):
@@ -155,7 +171,7 @@ def compute_metric_trend(conn, f, *, family: str, metric: str,
         series.append({
             'period_start': window.get('period_start'),
             'period_end': window.get('period_end'),
-            'value': _extract(payload, meta['path']),
+            'value': _extract(payload, meta),
         })
     series.reverse()  # chronological, oldest first
 
@@ -270,8 +286,8 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
     current = compute(conn, f)
     previous = compute(conn, previous_f)
 
-    value = _extract(current, meta['path'])
-    previous_value = _extract(previous, meta['path'])
+    value = _extract(current, meta)
+    previous_value = _extract(previous, meta)
     delta = pct_change = improved = None
     if value is not None and previous_value is not None:
         delta = round(float(value) - float(previous_value), 4)
@@ -286,6 +302,42 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
         drivers = _reliability_outage_drivers(conn, f)
     elif family == 'maintenance':
         drivers = _maintenance_overdue_drivers(conn, f)
+    elif family == 'condition':
+        # Contributors come straight from the canonical condition computation:
+        # most severe active alarms plus repeated-alarm assets as measured
+        # recurrence evidence. No causal claim is attached.
+        drivers = []
+        for row in current.get('contributors', [])[:CONDITION_DRIVER_LIMIT]:
+            severity_label = (row.get('severity') or 'alarm').lower()
+            drivers.append({
+                'kind': 'active_alarm',
+                'label': (
+                    f"{row['alarm_no']} {severity_label} on "
+                    f"{row.get('asset_no') or 'unassigned asset'}"
+                ),
+                'magnitude': row.get('hours_open'),
+                'unit': 'hours open',
+                'attribution': 'contributor',
+                'source_type': 'operational_alarm',
+                'source_id': row['alarm_id'],
+                'drill': {'module': 'telemetry', 'record': row['alarm_no'],
+                          'id': row['alarm_id']},
+            })
+        storms = current.get('alarm_storms') or []
+        if storms:
+            drivers.append({
+                'kind': 'risk_indicator',
+                'label': f'{len(storms)} recurring alarm channel(s) at or above '
+                         '3 occurrences',
+                'magnitude': len(storms),
+                'unit': 'channels',
+                'attribution': 'correlation',
+                'source_type': 'telemetry_channel',
+                'source_id': storms[0].get('channel_id'),
+                'drill': {'module': 'telemetry',
+                          'record': storms[0].get('channel_code'),
+                          'id': storms[0].get('channel_id')},
+            })
     else:
         drivers = []
 
