@@ -297,7 +297,6 @@
     const kicker = document.createElement('div');
     kicker.className = 'dashboard-section-kicker';
     kicker.textContent = `Portfolio signals · ${counts.critical} critical · ${counts.explainable} explainable`;
-
     grid.parentNode.insertBefore(strip, grid);
     grid.parentNode.insertBefore(kicker, grid);
   }
@@ -533,7 +532,7 @@
 
   function decorateDashboard() {
     if (!executiveDashboardVisible()) return;
-    const grid = content.querySelector('.kpi-grid');
+    const grid = content.querySelector('.kpi-grid:not(.strip-kpis)');
     if (!grid || grid.dataset.dashboardIntelligence === 'ready') return;
 
     grid.dataset.dashboardIntelligence = 'ready';
