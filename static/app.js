@@ -208,7 +208,7 @@ async function renderAnalytics(){
   if(KPI_STATE.typeId)qp.set('asset_type_id',KPI_STATE.typeId);
   if(KPI_STATE.crit)qp.set('criticality',KPI_STATE.crit);
   if(KPI_STATE.region)qp.set('region',KPI_STATE.region);
-  const [k,deter,pmrisk]=await Promise.all([api('/api/kpi/executive?'+qp),api('/api/kpi/deterioration?'+qp).catch(()=>null),api('/api/kpi/pm-risk?'+qp).catch(()=>null)]);
+  const [k,deter,pmrisk,forecast]=await Promise.all([api('/api/kpi/executive?'+qp),api('/api/kpi/deterioration?'+qp).catch(()=>null),api('/api/kpi/pm-risk?'+qp).catch(()=>null),api('/api/planning/maintenance-forecast?horizon_days=56'+(siteId?'&site_id='+siteId:'')).catch(()=>null)]);
   const ref=S.ref||await api('/api/reference');
   const rel=k.reliability,as=k.assets,m=k.maintenance,c=k.condition,ip=k.inventory_procurement,wf=k.workforce,fresh=k.freshness;
   const freshCls=fresh.state==='stale'?'warn':'good';
@@ -216,6 +216,25 @@ async function renderAnalytics(){
   const saidiCell=rel.saidi_minutes==null?`<div class="trend">Configure customers served per site to enable SAIDI/SAIFI/CAIDI.</div>`:'';
   const heatCells=(k.reliability.trend||[]).map(t=>({site_id:'',label:t.period,v:t.downtime_hours}));
   const detBy={};(deter?.signals||[]).forEach(s=>{detBy[s.kind]=(detBy[s.kind]||0)+1});
+  const weeks=(forecast?.weeks||[]);
+  const nextRiskWeek=weeks.find(w=>w.capacity_state==='Over Capacity')||weeks.find(w=>(w.utilization_pct||0)>=80)||null;
+  const craftShort=[];if(nextRiskWeek&&nextRiskWeek.craft_states)Object.entries(nextRiskWeek.craft_states).forEach(([code,st])=>{if(st.shortage_hours>0)craftShort.push(code)});
+  const topSite=(k.hse.contributors_by_site||[])[0]||null;
+  const topType=(k.hse.contributors_by_type||[])[0]||null;
+  const repeatCount=(k.hse.repeat_locations_90d||[]).length+(k.hse.repeat_assets_90d||[]).length;
+  const scopeLabel=siteId?'Site-scoped':'Portfolio-wide';
+  const stripHtml=`<section class="panel" style="margin-bottom:14px"><div class="panel-head"><div><h3>Command Strip</h3><p>${scopeLabel} · HSE and capacity signals requiring a decision. Click a row to open the source module.</p></div></div><div class="panel-body">
+    <div class="kpi-grid" style="margin-bottom:10px">
+      ${kpiCard('Open Incidents',k.hse.open_incidents,'HS','',k.hse.open_incidents?'warn':'good')}
+      ${kpiCard('High-Risk Open',k.hse.high_risk_open,'HR',`Δ ${k.hse.incidents_delta>=0?'+':''}${k.hse.incidents_delta} this window`,k.hse.high_risk_open?'warn':'good')}
+      ${kpiCard('Days Since High-Risk',k.hse.days_since_last_high_risk==null?'—':fmt(k.hse.days_since_last_high_risk),'DS','')}
+      ${kpiCard('Capacity Risk',nextRiskWeek?fmt(nextRiskWeek.utilization_pct)+'%':'Clear','CW',nextRiskWeek?`Week of ${esc(nextRiskWeek.week_start)}`:'No overloaded week in 56-day horizon',nextRiskWeek?'warn':'good')}
+    </div>
+    <div class="table-wrap"><table class="data-table"><tbody>
+      <tr class="drill-row" data-kind="hse" style="cursor:pointer"><td>HSE attention</td><td style="font-size:11px">${topSite?`Top site: ${esc(topSite.label)} (${topSite.incidents})`:''}${topType?` · Top type: ${esc(topType.label)} (${topType.incidents})`:''}${!topSite&&!topType?'No incidents recorded in window':''}</td><td>${repeatWarn?'<span class="status Warning">Repeat incidents</span>':''}</td></tr>
+      ${nextRiskWeek?`<tr class="drill-row" data-kind="maintenance" style="cursor:pointer"><td>PM capacity</td><td style="font-size:11px">Week ${esc(nextRiskWeek.week_start)}: demand ${fmt(nextRiskWeek.demand_hours)} h vs declared ${fmt(nextRiskWeek.capacity_hours)} h (${fmt(nextRiskWeek.utilization_pct)}%)${craftShort.length?` · craft shortage: ${esc(craftShort.join(', '))}`:''}</td><td><span class="status Critical">Overloaded</span></td></tr>`:''}
+    </tbody></table></div>
+  </div></section>`;
   $('#content').innerHTML=`
   <div class="hero"><div><h1>Executive Analytics</h1>
     <p>Drill from enterprise KPIs to assets, work and alarms. <span class="status ${freshCls}">Calculated ${esc(fresh.calculated_at)} · source ${fresh.state}</span></p></div>
@@ -227,6 +246,8 @@ async function renderAnalytics(){
       <select id="kpi-crit" class="btn"><option value="">All Criticality</option>${['Critical','High','Medium','Low'].map(x=>`<option value="${x}" ${x===KPI_STATE.crit?'selected':''}>${x}</option>`).join('')}</select>
       ${roleIn('admin')?`<button class="btn" id="kpi-customers">Customer Population</button>`:''}
     </div></div>
+
+  ${stripHtml}
 
   <h3 class="section-sub">Reliability</h3>
   <div class="kpi-grid">
@@ -414,6 +435,7 @@ async function renderAnalytics(){
       else if(kind==='asset'&&id){await go('assets');setTimeout(()=>assetDetail(Number(id)),250)}
       else if(kind==='asset-kpi'&&id){await assetKpiDossier(Number(id))}
       else if(kind==='hse'){await go('hse')}
+      else if(kind==='maintenance'){await go('maintenance')}
       else if(kind==='channel'){await go('telemetry')}
     };
   });

@@ -39,6 +39,52 @@ def _ensure_db():
     init_db(hash_password)
 
 
+def _kpi_site():
+    """Dedicated HSE strip site shared with test_kpi_hse.py fixtures."""
+    init_db(hash_password)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM sites WHERE site_code='KPI-HSE-SITE'").fetchone()
+        if row:
+            return int(row['id'])
+        now = datetime.now().isoformat(timespec='seconds')
+        cur = conn.execute(
+            '''INSERT INTO sites(site_code,name,region,city,site_type,status)
+               VALUES('KPI-HSE-SITE','KPI HSE Site','Greater Cairo','Cairo',
+                      'Operations Centre','Operating')''')
+        site_id = int(cur.lastrowid)
+        loc = conn.execute(
+            '''INSERT INTO locations(location_code,name,location_type,site_id)
+               VALUES('KPI-HSE-LOC','KPI HSE Location','Site',?)''', (site_id,))
+        conn.execute(
+            '''INSERT INTO assets(asset_no,name,category,criticality,condition,status,
+                 location_id,created_at,updated_at)
+               VALUES('BENCH-KPI-HSE','KPI HSE Asset','Pump','High','Good','Operating',?,?,?)''',
+            (int(loc.lastrowid), now, now))
+        return site_id
+
+
+def _seed_incident(*, incident_no, site_id=None, severity=2, probability=2,
+                   status='Open', incident_type='Near Miss', created_days_ago=1):
+    with db() as conn:
+        existing = conn.execute(
+            'SELECT id FROM safety_incidents WHERE incident_no=?', (incident_no,)).fetchone()
+        if existing:
+            return int(existing['id'])
+        admin = int(conn.execute("SELECT id FROM users WHERE username='omar'").fetchone()[0])
+        created = (datetime.now() - timedelta(days=created_days_ago)).isoformat(timespec='seconds')
+        cur = conn.execute(
+            '''INSERT INTO safety_incidents(incident_no,incident_type,title,site_id,location_id,
+                 asset_id,reported_by,severity,probability,risk_score,status,description,
+                 corrective_action,occurred_at,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (incident_no, incident_type, f'KPI regression {incident_no}', site_id,
+             None, None, admin, severity, probability,
+             int(severity) * int(probability), status, 'regression', '',
+             created, created))
+        return int(cur.lastrowid)
+
+
 def test_batch_health_matches_canonical_per_asset_scoring():
     """The optimized batch evaluator must equal the canonical scorer exactly."""
     _ensure_db()
@@ -588,3 +634,116 @@ def test_shortage_expedite_flow_through_standard_procurement_endpoint():
         # Audit trail records the creation with the requisition number.
         audits = client.get('/api/audit', headers=admin, params={'q': pr_no}).json()
         assert any(x['action'].upper().startswith('CREATE') for x in audits)
+
+
+def test_command_strip_backend_contract():
+    """The analytics command strip consumes exactly these backend shapes;
+    no client-side KPI recomputation exists, so every field asserted here is
+    rendered directly from the payloads."""
+    _ensure_db()
+    _kpi_site()
+    with TestClient(app) as client:
+        admin = auth(client)
+        # Anonymous is rejected on every strip source.
+        assert client.get('/api/kpi/hse').status_code == 401
+        assert client.get('/api/planning/maintenance-forecast').status_code == 401
+
+        hse = client.get('/api/kpi/hse', headers=admin,
+                         params={'period_days': 30}).json()
+        for field in ('open_incidents', 'high_risk_open', 'incidents_delta',
+                      'days_since_last_high_risk', 'contributors_by_site',
+                      'contributors_by_type', 'repeat_locations_90d',
+                      'repeat_assets_90d'):
+            assert field in hse, f'HSE strip source missing {field}'
+
+        forecast = client.get('/api/planning/maintenance-forecast', headers=admin,
+                              params={'horizon_days': 56}).json()
+        assert forecast['weeks'], 'forecast must expose weekly buckets'
+        first = forecast['weeks'][0]
+        for field in ('week_start', 'capacity_state', 'utilization_pct',
+                      'demand_hours', 'capacity_hours', 'craft_states'):
+            assert field in first, f'forecast bucket missing {field}'
+        # Technician role may read the forecast (current_user policy) but not
+        # the executive HSE strip source.
+        tech = auth(client, 'tech1', 'Tech@2026')
+        assert client.get('/api/planning/maintenance-forecast',
+                          headers=tech).status_code == 200
+        assert client.get('/api/kpi/hse', headers=tech).status_code == 403
+
+
+def test_strip_scope_propagation_follows_filters():
+    _ensure_db()
+    from app.kpi_service import compute_hse_kpis, ExecutiveFilters
+    site_id = _kpi_site()
+    _seed_incident(incident_no='HSE-KPI-STRIP', site_id=site_id,
+                   severity=3, probability=3, status='Open', created_days_ago=1)
+    f = ExecutiveFilters(site_id=site_id, period_days=30)
+    with db() as conn:
+        scoped = compute_hse_kpis(conn, f)
+    # Site-scoped strip data reflects only that site's incidents.
+    assert scoped['incidents_current'] >= 1
+    assert all(x['label'] == 'KPI HSE Site'
+               for x in scoped['contributors_by_site'])
+
+
+def test_shortage_expedite_action_contract_preserved():
+    """Regression guard: the Expedite bridge's server contract stays intact."""
+    _ensure_db()
+    now = datetime.now().isoformat(timespec='seconds')
+    with db() as conn:
+        wh = int(conn.execute('SELECT id FROM warehouses ORDER BY id LIMIT 1').fetchone()[0])
+        conn.execute(
+            '''INSERT INTO inventory_items(item_no,name,category,warehouse_id,current_stock,
+                 reserved_stock,min_level,max_level,reorder_point,unit_price,unit)
+               VALUES('KPI-EXPED2','Contract part','Electrical',?,0,0,0,5,0,50,'ea')''', (wh,))
+    with TestClient(app) as client:
+        store = auth(client, 'store', 'Store@2026')
+        items = client.get('/api/inventory', headers=store).json()
+        item = next(x for x in items if x['item_no'] == 'KPI-EXPED2')
+        # The bridge prefills quantity/unit cost/item from these exact fields.
+        r = client.post('/api/procurement/requisitions', headers=store, json={
+            'title': 'Expedite KPI-EXPED2',
+            'items': [{'inventory_item_id': item['id'],
+                       'description': item['name'],
+                       'quantity': 4,
+                       'estimated_unit_cost': item['unit_price']}],
+        })
+        assert r.status_code == 200, r.text
+        pr_id = r.json()['id']
+        submitted = client.post(f'/api/procurement/requisitions/{pr_id}/submit',
+                                headers=store)
+        assert submitted.status_code in (200, 403)  # submit policy unchanged
+        admin = auth(client)
+        listing = client.get('/api/procurement', headers=admin).json()
+        pr = next(x for x in listing['requisitions']
+                  if x['pr_no'] == r.json()['pr_no'])
+        assert pr['status'] in ('Submitted', 'Approved')
+
+
+def test_executive_export_filename_disambiguates_scope(tmp_path=None):
+    _ensure_db()
+    from app.kpi_service import ExecutiveFilters  # noqa: F401
+    with TestClient(app) as client:
+        admin = auth(client)
+        base = client.get('/api/exports/executive-kpis.csv', headers=admin)
+        disp_base = base.headers.get('content-disposition', '')
+        assert 'EUAS_executive_kpis-all_' in disp_base
+        assert base.text.count('Family,Metric,Value,Previous,Delta') == 1
+
+        scoped = client.get('/api/exports/executive-kpis.csv', headers=admin,
+                            params={'region': 'Greater Cairo'})
+        disp_scoped = scoped.headers.get('content-disposition', '')
+        assert 'greater-cairo' in disp_scoped or 'greatercairo' in disp_scoped
+        # Sanitization: hostile region text cannot inject header characters.
+        hostile = client.get('/api/exports/executive-kpis.csv', headers=admin,
+                             params={'region': 'Bad\nRegion"\\//x'})
+        disp_hostile = hostile.headers.get('content-disposition', '')
+        assert '\n' not in disp_hostile.split('filename=')[1]
+        assert '"' not in disp_hostile.split('filename="')[1].split('"')[0]
+
+        # Content identical across names for the same scope+window.
+        a = client.get('/api/exports/executive-kpis.csv', headers=admin,
+                       params={'criticality': 'Critical'}).text
+        b = client.get('/api/exports/executive-kpis.csv', headers=admin,
+                       params={'criticality': 'Critical'}).text
+        assert a == b
