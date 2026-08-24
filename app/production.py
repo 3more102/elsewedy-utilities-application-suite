@@ -29,6 +29,11 @@ FastAPI's Swagger/OpenAPI introspection routes remain useful in development, but
 production blocks them before application routing. This avoids publishing the
 full API schema and interactive documentation to unauthenticated clients while
 leaving normal API routes and local/reference developer workflows unchanged.
+
+The production CSP already restricts executable and renderable subresources to
+the same origin. COOP, CORP, COEP and Origin-Agent-Cluster therefore complete a
+strict cross-origin isolation boundary without introducing an external-resource
+dependency into the browser shell.
 """
 from __future__ import annotations
 
@@ -71,6 +76,8 @@ PRODUCTION_BROWSER_HEADERS = {
 PRODUCTION_ISOLATION_HEADERS = {
     b'cross-origin-opener-policy': b'same-origin',
     b'cross-origin-resource-policy': b'same-origin',
+    b'cross-origin-embedder-policy': b'require-corp',
+    b'origin-agent-cluster': b'?1',
     b'x-permitted-cross-domain-policies': b'none',
 }
 PRODUCTION_API_CACHE_HEADERS = {
