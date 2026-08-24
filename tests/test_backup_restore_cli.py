@@ -22,6 +22,11 @@ def _make_euas_db(path: Path, *, tamper: bool = False) -> None:
               record_id TEXT NOT NULL, old_value TEXT DEFAULT '', new_value TEXT DEFAULT '',
               created_at TEXT NOT NULL, prev_hash TEXT DEFAULT '', audit_hash TEXT DEFAULT ''
             );
+            CREATE TABLE audit_chain_anchor(
+              id INTEGER PRIMARY KEY CHECK(id=1),
+              head_hash TEXT NOT NULL DEFAULT '',
+              record_count INTEGER NOT NULL DEFAULT 0
+            );
             '''
         )
         from app.database import audit_digest
@@ -38,6 +43,10 @@ def _make_euas_db(path: Path, *, tamper: bool = False) -> None:
                 (str(index), created, prev, digest),
             )
             prev = digest
+        conn.execute(
+            'INSERT INTO audit_chain_anchor(id,head_hash,record_count) VALUES(1,?,3)',
+            (prev,),
+        )
         if tamper:
             conn.execute("UPDATE audit_logs SET new_value='tampered' WHERE id=2")
         conn.commit()

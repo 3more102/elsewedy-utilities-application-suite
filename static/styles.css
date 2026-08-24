@@ -28,3 +28,7 @@
 
 .project-progress{width:100%;height:7px;appearance:none;border:0;border-radius:4px;overflow:hidden;background:#edf0f3;margin-top:8px}.project-progress::-webkit-progress-bar{background:#edf0f3;border-radius:4px}.project-progress::-webkit-progress-value{background:var(--red);border-radius:4px}.project-progress::-moz-progress-bar{background:var(--red);border-radius:4px}
 .panel-body .subhead{margin:12px 0 6px;font-size:13px;font-weight:600;color:var(--ink,#172033)}.panel-body .kpi-grid+.subhead{margin-top:12px}
+.strip-panel{margin-bottom:14px}
+.strip-kpis{margin-bottom:10px}
+.strip-drill{cursor:pointer}
+.strip-detail{font-size:11px}

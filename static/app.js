@@ -205,13 +205,13 @@ function commandStripHtml(hseRes,pmRes,fcastRes,siteId){
   const repeatCount=h?((h.repeat_locations_90d||[]).length+(h.repeat_assets_90d||[]).length):0;
   const rows=[];
   if(h){
-    rows.push(`<tr class="drill-row" data-strip-drill="hse" style="cursor:pointer"><td>HSE attention</td><td style="font-size:11px">${topSite?`Top site: ${esc(topSite.label)} (${topSite.incidents})`:''}${topType?` · Top type: ${esc(topType.label)} (${topType.incidents})`:''}${!topSite&&!topType?'No incidents recorded in window':''}</td><td>${repeatCount?'<span class="status Warning">Repeat incidents</span>':''}</td></tr>`)
+    rows.push(`<tr class="drill-row strip-drill" data-strip-drill="hse"><td>HSE attention</td><td class="strip-detail">${topSite?`Top site: ${esc(topSite.label)} (${topSite.incidents})`:''}${topType?` · Top type: ${esc(topType.label)} (${topType.incidents})`:''}${!topSite&&!topType?'No incidents recorded in window':''}</td><td>${repeatCount?'<span class="status Warning">Repeat incidents</span>':''}</td></tr>`)
   }
   if(nextRiskWeek){
-    rows.push(`<tr class="drill-row" data-strip-drill="maintenance" style="cursor:pointer"><td>PM capacity</td><td style="font-size:11px">Week ${esc(nextRiskWeek.week_start)}: demand ${fmt(nextRiskWeek.demand_hours)} h vs declared ${fmt(nextRiskWeek.capacity_hours)} h (${fmt(nextRiskWeek.utilization_pct)}%)${craftShort.length?` · craft shortage: ${esc(craftShort.join(', '))}`:''}${pm&&pm.critical_pm_in_overloaded_weeks?` · ${pm.critical_pm_in_overloaded_weeks} critical PM at risk`:''}</td><td><span class="status Critical">Overloaded</span></td></tr>`)
+    rows.push(`<tr class="drill-row strip-drill" data-strip-drill="maintenance"><td>PM capacity</td><td class="strip-detail">Week ${esc(nextRiskWeek.week_start)}: demand ${fmt(nextRiskWeek.demand_hours)} h vs declared ${fmt(nextRiskWeek.capacity_hours)} h (${fmt(nextRiskWeek.utilization_pct)}%)${craftShort.length?` · craft shortage: ${esc(craftShort.join(', '))}`:''}${pm&&pm.critical_pm_in_overloaded_weeks?` · ${pm.critical_pm_in_overloaded_weeks} critical PM at risk`:''}</td><td><span class="status Critical">Overloaded</span></td></tr>`)
   }
-  return `<section class="panel" style="margin-bottom:14px"><div class="panel-head"><div><h3>Command Strip</h3><p>${scopeLabel} · HSE and capacity signals requiring a decision. Click a row to open the source module.</p></div></div><div class="panel-body">
-    <div class="kpi-grid" style="margin-bottom:10px">
+  return `<section class="panel strip-panel"><div class="panel-head"><div><h3>Command Strip</h3><p>${scopeLabel} · HSE and capacity signals requiring a decision. Click a row to open the source module.</p></div></div><div class="panel-body">
+    <div class="kpi-grid strip-kpis">
       ${kpi('Open Incidents',h?h.open_incidents:'—','HS','Requires attention',h&&h.open_incidents?'warn':'good')}
       ${kpi('High-Risk Open',h?h.high_risk_open:'—','HR',h?`Δ ${h.incidents_delta>=0?'+':''}${h.incidents_delta} this window`:'',h&&h.high_risk_open?'warn':'good')}
       ${kpi('Days Since High-Risk',!h?'—':(h.days_since_last_high_risk==null?'—':fmt(h.days_since_last_high_risk)),'DS','')}
