@@ -34,9 +34,16 @@ The production CSP already restricts executable and renderable subresources to
 the same origin. COOP, CORP, COEP and Origin-Agent-Cluster therefore complete a
 strict cross-origin isolation boundary without introducing an external-resource
 dependency into the browser shell.
+
+Client-supplied request IDs are normalized at the production boundary before the
+legacy application can reflect them. Only one compact ASCII token is preserved;
+missing, duplicated, overlong or malformed values are replaced by a server-
+generated 128-bit hexadecimal identifier.
 """
 from __future__ import annotations
 
+import re
+import secrets
 from ipaddress import ip_address
 
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -90,6 +97,7 @@ PRODUCTION_PRIVATE_INTROSPECTION_PATHS = frozenset({
     '/openapi.json',
     '/docs/oauth2-redirect',
 })
+PRODUCTION_REQUEST_ID_PATTERN = re.compile(rb'^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$')
 
 
 class ProductionSecurityHeaders:
@@ -135,6 +143,37 @@ class ProductionSecurityHeaders:
             await send(message)
 
         await self.application(scope, receive, send_with_policy)
+
+
+class ProductionRequestIdBoundary:
+    """Normalize untrusted request correlation IDs before application middleware."""
+
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http':
+            await self.application(scope, receive, send)
+            return
+
+        headers = list(scope.get('headers', []))
+        request_ids = [
+            value
+            for name, value in headers
+            if name.lower() == b'x-request-id'
+        ]
+        if len(request_ids) == 1 and PRODUCTION_REQUEST_ID_PATTERN.fullmatch(request_ids[0]):
+            request_id = request_ids[0]
+        else:
+            request_id = secrets.token_hex(16).encode('ascii')
+
+        normalized_headers = [
+            (name, value)
+            for name, value in headers
+            if name.lower() != b'x-request-id'
+        ]
+        normalized_headers.append((b'x-request-id', request_id))
+        await self.application({**scope, 'headers': normalized_headers}, receive, send)
 
 
 class ProductionPrivateIntrospectionBoundary:
@@ -253,13 +292,15 @@ def _trusted_host_application(application):
 
 # TrustedProxyScheme only normalizes the request scope. Security headers remain
 # outside TrustedHostMiddleware so even a rejected Host response receives the
-# production browser-security header set. Private production boundaries sit
-# behind host validation but in front of the legacy application router.
+# production browser-security header set. The request-ID and private production
+# boundaries sit behind host validation but in front of the legacy app router.
 app = TrustedProxyScheme(
     ProductionSecurityHeaders(
         _trusted_host_application(
-            ProductionPrivateIntrospectionBoundary(
-                ProductionPrivateUploadBoundary(_application)
+            ProductionRequestIdBoundary(
+                ProductionPrivateIntrospectionBoundary(
+                    ProductionPrivateUploadBoundary(_application)
+                )
             )
         )
     )
