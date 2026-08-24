@@ -13,7 +13,7 @@ Guarantees being pinned down:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
@@ -328,7 +328,11 @@ def test_planned_outage_why_includes_zero_elapsed_scheduled_records():
             '/api/kpi/explanation',
             headers=headers,
             params={'family': 'reliability', 'metric': 'planned_outages',
-                    'site_id': seed['site_a'], 'period_days': 30},
+                    'site_id': seed['site_a'], 'period_days': 30,
+                    # Anchor the window to tomorrow: near local midnight,
+                    # ``scheduled_start`` (now + 2h) can cross into the next
+                    # day and would otherwise fall outside a default window.
+                    'period_end': (date.today() + timedelta(days=1)).isoformat()},
         )
         assert response.status_code == 200, response.text
         payload = response.json()
@@ -342,3 +346,4 @@ def test_planned_outage_why_includes_zero_elapsed_scheduled_records():
         assert scheduled, 'scheduled planned outage missing from drivers'
         assert scheduled[0]['kind'] == 'planned_outage'
         assert scheduled[0]['magnitude'] == 0.0
+        assert '(scheduled)' in str(scheduled[0]['label'])

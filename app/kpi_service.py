@@ -1656,8 +1656,17 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
                 [win_start + 'T00:00:00', win_end + 'T23:59:59'] + extra_args)):
             hours = _outage_overlap_hours(row['start_at'], row.get('end_at'), win_start_dt, win_end_dt)
             status = str(row.get('status') or '')
-            state = ('ongoing' if not row.get('end_at') and status != 'Closed'
-                     else 'scheduled' if hours <= 0 else 'recorded')
+            # State reflects reality: only a started, open-ended planned
+            # outage is 'ongoing'; anything with zero elapsed overlap has
+            # either not started yet (possibly open-ended but in the
+            # future) or contributes no duration yet, and stays
+            # 'scheduled'; everything else is a completed 'recorded' row.
+            if not row.get('end_at') and status != 'Closed' and hours > 0:
+                state = 'ongoing'
+            elif hours <= 0:
+                state = 'scheduled'
+            else:
+                state = 'recorded'
             drivers.append({
                 'kind': 'planned_outage',
                 'label': (f"{row['asset_no']} planned outage ({state})"),
