@@ -1748,6 +1748,30 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
         'previous': maint_prev['emergency_wo'],
         'delta': maint_now['emergency_wo'] - maint_prev['emergency_wo'],
     }
+    # Chronic bad actors come straight from the canonical asset computation
+    # (>=2 corrective completions in 90 days, executive-scoped). These are
+    # the literal records composing the repeat-failure numerator, so no
+    # second extraction exists here.
+    asset_kpis = compute_asset_kpis(conn, f)
+    explanations['repeat_failures'] = {
+        'current': maint_now['repeat_failure_rate_pct'],
+        'previous': None,
+        'delta': None,
+        'drivers': [
+            {
+                'kind': 'repeat_failure',
+                'label': (
+                    f"{r['asset_no']} {int(r['failures_90d'])} corrective"
+                    ' failures in 90 days'
+                ),
+                'failures_90d': int(r['failures_90d']),
+                'last_failure': r['last_failure'],
+                'link': {'module': 'assets', 'record': r['asset_no'],
+                         'id': r['id']},
+            }
+            for r in asset_kpis.get('repeat_failure_assets', [])
+        ],
+    }
     return explanations
 
 

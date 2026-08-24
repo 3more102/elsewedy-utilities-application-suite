@@ -305,6 +305,32 @@ def _reliability_outage_drivers(conn, f, metric: str, limit: int = 5) -> list[di
     return drivers
 
 
+def _repeat_failure_drivers(conn, f, limit: int = 10) -> list[dict]:
+    """Chronic bad-actor contributors for the repeat-failure rate.
+
+    Consumes the canonical ``repeat_failures`` explanation section; each
+    contributor is an asset whose corrective completions literally compose
+    the metric numerator, hence ``contributor`` attribution.
+    """
+    from .kpi_service import explain_kpi_changes
+
+    section = (explain_kpi_changes(conn, f).get('repeat_failures') or {})
+    drivers = []
+    for driver in (section.get('drivers') or [])[:limit]:
+        link = driver.get('link') or {}
+        drivers.append({
+            'kind': 'repeat_failure',
+            'label': driver.get('label'),
+            'magnitude': driver.get('failures_90d'),
+            'unit': 'failures',
+            'attribution': 'contributor',
+            'source_type': 'asset',
+            'source_id': link.get('id'),
+            'drill': link,
+        })
+    return drivers
+
+
 def explain_metric(conn, f, *, family: str, metric: str) -> dict:
     """Current vs previous window for one metric, with measured drivers.
 
@@ -345,6 +371,8 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
 
     if family == 'reliability':
         drivers = _reliability_outage_drivers(conn, f, metric)
+    elif family == 'maintenance' and metric == 'repeat_failure_rate_pct':
+        drivers = _repeat_failure_drivers(conn, f)
     elif family == 'maintenance' and metric in {
             'open_work_orders', 'overdue_work_orders', 'emergency_work_orders',
             'high_risk_overdue_work_orders', 'unassigned_critical_work_orders',
