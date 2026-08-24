@@ -149,6 +149,18 @@ _TREND_FAMILIES: dict[str, dict] = {
                                          'path': 'high_risk_open'},
         },
     },
+    # Cost is genuinely window-based: compute_cost_kpis sums immutable
+    # maintenance_cost_ledger entries inside each bucket's posted_at range,
+    # so historical samples are real as-of evaluations, not snapshot echoes.
+    'cost': {
+        'compute': 'compute_cost_kpis',
+        'metrics': {
+            'maintenance_cost_window': {
+                'label': 'Maintenance Cost', 'unit': 'currency',
+                'direction': 'lower_is_better',
+                'path': 'maintenance_cost_window'},
+        },
+    },
 }
 
 
@@ -383,6 +395,38 @@ def _schedule_compliance_drivers(conn, f, limit: int = 10) -> list[dict]:
     return drivers
 
 
+def _maintenance_cost_drivers(conn, f, limit: int = 10) -> list[dict]:
+    """Top-cost asset contributors for the window's maintenance cost.
+
+    Consumes the canonical ``top_cost_assets`` section computed over the
+    current window; each cited asset's ledger entries literally compose the
+    metric sum, hence ``contributor`` attribution. The extraction reuses the
+    canonical compute so contributor scope equals metric scope by
+    construction (unattributed ledger entries are excluded from scoped
+    views by compute_cost_kpis itself).
+    """
+    from .kpi_service import compute_cost_kpis
+
+    drivers = []
+    for row in (compute_cost_kpis(conn, f).get('top_cost_assets') or [])[:limit]:
+        amount = round(float(row['amount']), 2)
+        drivers.append({
+            'kind': 'maintenance_cost',
+            'label': (
+                f"{row['asset_no']} {row.get('asset_name') or ''} ".strip()
+                + f'{amount:,.2f}'
+            ),
+            'magnitude': amount,
+            'unit': 'currency',
+            'attribution': 'contributor',
+            'source_type': 'asset',
+            'source_id': int(row['asset_id']),
+            'drill': {'module': 'assets', 'record': row['asset_no'],
+                      'id': int(row['asset_id'])},
+        })
+    return drivers
+
+
 def _hse_incident_drivers(conn, f, *, metric: str, limit: int = 10) -> list[dict]:
     """Open-incident contributors for the HSE family.
 
@@ -465,6 +509,8 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
     elif family == 'hse' and metric in {'open_incidents',
                                         'high_risk_incidents_open'}:
         drivers = _hse_incident_drivers(conn, f, metric=metric)
+    elif family == 'cost':
+        drivers = _maintenance_cost_drivers(conn, f)
     elif family == 'maintenance' and metric in {
             'open_work_orders', 'overdue_work_orders', 'emergency_work_orders',
             'high_risk_overdue_work_orders', 'unassigned_critical_work_orders',
