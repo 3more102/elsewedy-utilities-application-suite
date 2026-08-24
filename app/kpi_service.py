@@ -1097,6 +1097,80 @@ def compute_cost_kpis(conn, f: ExecutiveFilters) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Parts-shortage drill-down (KPI -> action)
+# --------------------------------------------------------------------------- #
+
+def compute_parts_shortages(conn, f: ExecutiveFilters, limit: int = 50) -> dict:
+    """Exact per-line material shortages blocking open work.
+
+    Same reservation-engine math as the parts-blocked KPI and
+    _work_order_parts_readiness, exposed at line level so planners can act
+    (reserve, expedite or re-plan) without opening each work order.
+    Honors site/region scoping through the work order's location.
+    """
+    sql = (
+        '''SELECT r.work_order_id wo_id, w.wo_no, w.priority, a.asset_no,
+                  i.id item_id, i.item_no, i.name item_name, i.unit,
+                  r.quantity required_qty, COALESCE(m.issued,0) issued_qty,
+                  COALESCE(rv.reserved,0) reserved_for_work,
+                  CASE WHEN i.current_stock-i.reserved_stock>0
+                       THEN i.current_stock-i.reserved_stock ELSE 0 END free_stock,
+                  s.name site_name
+             FROM work_order_requirements r
+             JOIN work_orders w ON w.id=r.work_order_id
+             JOIN inventory_items i ON i.id=r.inventory_item_id
+             LEFT JOIN assets a ON a.id=w.asset_id
+             LEFT JOIN locations l ON l.id=w.location_id
+             LEFT JOIN sites st ON st.id=l.site_id
+             LEFT JOIN sites s ON s.id=st.id
+             LEFT JOIN (SELECT work_order_id ao, inventory_item_id ai, SUM(quantity) issued
+                          FROM work_order_materials GROUP BY work_order_id,inventory_item_id) m
+               ON m.ao=r.work_order_id AND m.ai=r.inventory_item_id
+             LEFT JOIN (SELECT work_order_id ro, inventory_item_id ri,
+               SUM(quantity-issued_quantity) reserved FROM inventory_reservations
+               WHERE status IN ('Reserved','Partially Issued')
+               GROUP BY work_order_id,inventory_item_id) rv
+               ON rv.ro=r.work_order_id AND rv.ri=r.inventory_item_id''')
+    where = (" WHERE r.status<>'Cancelled' AND " + _OPEN_WO +
+             ' AND (r.quantity-COALESCE(m.issued,0)) >'
+             ' (COALESCE(rv.reserved,0)'
+             ' + CASE WHEN i.current_stock-i.reserved_stock>0'
+             '   THEN i.current_stock-i.reserved_stock ELSE 0 END)')
+    args: list = []
+    if f.site_id is not None:
+        where += ' AND s.id=?'
+        args.append(f.site_id)
+    if f.region:
+        where += ' AND s.region=?'
+        args.append(f.region)
+    rows_ = _rows(conn.execute(sql + where + ' ORDER BY w.priority DESC, i.item_no LIMIT ?',
+                               args + [limit]))
+    lines = [{
+        'wo_id': r['wo_id'], 'wo_no': r['wo_no'], 'priority': r['priority'],
+        'asset_no': r['asset_no'], 'item_no': r['item_no'], 'item_name': r['item_name'],
+        'unit': r['unit'],
+        'required_qty': float(r['required_qty'] or 0),
+        'issued_qty': float(r['issued_qty'] or 0),
+        'reserved_for_work': float(r['reserved_for_work'] or 0),
+        'free_stock': float(r['free_stock'] or 0),
+        'outstanding_short': round(float(r['required_qty'] or 0)
+                                   - float(r['issued_qty'] or 0)
+                                   - float(r['reserved_for_work'] or 0)
+                                   - float(r['free_stock'] or 0), 3),
+        'site_name': r['site_name'],
+    } for r in rows_]
+    return {
+        'summary': {
+            'blocked_work_orders': len({x['wo_id'] for x in lines}),
+            'short_lines': len(lines),
+            'high_risk_lines': sum(1 for x in lines
+                                   if x['priority'] in ('Emergency', 'Critical', 'High')),
+        },
+        'lines': lines,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Explainable KPI changes (period vs previous period)
 # --------------------------------------------------------------------------- #
 

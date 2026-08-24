@@ -376,3 +376,56 @@ def test_refresh_parameter_forces_live_recompute():
                                params={**params, 'refresh': 'true'}).json()
         assert first['snapshot']['served_from_cache'] in (True, False)
         assert refreshed['snapshot']['served_from_cache'] is False
+
+
+def test_parts_shortage_drilldown_exact_lines_permissions_and_scope():
+    _ensure_db()
+    now = datetime.now().isoformat(timespec='seconds')
+    with db() as conn:
+        tr = int(conn.execute("SELECT id FROM assets WHERE asset_no='TR-001'").fetchone()[0])
+        ncs_loc = int(conn.execute(
+            "SELECT id FROM locations WHERE location_code='NCS-TR-BAY'").fetchone()[0])
+        wo_cur = conn.execute(
+            '''INSERT INTO work_orders(wo_no,title,priority,status,work_type,asset_id,
+                 location_id,estimated_hours,created_at,updated_at)
+               VALUES('WO-KPI-SHORT','Shortage drilldown','Critical','Approved','Preventive',
+                      ?,?,1,?,?)''', (tr, ncs_loc, now, now))
+        wo_id = int(wo_cur.lastrowid)
+        wh = int(conn.execute('SELECT id FROM warehouses ORDER BY id LIMIT 1').fetchone()[0])
+        conn.execute(
+            '''INSERT INTO inventory_items(item_no,name,category,warehouse_id,current_stock,
+                 reserved_stock,min_level,max_level,reorder_point,unit_price,unit)
+               VALUES('KPI-SHORT-1','Shortfall part','Electrical',?,3,0,0,10,0,5,'ea')''', (wh,))
+        item_id = int(conn.execute(
+            "SELECT id FROM inventory_items WHERE item_no='KPI-SHORT-1'").fetchone()[0])
+        conn.execute(
+            'INSERT INTO work_order_requirements(work_order_id,inventory_item_id,quantity,status)'
+            " VALUES(?,?,10,'Required')", (wo_id, item_id))
+
+    with TestClient(app) as client:
+        admin = auth(client)
+        tech = auth(client, 'tech1', 'Tech@2026')
+        assert client.get('/api/kpi/parts/shortages', headers=tech).status_code == 403
+        r = client.get('/api/kpi/parts/shortages', headers=admin)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        line = next((x for x in body['lines'] if x['wo_no'] == 'WO-KPI-SHORT'), None)
+        assert line is not None
+        # required 10, issued 0, reserved 0, free stock 3 -> outstanding 7.
+        assert line['required_qty'] == 10.0 and line['free_stock'] == 3.0
+        assert abs(line['outstanding_short'] - 7.0) < 0.001
+        assert body['summary']['blocked_work_orders'] >= 1
+        assert body['summary']['high_risk_lines'] >= 1
+
+        # Site scoping: a scope excluding the WO's site hides its shortage line.
+        with db() as conn:
+            ncs = int(conn.execute(
+                "SELECT id FROM sites WHERE site_code='NCS-01'").fetchone()[0])
+            cai = int(conn.execute(
+                "SELECT id FROM sites WHERE site_code='CAI-OPS'").fetchone()[0])
+        own = client.get('/api/kpi/parts/shortages', headers=admin,
+                         params={'site_id': ncs}).json()
+        assert any(x['wo_no'] == 'WO-KPI-SHORT' for x in own['lines'])
+        other = client.get('/api/kpi/parts/shortages', headers=admin,
+                           params={'site_id': cai}).json()
+        assert not any(x['wo_no'] == 'WO-KPI-SHORT' for x in other['lines'])

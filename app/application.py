@@ -1007,6 +1007,19 @@ def kpi_deterioration(
     with db() as conn:
         return compute_deterioration_signals(conn, f, limit=limit)
 
+@app.get('/api/kpi/parts/shortages')
+def kpi_parts_shortages(
+    limit: int = Query(50, ge=1, le=200),
+    site_id: Optional[int] = None,
+    region: Optional[str] = None,
+    user=Depends(require_roles(*_KPI_ROLES)),
+):
+    """Exact per-line material shortages blocking open work (KPI -> action)."""
+    f = _kpi_filters(site_id=site_id, region=region)
+    from .kpi_service import compute_parts_shortages
+    with db() as conn:
+        return compute_parts_shortages(conn, f, limit=limit)
+
 @app.get('/api/kpi/assets/{asset_id}')
 def kpi_asset_profile(
     asset_id: int,

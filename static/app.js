@@ -322,7 +322,8 @@ async function renderAnalytics(){
     <section class="panel"><div class="panel-head"><div><h3>Workload by Technician</h3><p>Open work per technician</p></div></div><div class="panel-body">
       ${wf.workload_by_technician.length?barChart(wf.workload_by_technician.map(t=>({label:t.name,v:t.open_wo})),'label','v'):empty('No assigned open work')}
     </div></section>
-  </div>`;
+  </div>
+  <section class="panel" style="margin-bottom:14px"><div class="panel-head"><div><h3>Material Shortages Blocking Work</h3><p>Exact outstanding quantities per requirement — reserve, expedite or re-plan. Click a row to open the work order.</p></div><div><button class="btn small" id="kpi-shortages-refresh">Load Shortages</button></div></div><div class="panel-body" id="kpi-shortage-body">${empty('Load to compute reservation-exact shortage lines')}</div></section>`;
 
   const reload=()=>render();
   $('#kpi-days').onchange=e=>{KPI_STATE.days=Number(e.target.value);reload()};
@@ -331,6 +332,18 @@ async function renderAnalytics(){
   $('#kpi-type').onchange=e=>{KPI_STATE.typeId=e.target.value;reload()};
   $('#kpi-crit').onchange=e=>{KPI_STATE.crit=e.target.value;reload()};
   if($('#kpi-customers'))$('#kpi-customers').onclick=()=>customersModal(ref.sites);
+  const loadShortages=async()=>{
+    const sq=new URLSearchParams();if(siteId)sq.set('site_id',siteId);if(KPI_STATE.region)sq.set('region',KPI_STATE.region);
+    $('#kpi-shortage-body').innerHTML='<div class="empty">Loading…</div>';
+    try{
+      const sh=await api('/api/kpi/parts/shortages?'+sq);
+      const s=sh.summary;
+      $('#kpi-shortage-body').innerHTML=`<div class="kpi-grid" style="margin-bottom:10px">${kpiCard('Blocked WOs',s.blocked_work_orders,'B','')}${kpiCard('Short Lines',s.short_lines,'L','')}${kpiCard('High-Risk Lines',s.high_risk_lines,'H','Emergency/Critical/High','warn')}</div>`+
+        (sh.lines.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>WO</th><th>Priority</th><th>Part</th><th>Required</th><th>Reserved</th><th>Free</th><th>Outstanding</th></tr></thead><tbody>${sh.lines.map(l=>`<tr class="drill-row" data-kind="work" data-id="${l.wo_id}" style="cursor:pointer"><td>${esc(l.wo_no)}</td><td>${status(l.priority)}</td><td>${esc(l.item_no)} — ${esc(l.item_name)}</td><td>${fmt(l.required_qty)} ${esc(l.unit||'')}</td><td>${fmt(l.reserved_for_work)}</td><td>${fmt(l.free_stock)}</td><td><strong class="${l.outstanding_short>0?'':'good'}">${fmt(l.outstanding_short)}</strong></td></tr>`).join('')}</tbody></table></div>`:empty('No shortages blocking open work'));
+      $$('#kpi-shortage-body .drill-row').forEach(row=>{row.onclick=async()=>{await go('work');setTimeout(()=>workDetail(Number(row.dataset.id)),250)}});
+    }catch(err){$('#kpi-shortage-body').innerHTML=empty(err.message)}
+  };
+  $('#kpi-shortages-refresh').onclick=loadShortages;
   $$('#content .drill-row').forEach(row=>{
     row.onclick=async()=>{
       const kind=row.dataset.kind,id=row.dataset.id;
