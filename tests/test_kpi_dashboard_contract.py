@@ -182,13 +182,34 @@ def test_app_js_consumes_backend_families_without_client_recomputation():
     for handler in ('kpiContributorDetail', 'kpiItemDetail', 'kpiWoDetail', 'kpiWfDetail',
                     'openCustomerCounts', 'saveCustomerCount',
                     'reliabilityPanel', 'inventoryPanel', 'maintenancePanel',
-                    'workforcePanel'):
+                    'workforcePanel', 'materialBlockedPanel'):
         assert handler in source, handler
-    # ...and never recompute utility indices in the browser.
+    # ...surface the safe KPI-to-action navigation bridges...
+    for action in ('data-action-dispatch', 'data-action-procurement',
+                   'data-action-inventory', 'material_blocked_work'):
+        assert action in source, action
+    # ...and never recompute business formulas in the browser.
     lowered = source.lower()
     for forbidden in ('saidi=', 'saifi=', 'caidi=', 'function computesaidi',
-                      'function computemtb', 'function computeavailability'):
+                      'function computemtb', 'function computeavailability',
+                      'utilisation_pct_30d=', 'utilization_pct_30d='):
         assert forbidden not in lowered, forbidden
+
+
+def test_material_blocked_dashboard_payload_supports_action_bridge():
+    """The material-blocked panel consumes /api/dashboard fields directly."""
+    with TestClient(app) as client:
+        headers = _auth(client)
+        response = client.get('/api/dashboard', headers=headers)
+        assert response.status_code == 200
+        payload = response.json()
+        assert 'material_blocked_work' in payload
+        assert 'material_blocked_work_orders' in payload['kpis']
+        assert isinstance(payload['material_blocked_work'], list)
+        for entry in payload['material_blocked_work']:
+            # Drill-down needs the real record id; ranking needs priority.
+            for key in ('id', 'wo_no', 'title', 'priority', 'status', 'shortage_items'):
+                assert key in entry, key
 
 
 def test_admin_customer_count_endpoint_stays_audited_for_dashboard():
