@@ -323,6 +323,8 @@ def install_kpi_routes() -> None:
             rows_out,
         )
 
+    install_inventory_kpi_routes(app)
+
     @app.patch('/api/sites/{site_id}/customer-count')
     def set_site_customer_count_route(
         site_id: int,
@@ -360,3 +362,235 @@ def install_kpi_routes() -> None:
 
     app.openapi_schema = None
     setattr(app.state, marker, True)
+
+
+INVENTORY_KPI_DEFINITIONS: dict[str, dict] = {
+    'stock_availability_pct': {
+        'name': 'Stock Line Availability',
+        'definition': (
+            'Share of stocked lines whose unreserved (available-to-issue) '
+            'quantity is positive.'
+        ),
+        'formula': 'lines with current_stock - reserved_stock > 0 / total stocked lines x 100',
+        'unit': '%',
+        'direction': 'higher_is_better',
+        'target': 98.0,
+        'warning_threshold': 95.0,
+        'critical_threshold': 90.0,
+        'sources': ['inventory_items'],
+    },
+    'stockout_lines': {
+        'name': 'Stockout Lines',
+        'definition': (
+            'Number of stocked lines with no available-to-issue quantity; '
+            'every demand against these lines is blocked until receipt.'
+        ),
+        'formula': 'count(lines where current_stock - reserved_stock <= 0)',
+        'unit': 'lines',
+        'direction': 'lower_is_better',
+        'target': 0.0,
+        'warning_threshold': 3.0,
+        'critical_threshold': 10.0,
+        'sources': ['inventory_items'],
+    },
+    'uncovered_reorder_lines': {
+        'name': 'Uncovered Reorder Lines',
+        'definition': (
+            'Lines at or below their reorder point with no open purchase '
+            'requisition covering them — demand risk with nothing on order.'
+        ),
+        'formula': (
+            'count(lines where available <= reorder_point and no requisition '
+            'in a non-terminal status references the line)'
+        ),
+        'unit': 'lines',
+        'direction': 'lower_is_better',
+        'target': 0.0,
+        'warning_threshold': 2.0,
+        'critical_threshold': 5.0,
+        'sources': ['inventory_items', 'purchase_requisitions', 'purchase_requisition_items'],
+    },
+    'slow_moving_value_pct': {
+        'name': 'Slow-Moving Stock Value',
+        'definition': (
+            'Share of total on-hand value in lines with no issue transaction '
+            'during the lookback window — working capital at rest.'
+        ),
+        'formula': (
+            'value of lines without an ISSUE transaction in the window / '
+            'total stock value x 100'
+        ),
+        'unit': '%',
+        'direction': 'lower_is_better',
+        'target': 20.0,
+        'warning_threshold': 40.0,
+        'critical_threshold': 60.0,
+        'sources': ['inventory_items', 'inventory_transactions'],
+    },
+    'open_po_aging_days_avg': {
+        'name': 'Average Open Purchase Order Age',
+        'definition': (
+            'Mean age in days of purchase orders not yet received or '
+            'cancelled — supplier pipeline pressure.'
+        ),
+        'formula': 'avg(today - order_date) over POs with status not Received/Cancelled',
+        'unit': 'days',
+        'direction': 'lower_is_better',
+        'target': 14.0,
+        'warning_threshold': 30.0,
+        'critical_threshold': 60.0,
+        'sources': ['purchase_orders'],
+    },
+}
+
+# Requisition statuses that still cover a reorder need.
+_OPEN_PR_EXCLUSION = ('Received', 'Cancelled', 'Rejected')
+# Purchase-order statuses that close the supply pipeline for a line.
+_CLOSED_PO_STATUS = ('Received', 'Cancelled')
+
+
+def compute_inventory_kpis(conn, slow_moving_days: int = 90) -> dict:
+    as_of_date = date.today()
+    cutoff = (
+        datetime.combine(as_of_date, datetime.min.time()) - timedelta(days=slow_moving_days)
+    ).isoformat(timespec='seconds')
+
+    items = [
+        dict(row)
+        for row in conn.execute(
+            '''SELECT i.id,i.item_no,i.name,i.current_stock,i.reserved_stock,
+                      i.reorder_point,i.unit_price
+               FROM inventory_items i ORDER BY i.item_no'''
+        ).fetchall()
+    ]
+    total_lines = len(items)
+
+    open_pr_items = {
+        int(row['inventory_item_id'])
+        for row in conn.execute(
+            f'''SELECT DISTINCT x.inventory_item_id
+                FROM purchase_requisition_items x
+                JOIN purchase_requisitions pr ON pr.id=x.pr_id
+                WHERE x.inventory_item_id IS NOT NULL
+                  AND pr.status NOT IN ({','.join('?' * len(_OPEN_PR_EXCLUSION))})''',
+            _OPEN_PR_EXCLUSION,
+        ).fetchall()
+    }
+
+    slow_moving_ids = {
+        int(row['id'])
+        for row in conn.execute(
+            '''SELECT i.id FROM inventory_items i
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM inventory_transactions t
+                 WHERE t.item_id=i.id AND t.tx_type='ISSUE' AND t.created_at>=?
+               )''',
+            (cutoff,),
+        ).fetchall()
+    }
+
+    stockouts = 0
+    uncovered_reorder = 0
+    below_reorder = 0
+    total_value = 0.0
+    slow_moving_value = 0.0
+    contributors: list[dict] = []
+    for item in items:
+        available = float(item['current_stock'] or 0) - float(item['reserved_stock'] or 0)
+        unit_price = float(item['unit_price'] or 0)
+        on_hand_value = float(item['current_stock'] or 0) * unit_price
+        total_value += on_hand_value
+        if item['id'] in slow_moving_ids:
+            slow_moving_value += on_hand_value
+        is_stockout = available <= 0
+        if is_stockout:
+            stockouts += 1
+        if available <= float(item['reorder_point'] or 0):
+            below_reorder += 1
+            covered = item['id'] in open_pr_items
+            if not covered:
+                uncovered_reorder += 1
+                contributors.append({
+                    'item_no': item['item_no'],
+                    'name': item['name'],
+                    'available': round(available, 3),
+                    'reorder_point': float(item['reorder_point'] or 0),
+                    'exposure_value': round(max(0.0, float(item['reorder_point'] or 0) - available) * unit_price, 2),
+                    'on_order': False,
+                })
+
+    contributors.sort(key=lambda x: -x['exposure_value'])
+
+    availability_pct = (
+        round(100.0 * (total_lines - stockouts) / total_lines, 2) if total_lines else 100.0
+    )
+    slow_moving_pct = round(100.0 * slow_moving_value / total_value, 2) if total_value else 0.0
+
+    values = {
+        'stock_availability_pct': availability_pct,
+        'stockout_lines': float(stockouts),
+        'uncovered_reorder_lines': float(uncovered_reorder),
+        'slow_moving_value_pct': slow_moving_pct,
+    }
+    open_pos = [
+        dict(row)
+        for row in conn.execute(
+            f'''SELECT po_no,vendor_id,order_date,total_cost FROM purchase_orders
+                WHERE status NOT IN ({','.join('?' * len(_CLOSED_PO_STATUS))})
+                ORDER BY order_date''',
+            _CLOSED_PO_STATUS,
+        ).fetchall()
+    ]
+    today = datetime.combine(as_of_date, datetime.min.time())
+    po_ages = []
+    for po in open_pos:
+        try:
+            age = (today - datetime.fromisoformat(str(po['order_date'])[:19])).total_seconds() / 86400.0
+        except ValueError:
+            continue
+        po_ages.append(age)
+    values['open_po_aging_days_avg'] = round(sum(po_ages) / len(po_ages), 2) if po_ages else None
+
+    kpis = {}
+    for kpi_id, definition in INVENTORY_KPI_DEFINITIONS.items():
+        kpis[kpi_id] = {**definition, 'id': kpi_id, 'value': values[kpi_id]}
+
+    return {
+        'kpi_family': 'inventory_procurement',
+        'as_of': as_of_date.isoformat(),
+        'slow_moving_lookback_days': slow_moving_days,
+        'stocked_lines': total_lines,
+        'stock_value': round(total_value, 2),
+        'below_reorder_lines': below_reorder,
+        'open_purchase_orders': len(open_pos),
+        'kpis': kpis,
+        'contributors': contributors[:5],
+        'data_freshness': {'generated_at': _application.now()},
+    }
+
+
+def install_inventory_kpi_routes(app) -> None:
+    @app.get('/api/kpis/inventory')
+    def inventory_kpis_route(
+        slow_moving_days: int = Query(90, ge=7, le=730),
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            return compute_inventory_kpis(conn, slow_moving_days)
+
+    @app.get('/api/kpis/inventory.csv')
+    def inventory_kpis_csv_route(
+        slow_moving_days: int = Query(90, ge=7, le=730),
+        user=Depends(current_user),
+    ):
+        with db() as conn:
+            result = compute_inventory_kpis(conn, slow_moving_days)
+        rows_out = [
+            [kpi['id'], kpi['name'], kpi['value'], kpi['unit'], kpi['direction']]
+            for kpi in result['kpis'].values()
+        ]
+        return _application.csv_response(
+            'EUAS_inventory_kpis.csv',
+            ['KPI', 'Name', 'Value', 'Unit', 'Direction'],
+            rows_out,
+        )
