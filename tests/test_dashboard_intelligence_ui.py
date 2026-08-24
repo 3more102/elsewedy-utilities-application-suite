@@ -22,6 +22,8 @@ def test_dashboard_intelligence_uses_canonical_kpi_contracts():
     assert "drivers" in js
     assert "drill" in js
     assert "attribution" in js
+    assert "sample.value != null" in js
+    assert "if (value == null) return '—';" in js
     assert "innerHTML" not in js
     assert "onclick=" not in js
     assert "style=" not in js
