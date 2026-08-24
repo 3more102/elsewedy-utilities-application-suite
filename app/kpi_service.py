@@ -619,6 +619,20 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         scope_args + [w['period_start'], w['period_end'] + 'T23:59:59']).fetchone()[0])
     schedule_compliance = round(100 * met / scheduled, 1) if scheduled else 100.0
 
+    # Late completions share the exact joins, scope and window predicates of
+    # the schedule-compliance counts above, so cited work orders are always
+    # part of the population the rate measured.
+    late_completed = _rows(conn.execute(
+        'SELECT w.id,w.wo_no,w.title,w.priority,w.target_finish,w.actual_finish,'
+        'CAST(julianday(w.actual_finish) - julianday(w.target_finish) AS INT)'
+        ' delay_days' + base +
+        " AND w.status IN ('Completed','Closed')"
+        ' AND w.actual_finish IS NOT NULL AND w.target_finish IS NOT NULL'
+        ' AND w.target_finish>=? AND w.target_finish<?'
+        ' AND w.actual_finish>w.target_finish' +
+        ' ORDER BY delay_days DESC, w.wo_no LIMIT 10',
+        scope_args + [w['period_start'], w['period_end'] + 'T23:59:59']))
+
     rel_failures = int(conn.execute(
         'SELECT COUNT(*)' + base +
         " AND w.status IN ('Completed','Closed') AND w.work_type LIKE 'Corrective%'"
@@ -683,6 +697,7 @@ def compute_maintenance_kpis(conn, f: ExecutiveFilters) -> dict:
         'pm_compliance_pct': pm_compliance,
         'pm_overdue_plans': pm_overdue_plans,
         'schedule_compliance_pct': schedule_compliance,
+        'late_completed_workorders': late_completed,
         'backlog_hours': round(backlog_hours, 1),
         'backlog_weeks': round(backlog_hours / weekly_capacity, 1) if weekly_capacity else None,
         'weekly_capacity_hours': round(weekly_capacity, 1),
@@ -1792,6 +1807,26 @@ def explain_kpi_changes(conn, f: ExecutiveFilters) -> dict:
         'current': maint_now['emergency_wo'],
         'previous': maint_prev['emergency_wo'],
         'delta': maint_now['emergency_wo'] - maint_prev['emergency_wo'],
+    }
+    # Late completions are measured by the same population as the rate; each
+    # cited work order is part of what schedule compliance evaluated.
+    explanations['schedule_compliance'] = {
+        'current': maint_now['schedule_compliance_pct'],
+        'previous': maint_prev['schedule_compliance_pct'],
+        'delta': round(maint_now['schedule_compliance_pct']
+                       - maint_prev['schedule_compliance_pct'], 1),
+        'drivers': [
+            {
+                'kind': 'late_completion',
+                'label': (
+                    f"{r['wo_no']} finished {max(int(r['delay_days'] or 0), 0)} d late"
+                ),
+                'delay_days': max(int(r['delay_days'] or 0), 0),
+                'priority': r['priority'],
+                'link': {'module': 'work', 'record': r['wo_no'], 'id': r['id']},
+            }
+            for r in maint_now.get('late_completed_workorders', [])
+        ],
     }
     # Chronic bad actors come straight from the canonical maintenance
     # computation, whose contributor query shares the exact joins, scope and

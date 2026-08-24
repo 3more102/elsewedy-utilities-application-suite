@@ -357,6 +357,32 @@ def _pm_compliance_drivers(conn, f, limit: int = 10) -> list[dict]:
     return drivers
 
 
+def _schedule_compliance_drivers(conn, f, limit: int = 10) -> list[dict]:
+    """Late-completion contributors for schedule compliance.
+
+    Consumes the canonical ``schedule_compliance`` explanation section; each
+    cited work order was measured by the rate itself.
+    """
+    from .kpi_service import explain_kpi_changes
+
+    section = (explain_kpi_changes(conn, f)
+               .get('schedule_compliance') or {})
+    drivers = []
+    for driver in (section.get('drivers') or [])[:limit]:
+        link = driver.get('link') or {}
+        drivers.append({
+            'kind': 'late_completion',
+            'label': driver.get('label'),
+            'magnitude': driver.get('delay_days'),
+            'unit': 'days late',
+            'attribution': 'contributor',
+            'source_type': 'work_order',
+            'source_id': link.get('id'),
+            'drill': link,
+        })
+    return drivers
+
+
 def explain_metric(conn, f, *, family: str, metric: str) -> dict:
     """Current vs previous window for one metric, with measured drivers.
 
@@ -401,6 +427,13 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
         drivers = _repeat_failure_drivers(conn, f)
     elif family == 'maintenance' and metric == 'pm_compliance_pct':
         drivers = _pm_compliance_drivers(conn, f)
+    elif family == 'maintenance' and metric == 'schedule_compliance_pct':
+        drivers = _schedule_compliance_drivers(conn, f)
+    elif family == 'maintenance' and metric in {'mtbf_hours', 'mttr_hours'}:
+        # MTBF/MTTR are derived from the scoped forced-outage set computed by
+        # compute_reliability; those outage records are the composing
+        # evidence, so the reliability driver path serves both metrics.
+        drivers = _reliability_outage_drivers(conn, f, metric)
     elif family == 'maintenance' and metric in {
             'open_work_orders', 'overdue_work_orders', 'emergency_work_orders',
             'high_risk_overdue_work_orders', 'unassigned_critical_work_orders',
