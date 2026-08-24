@@ -862,6 +862,86 @@ def test_cbm_pagination_is_additive_and_validated():
 
 
 # ---------------------------------------------------------------------------
+# Site-level burst correlation
+# ---------------------------------------------------------------------------
+def test_site_burst_correlation_across_assets_and_scope():
+    from datetime import datetime, timedelta
+
+    headers = _login('exec', 'Viewer@2026')
+    base = datetime.now() - timedelta(minutes=25)
+    with db() as conn:
+        site_id, loc_id = _make_scoped_site(conn, 'SBURST-A')
+        quiet_site, quiet_loc = _make_scoped_site(conn, 'SBURST-B')
+        asset_x = _make_site_asset(conn, 'AST-SBURST-X', loc_id)
+        asset_y = _make_site_asset(conn, 'AST-SBURST-Y', loc_id)
+        chan_x = _make_channel(conn, 'TEL-SBURST-X', asset_x)
+        chan_y = _make_channel(conn, 'TEL-SBURST-Y', asset_y)
+        quiet_asset = _make_site_asset(conn, 'AST-SBURST-Q', quiet_loc)
+        quiet_chan = _make_channel(conn, 'TEL-SBURST-Q', quiet_asset)
+        member_ids: list[int] = []
+        # Six alarms across two different assets at one site inside 4 minutes.
+        for index in range(3):
+            opened = _iso(base + timedelta(minutes=index))
+            member_ids.append(_add_site_alarm(
+                conn, f'ALM-SBURST-X{index}', asset_x, chan_x, site_id, opened))
+            member_ids.append(_add_site_alarm(
+                conn, f'ALM-SBURST-Y{index}', asset_y, chan_y, site_id,
+                _iso(base + timedelta(minutes=index, seconds=30))))
+        # A quiet site must never be dragged into the cluster.
+        _add_site_alarm(
+            conn, 'ALM-SBURST-Q0', quiet_asset, quiet_chan, quiet_site,
+            _iso(base + timedelta(minutes=1)),
+        )
+        conn.commit()
+    try:
+        with TestClient(app) as client:
+            def fetch(site):
+                url = ('/api/reliability/alarm-correlation'
+                       '?hours=2&burst_threshold=50&site_burst_threshold=6'
+                       '&burst_window_minutes=5')
+                if site is not None:
+                    url += f'&site_id={site}'
+                response = client.get(url, headers=headers)
+                assert response.status_code == 200, response.text
+                return response.json()
+
+            scoped = fetch(site_id)
+            assert len(scoped['site_bursts']) == 1
+            site_burst = scoped['site_bursts'][0]
+            assert site_burst['distinct_assets'] == 2
+            assert site_burst['alarms'] == 6
+            assert sorted(site_burst['assets']) == ['AST-SBURST-X', 'AST-SBURST-Y']
+            cluster_members = [site_burst['primary_alarm_id'], *site_burst['related_alarm_ids']]
+            assert sorted(cluster_members) == sorted(member_ids)
+            assert 'probable common upstream condition' in site_burst['rationale']
+
+            repeat = fetch(site_id)
+            assert repeat['site_bursts'][0]['correlation_id'] == \
+                site_burst['correlation_id']
+
+            elsewhere = fetch(quiet_site)
+            for cluster in elsewhere['bursts'] + elsewhere['groups']:
+                members = [cluster.get('primary_alarm_id'), *cluster.get('related_alarm_ids', [])]
+                assert not set(member_ids) & set(members)
+
+            unscoped = fetch(None)
+            unscoped_members = [
+                m for c in unscoped['site_bursts']
+                for m in [c['primary_alarm_id'], *c['related_alarm_ids']]
+            ]
+            assert set(member_ids) <= set(unscoped_members)
+    finally:
+        with db() as conn:
+            conn.execute("DELETE FROM operational_alarms WHERE alarm_no LIKE 'ALM-SBURST-%'")
+            for channel in (chan_x, chan_y, quiet_chan):
+                conn.execute('DELETE FROM telemetry_channels WHERE id=?', (channel,))
+            conn.execute("DELETE FROM assets WHERE asset_no LIKE 'AST-SBURST-%'")
+            for sid in (site_id, quiet_site):
+                conn.execute('DELETE FROM locations WHERE site_id=?', (sid,))
+                conn.execute('DELETE FROM sites WHERE id=?', (sid,))
+
+
+# ---------------------------------------------------------------------------
 # FMEA catalog listing
 # ---------------------------------------------------------------------------
 def test_fmea_catalog_listing_filters_and_pagination():

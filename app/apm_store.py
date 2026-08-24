@@ -337,6 +337,27 @@ def _cluster_attribution(alarms: list[dict]) -> dict:
     }
 
 
+def _sliding_time_clusters(
+    timed_pairs: list[tuple[datetime, dict]], window_seconds: int
+):
+    """Yield ``(i, j)`` index windows whose span fits ``window_seconds``.
+
+    ``timed_pairs`` must be sorted ascending by timestamp; each yielded window
+    is maximal, so consecutive windows never share an alarm.
+    """
+    times = [t for t, _alarm in timed_pairs]
+    i = 0
+    while i < len(times):
+        j = i
+        while (
+            j + 1 < len(times)
+            and (times[j + 1] - times[i]).total_seconds() <= window_seconds
+        ):
+            j += 1
+        yield i, j
+        i = j + 1
+
+
 def alarm_correlation_view(
     conn,
     *,
@@ -344,11 +365,12 @@ def alarm_correlation_view(
     burst_window_minutes: int = 15,
     burst_threshold: int = 5,
     site_id: Optional[int] = None,
+    site_burst_threshold: int = 8,
 ) -> dict:
     cutoff = _iso(datetime.now() - timedelta(hours=hours))
     alarm_sql = '''
         SELECT oa.*,tc.channel_code,tc.name channel_name,a.asset_no,a.name asset_name,
-                  s.name site_name
+                  s.site_code,s.name site_name
            FROM operational_alarms oa
            JOIN telemetry_channels tc ON tc.id=oa.channel_id
            JOIN assets a ON a.id=oa.asset_id
@@ -408,12 +430,7 @@ def alarm_correlation_view(
             ),
             key=lambda pair: (pair[0], int(pair[1]['id'])),
         )
-        times = [t for t, _a in timed]
-        i = 0
-        while i < len(times):
-            j = i
-            while j + 1 < len(times) and (times[j + 1] - times[i]).total_seconds() <= window_seconds:
-                j += 1
+        for i, j in _sliding_time_clusters(timed, window_seconds):
             count = j - i + 1
             if count >= burst_threshold:
                 window_alarms = [a for _t, a in timed[i:j + 1]]
@@ -421,15 +438,15 @@ def alarm_correlation_view(
                 channels = sorted({a['channel_code'] for a in window_alarms})
                 bursts.append({
                     'correlation_id': _correlation_id(
-                        'burst', asset_id, sample['site_id'], _iso(times[i]), _iso(times[j])
+                        'burst', asset_id, sample['site_id'], _iso(timed[i][0]), _iso(timed[j][0])
                     ),
                     **_cluster_attribution(window_alarms),
                     'asset_id': asset_id,
                     'asset_no': sample['asset_no'],
                     'site_name': sample.get('site_name'),
                     'alarms': count,
-                    'started_at': _iso(times[i]),
-                    'ended_at': _iso(times[j]),
+                    'started_at': _iso(timed[i][0]),
+                    'ended_at': _iso(timed[j][0]),
                     'channels': channels,
                     'probable_common_source': sample['asset_name'],
                     'rationale': (
@@ -438,7 +455,6 @@ def alarm_correlation_view(
                         f"probable common source is the shared asset/process"
                     ),
                 })
-            i = j + 1
     bursts.sort(key=lambda item: (-item['alarms'], item['asset_no']))
 
     groups = []
@@ -467,15 +483,70 @@ def alarm_correlation_view(
         })
     groups.sort(key=lambda item: (-item['alarm_count'], item['asset_no']))
 
+    # Site-level bursts: many alarms across DIFFERENT assets at one site in a
+    # tight window indicate a probable shared upstream condition (power feed,
+    # process header, comms). Single-asset clusters are already reported as
+    # asset bursts, so a site burst requires at least two distinct assets.
+    by_site: dict[int, list[dict]] = {}
+    for alarm in alarms:
+        if alarm['site_id'] is not None:
+            by_site.setdefault(int(alarm['site_id']), []).append(alarm)
+
+    site_bursts = []
+    for cluster_site_id, group in by_site.items():
+        timed = sorted(
+            (
+                (parsed, alarm)
+                for parsed, alarm in (
+                    (_parse_ts(entry['opened_at']), entry) for entry in group
+                )
+                if parsed
+            ),
+            key=lambda pair: (pair[0], int(pair[1]['id'])),
+        )
+        sample = group[0]
+        site_label = sample.get('site_name') or f"site {cluster_site_id}"
+        for i, j in _sliding_time_clusters(timed, window_seconds):
+            window_alarms = [a for _t, a in timed[i:j + 1]]
+            distinct_assets = {int(a['asset_id']) for a in window_alarms}
+            count = len(window_alarms)
+            if count < site_burst_threshold or len(distinct_assets) < 2:
+                continue
+            channels = sorted({a['channel_code'] for a in window_alarms})
+            assets = sorted({a['asset_no'] for a in window_alarms})
+            site_bursts.append({
+                'correlation_id': _correlation_id(
+                    'site_burst', cluster_site_id, _iso(timed[i][0]), _iso(timed[j][0])
+                ),
+                **_cluster_attribution(window_alarms),
+                'site_id': cluster_site_id,
+                'site_code': sample.get('site_code'),
+                'site_name': sample.get('site_name'),
+                'alarms': count,
+                'distinct_assets': len(distinct_assets),
+                'assets': assets,
+                'started_at': _iso(timed[i][0]),
+                'ended_at': _iso(timed[j][0]),
+                'channels': channels,
+                'rationale': (
+                    f"{count} alarms across {len(distinct_assets)} asset(s) at "
+                    f"{site_label} within {burst_window_minutes} minutes; "
+                    f"probable common upstream condition at the site"
+                ),
+            })
+    site_bursts.sort(key=lambda item: (-item['alarms'], item.get('site_code') or ''))
+
     return {
         'window_hours': hours,
         'total_alarms': len(alarms),
         'recurrence': recurrence[:50],
         'bursts': bursts[:50],
         'groups': groups[:50],
+        'site_bursts': site_bursts[:50],
         'burst_settings': {
             'window_minutes': burst_window_minutes,
             'threshold': burst_threshold,
+            'site_threshold': site_burst_threshold,
         },
     }
 
@@ -1066,6 +1137,7 @@ def install_apm_routes() -> None:
         burst_window_minutes: int = _application.Query(15, ge=1, le=240),
         burst_threshold: int = _application.Query(5, ge=2, le=100),
         site_id: Optional[int] = None,
+        site_burst_threshold: int = _application.Query(8, ge=2, le=500),
         user=Depends(current_user),
     ):
         with db() as conn:
@@ -1075,6 +1147,7 @@ def install_apm_routes() -> None:
                 burst_window_minutes=burst_window_minutes,
                 burst_threshold=burst_threshold,
                 site_id=site_id,
+                site_burst_threshold=site_burst_threshold,
             )
 
     @app.post('/api/reliability/cbm-evaluation')
