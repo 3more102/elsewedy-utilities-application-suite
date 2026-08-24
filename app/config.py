@@ -44,4 +44,4 @@ OUTBOX_MAX_ATTEMPTS = max(1, int(os.getenv('EUAS_OUTBOX_MAX_ATTEMPTS', '5')))
 # while their request is still in flight.
 OUTBOX_LEASE_SECONDS = max(10, int(os.getenv('EUAS_OUTBOX_LEASE_SECONDS', '30')))
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12

@@ -75,6 +75,85 @@ def _auth_v10_valid(conn, backend: str) -> bool:
     raise MigrationError(f'unsupported database backend: {backend}')
 
 
+def _site_customer_count_valid(conn, backend: str) -> bool:
+    if backend == 'sqlite':
+        present = {
+            str(row['name'] if hasattr(row, 'keys') else row[1])
+            for row in conn.execute('PRAGMA table_info(sites)').fetchall()
+        }
+        return 'customer_count' in present
+
+    if backend == 'postgresql':
+        rows = conn.execute(
+            '''SELECT column_name FROM information_schema.columns
+               WHERE table_schema=current_schema() AND table_name=?''',
+            ('sites',),
+        ).fetchall()
+        return 'customer_count' in {str(row['column_name']) for row in rows}
+
+    raise MigrationError(f'unsupported database backend: {backend}')
+
+
+def _apply_site_customer_count(conn) -> Optional[dict]:
+    from .database import _table_columns
+
+    if 'customer_count' not in _table_columns(conn, 'sites'):
+        conn.execute('ALTER TABLE sites ADD COLUMN customer_count INTEGER')
+    return None
+
+
+def _apm_condition_reliability_valid(conn, backend: str) -> bool:
+    required = {'cbm_recommendations', 'fmea_records'}
+    if backend == 'sqlite':
+        present = {
+            str(row['name'] if hasattr(row, 'keys') else row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        return required <= present
+
+    if backend == 'postgresql':
+        rows = conn.execute(
+            '''SELECT table_name FROM information_schema.tables
+               WHERE table_schema=current_schema()'''
+        ).fetchall()
+        present = {str(row[0] if not hasattr(row, 'keys') else row['table_name']) for row in rows}
+        return required <= present
+
+    raise MigrationError(f'unsupported database backend: {backend}')
+
+
+def _apply_apm_condition_reliability(conn) -> Optional[dict]:
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS cbm_recommendations(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, recommendation_no TEXT UNIQUE NOT NULL,
+          asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+          channel_id INTEGER REFERENCES telemetry_channels(id) ON DELETE SET NULL,
+          condition_type TEXT NOT NULL, severity TEXT NOT NULL,
+          evidence_json TEXT NOT NULL DEFAULT '{}', suggested_action TEXT NOT NULL DEFAULT '',
+          confidence TEXT NOT NULL DEFAULT 'deterministic', status TEXT NOT NULL DEFAULT 'Open',
+          work_order_id INTEGER REFERENCES work_orders(id),
+          created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL,
+          decided_at TEXT, decided_by INTEGER REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cbm_asset_status ON cbm_recommendations(asset_id,status);
+        CREATE INDEX IF NOT EXISTS idx_cbm_channel_status ON cbm_recommendations(channel_id,status);
+        CREATE TABLE IF NOT EXISTS fmea_records(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, fmea_no TEXT UNIQUE NOT NULL,
+          asset_id INTEGER REFERENCES assets(id) ON DELETE CASCADE,
+          function_text TEXT NOT NULL DEFAULT '', failure_mode TEXT NOT NULL,
+          failure_cause TEXT DEFAULT '', failure_effect TEXT DEFAULT '',
+          severity INTEGER NOT NULL, occurrence INTEGER NOT NULL, detection INTEGER NOT NULL,
+          rpn INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'Draft',
+          created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL, approved_by INTEGER REFERENCES users(id), approved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_fmea_asset ON fmea_records(asset_id,status);
+    ''')
+    return None
+
+
 def registered_migrations() -> tuple[Migration, ...]:
     from . import auth_store
 
@@ -85,6 +164,18 @@ def registered_migrations() -> tuple[Migration, ...]:
             auth_store.ensure_auth_schema,
             _auth_v10_valid,
             repairable=True,
+        ),
+        Migration(
+            11,
+            'site_customer_count',
+            _apply_site_customer_count,
+            _site_customer_count_valid,
+        ),
+        Migration(
+            12,
+            'apm_condition_reliability',
+            _apply_apm_condition_reliability,
+            _apm_condition_reliability_valid,
         ),
     )
 

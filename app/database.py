@@ -155,6 +155,8 @@ def _ensure_schema_columns(conn):
     cols=_table_columns(conn,'audit_logs')
     if 'prev_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN prev_hash TEXT DEFAULT ''")
     if 'audit_hash' not in cols: conn.execute("ALTER TABLE audit_logs ADD COLUMN audit_hash TEXT DEFAULT ''")
+    site_cols=_table_columns(conn,'sites')
+    if 'customer_count' not in site_cols: conn.execute('ALTER TABLE sites ADD COLUMN customer_count INTEGER')
 
 def _backfill_audit_chain(conn):
     prev=''
@@ -190,7 +192,7 @@ def init_db(hash_password):
         CREATE TABLE IF NOT EXISTS sites(
           id INTEGER PRIMARY KEY AUTOINCREMENT, site_code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
           region TEXT NOT NULL, city TEXT NOT NULL, site_type TEXT NOT NULL, latitude REAL, longitude REAL,
-          status TEXT NOT NULL DEFAULT 'Operating', manager TEXT DEFAULT ''
+          status TEXT NOT NULL DEFAULT 'Operating', manager TEXT DEFAULT '', customer_count INTEGER
         );
         CREATE TABLE IF NOT EXISTS locations(
           id INTEGER PRIMARY KEY AUTOINCREMENT, location_code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
@@ -502,6 +504,30 @@ def init_db(hash_password):
           prev_hash TEXT DEFAULT '', audit_hash TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_audit_chain ON audit_logs(id,audit_hash);
+        CREATE TABLE IF NOT EXISTS cbm_recommendations(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, recommendation_no TEXT UNIQUE NOT NULL,
+          asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+          channel_id INTEGER REFERENCES telemetry_channels(id) ON DELETE SET NULL,
+          condition_type TEXT NOT NULL, severity TEXT NOT NULL,
+          evidence_json TEXT NOT NULL DEFAULT '{}', suggested_action TEXT NOT NULL DEFAULT '',
+          confidence TEXT NOT NULL DEFAULT 'deterministic', status TEXT NOT NULL DEFAULT 'Open',
+          work_order_id INTEGER REFERENCES work_orders(id),
+          created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL,
+          decided_at TEXT, decided_by INTEGER REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cbm_asset_status ON cbm_recommendations(asset_id,status);
+        CREATE INDEX IF NOT EXISTS idx_cbm_channel_status ON cbm_recommendations(channel_id,status);
+        CREATE TABLE IF NOT EXISTS fmea_records(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, fmea_no TEXT UNIQUE NOT NULL,
+          asset_id INTEGER REFERENCES assets(id) ON DELETE CASCADE,
+          function_text TEXT NOT NULL DEFAULT '', failure_mode TEXT NOT NULL,
+          failure_cause TEXT DEFAULT '', failure_effect TEXT DEFAULT '',
+          severity INTEGER NOT NULL, occurrence INTEGER NOT NULL, detection INTEGER NOT NULL,
+          rpn INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'Draft',
+          created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL, approved_by INTEGER REFERENCES users(id), approved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_fmea_asset ON fmea_records(asset_id,status);
         ''')
         _ensure_schema_columns(conn)
         _backfill_audit_chain(conn)
