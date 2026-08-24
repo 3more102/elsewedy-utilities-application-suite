@@ -4,6 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INDEX = ROOT / 'static' / 'index.html'
 SCRIPT = ROOT / 'static' / 'dashboard-canonical-snapshot.js'
+INTELLIGENCE = ROOT / 'static' / 'dashboard-enhancements.js'
 SW = ROOT / 'static' / 'sw.js'
 
 
@@ -36,3 +37,14 @@ def test_canonical_snapshot_adapter_uses_one_authoritative_surface_without_fake_
     assert "['Maintenance Cost', {path: 'costs.maintenance_cost_window'" in script
     assert "card.dataset.canonicalSnapshot = 'true'" in script
     assert "S.cache.canonicalExecutive = snapshot" in script
+
+
+def test_dashboard_intelligence_and_snapshot_target_primary_grid_not_command_strip():
+    snapshot = SCRIPT.read_text(encoding='utf-8')
+    intelligence = INTELLIGENCE.read_text(encoding='utf-8')
+    primary_selector = ".kpi-grid:not(.strip-kpis)"
+
+    assert f"content.querySelector('{primary_selector}')" in snapshot
+    assert "grid.querySelectorAll(':scope > .kpi')" in snapshot
+    assert f"content.querySelector('{primary_selector}')" in intelligence
+    assert "const grid = content.querySelector('.kpi-grid');" not in intelligence
