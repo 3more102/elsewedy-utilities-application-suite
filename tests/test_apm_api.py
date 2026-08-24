@@ -643,6 +643,55 @@ def _add_site_alarm(
 
 
 # ---------------------------------------------------------------------------
+# Watchlist data-quality transparency
+# ---------------------------------------------------------------------------
+def test_watchlist_can_surface_insufficient_history_channels():
+    headers = _login('planner', 'Planner@2026')
+    with db() as conn:
+        site_id, loc_id = _make_scoped_site(conn, 'INSUF-A')
+        asset_id = _make_site_asset(conn, 'AST-INSUF-A', loc_id)
+        starving = _make_channel(conn, 'TEL-INSUF-A-STARVE', asset_id, warning_high=80)
+        healthy = _make_channel(conn, 'TEL-INSUF-A-FED', asset_id, warning_high=80)
+        # Two readings: not enough history for any trend verdict.
+        _add_readings(conn, starving, [50.0, 51.0])
+        _add_readings(conn, healthy, [55, 62, 68, 75, 82, 86])
+        conn.commit()
+    try:
+        with TestClient(app) as client:
+            default_view = client.get(
+                f'/api/reliability/deterioration-watchlist?site_id={site_id}',
+                headers=headers,
+            )
+            assert default_view.status_code == 200, default_view.text
+            default_entries = {item['channel_code'] for item in default_view.json()}
+            assert default_entries == {'TEL-INSUF-A-FED'}
+
+            transparent = client.get(
+                f'/api/reliability/deterioration-watchlist'
+                f'?site_id={site_id}&include_insufficient=true',
+                headers=headers,
+            )
+            assert transparent.status_code == 200, transparent.text
+            by_code = {item['channel_code']: item for item in transparent.json()}
+            assert set(by_code) == {'TEL-INSUF-A-FED', 'TEL-INSUF-A-STARVE'}
+            starved = by_code['TEL-INSUF-A-STARVE']
+            assert starved['level'] == 'insufficient_data'
+            assert starved['readings'] == 2
+            assert any('insufficient history' in s for s in starved['signals'])
+            # Flagged channels still rank before insufficient-data entries.
+            codes = [item['channel_code'] for item in transparent.json()]
+            assert codes.index('TEL-INSUF-A-FED') < codes.index('TEL-INSUF-A-STARVE')
+    finally:
+        with db() as conn:
+            for channel in (starving, healthy):
+                conn.execute('DELETE FROM telemetry_readings WHERE channel_id=?', (channel,))
+                conn.execute('DELETE FROM telemetry_channels WHERE id=?', (channel,))
+            conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))
+            conn.execute('DELETE FROM locations WHERE site_id=?', (site_id,))
+            conn.execute('DELETE FROM sites WHERE id=?', (site_id,))
+
+
+# ---------------------------------------------------------------------------
 # Site scoping across reliability reads
 # ---------------------------------------------------------------------------
 def test_reliability_reads_honor_site_scope():

@@ -259,10 +259,12 @@ def portfolio_risk_view(conn, site_id=None) -> dict:
 # Deterioration watchlist
 # ---------------------------------------------------------------------------
 def deterioration_watchlist_view(
-    conn, *, window_days: int = 30, min_points: int = 4, site_id: Optional[int] = None
+    conn, *, window_days: int = 30, min_points: int = 4,
+    site_id: Optional[int] = None, include_insufficient: bool = False
 ) -> list[dict]:
     cutoff = _iso(datetime.now() - timedelta(days=window_days))
     watchlist = []
+    insufficient: list[dict] = []
     channels_sql = '''
        SELECT tc.*,a.asset_no,a.name asset_name,s.name site_name
        FROM telemetry_channels tc
@@ -291,24 +293,47 @@ def deterioration_watchlist_view(
             'warning_high': channel.get('warning_high'),
             'critical_high': channel.get('critical_high'),
         }, min_points=min_points)
-        if verdict['level'] == 'none':
-            continue
-        watchlist.append({
-            'asset_id': channel['asset_id'],
-            'asset_no': channel['asset_no'],
-            'asset_name': channel['asset_name'],
-            'site_name': channel.get('site_name'),
-            'channel_id': channel['id'],
-            'channel_code': channel['channel_code'],
-            'channel_name': channel['name'],
-            'unit': channel['unit'],
-            'level': verdict['level'],
-            'signals': verdict['signals'],
-            'trend_state': verdict['trend']['state'],
-            'readings': verdict['excursions']['readings'],
-        })
+        if verdict['level'] != 'none':
+            watchlist.append({
+                'asset_id': channel['asset_id'],
+                'asset_no': channel['asset_no'],
+                'asset_name': channel['asset_name'],
+                'site_name': channel.get('site_name'),
+                'channel_id': channel['id'],
+                'channel_code': channel['channel_code'],
+                'channel_name': channel['name'],
+                'unit': channel['unit'],
+                'level': verdict['level'],
+                'signals': verdict['signals'],
+                'trend_state': verdict['trend']['state'],
+                'readings': verdict['excursions']['readings'],
+            })
+        elif (
+            include_insufficient
+            and verdict['trend']['state'] == 'insufficient_data'
+        ):
+            insufficient.append({
+                'asset_id': channel['asset_id'],
+                'asset_no': channel['asset_no'],
+                'asset_name': channel['asset_name'],
+                'site_name': channel.get('site_name'),
+                'channel_id': channel['id'],
+                'channel_code': channel['channel_code'],
+                'channel_name': channel['name'],
+                'unit': channel['unit'],
+                'level': 'insufficient_data',
+                'signals': [
+                    f"insufficient history: {verdict['trend']['points']} reading(s) "
+                    f"in the last {window_days} days "
+                    f"(minimum {min_points} required for a trend verdict)"
+                ],
+                'trend_state': verdict['trend']['state'],
+                'readings': verdict['trend']['points'],
+            })
     order = {'severe': 0, 'adverse': 1}
     watchlist.sort(key=lambda item: (order[item['level']], item['asset_no'], item['channel_code']))
+    if include_insufficient:
+        watchlist.extend(insufficient)
     return watchlist
 
 
@@ -1124,11 +1149,13 @@ def install_apm_routes() -> None:
     def deterioration_watchlist_route(
         window_days: int = _application.Query(30, ge=1, le=365),
         site_id: Optional[int] = None,
+        include_insufficient: bool = False,
         user=Depends(current_user),
     ):
         with db() as conn:
             return deterioration_watchlist_view(
-                conn, window_days=window_days, site_id=site_id
+                conn, window_days=window_days, site_id=site_id,
+                include_insufficient=include_insufficient,
             )
 
     @app.get('/api/reliability/alarm-correlation')
