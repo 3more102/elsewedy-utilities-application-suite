@@ -92,7 +92,7 @@
   }
 
   function formatMagnitude(value, unit = '') {
-    if (value == null) return unit || 'Observed';
+    if (value == null) return '—';
     const rendered = formatNumber(value);
     if (unit === 'currency') {
       return new Intl.NumberFormat('en-US', {
@@ -465,6 +465,7 @@
       if (!card.isConnected || !executiveDashboardVisible()) return;
 
       const values = (Array.isArray(data.samples) ? data.samples : [])
+        .filter(sample => sample && sample.value != null)
         .map(sample => Number(sample.value))
         .filter(Number.isFinite);
       const state = trendState(data, values);
