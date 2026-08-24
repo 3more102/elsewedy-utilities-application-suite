@@ -6,7 +6,7 @@ import io
 import json
 from typing import Optional
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from . import application as _application
@@ -22,7 +22,7 @@ def _get_or_404(conn, sql, args, message):
     return _application.get_or_404(conn, sql, args, message)
 
 
-def list_assets_view(conn, q: str, condition: str, status: str, site_id, sort: str):
+def list_assets_view(conn, q: str, condition: str, status: str, site_id, sort: str, limit: int, offset: int):
     allowed = {
         'asset_no': 'a.asset_no',
         'name': 'a.name',
@@ -46,7 +46,8 @@ def list_assets_view(conn, q: str, condition: str, status: str, site_id, sort: s
     if site_id:
         sql += ' AND s.id=?'
         args.append(site_id)
-    sql += f' ORDER BY {order}'
+    sql += f' ORDER BY {order}, a.id LIMIT ? OFFSET ?'
+    args += [limit, offset]
     return _rows(conn.execute(sql, args))
 
 
@@ -302,10 +303,12 @@ def install_asset_routes() -> None:
         status: str = '',
         site_id: Optional[int] = None,
         sort: str = 'asset_no',
+        limit: int = Query(200, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
         user=Depends(current_user),
     ):
         with db() as conn:
-            return list_assets_view(conn, q, condition, status, site_id, sort)
+            return list_assets_view(conn, q, condition, status, site_id, sort, limit, offset)
 
     @app.get('/api/assets-export.csv')
     def export_assets_route(user=Depends(current_user)):
