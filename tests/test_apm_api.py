@@ -810,6 +810,58 @@ def test_alarm_correlation_identifiers_stable_attributed_and_scoped():
 
 
 # ---------------------------------------------------------------------------
+# CBM list pagination
+# ---------------------------------------------------------------------------
+def test_cbm_pagination_is_additive_and_validated():
+    manager = _login('seif', 'EUAS@2026')
+    with db() as conn:
+        asset_id = _make_asset(conn, 'AST-APM-CBMPG')
+        seeded = []
+        for index in range(5):
+            cur = conn.execute(
+                '''INSERT INTO cbm_recommendations(
+                     recommendation_no,asset_id,condition_type,severity,
+                     evidence_json,suggested_action,confidence,status,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)''',
+                (
+                    f'CBM-PG-{index}', asset_id, 'trend_deterioration', 'High',
+                    '{}', 'Inspect channel', 'deterministic', 'Open', now(),
+                ),
+            )
+            seeded.append(int(cur.lastrowid))
+        conn.commit()
+    try:
+        with TestClient(app) as client:
+            base = f'/api/reliability/cbm-recommendations?asset_id={asset_id}'
+
+            default_view = client.get(base, headers=manager).json()
+            assert set(seeded) <= {row['id'] for row in default_view}
+
+            page_one = client.get(f'{base}&limit=2', headers=manager).json()
+            page_two = client.get(f'{base}&limit=2&offset=2', headers=manager).json()
+            assert len(page_one) == 2 and len(page_two) == 2
+            ids_one = [row['id'] for row in page_one]
+            ids_two = [row['id'] for row in page_two]
+            assert not set(ids_one) & set(ids_two)
+
+            # Exact windows of the canonical status-ordered, id-tiebroken sequence.
+            full = client.get(f'{base}&limit=1000', headers=manager).json()
+            expected = [row['id'] for row in full if row['id'] in seeded]
+            assert expected == sorted(seeded, reverse=True)
+            assert ids_one + ids_two == expected[:4]
+
+            for params in ({'limit': 0}, {'limit': 1001}, {'offset': -1}):
+                response = client.get(
+                    '/api/reliability/cbm-recommendations', headers=manager, params=params
+                )
+                assert response.status_code == 422, params
+    finally:
+        with db() as conn:
+            conn.execute('DELETE FROM cbm_recommendations WHERE asset_id=?', (asset_id,))
+            conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))
+
+
+# ---------------------------------------------------------------------------
 # FMEA catalog listing
 # ---------------------------------------------------------------------------
 def test_fmea_catalog_listing_filters_and_pagination():

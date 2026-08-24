@@ -1089,6 +1089,8 @@ def install_apm_routes() -> None:
         status: str = '',
         asset_id: Optional[int] = None,
         site_id: Optional[int] = None,
+        limit: int = _application.Query(200, ge=1, le=1000),
+        offset: int = _application.Query(0, ge=0),
         user=Depends(current_user),
     ):
         with db() as conn:
@@ -1108,7 +1110,11 @@ def install_apm_routes() -> None:
             if site_id is not None:
                 sql += ' AND l.site_id=?'
                 args.append(site_id)
-            sql += ' ORDER BY CASE r.status WHEN \'Open\' THEN 0 WHEN \'Reviewed\' THEN 1 ELSE 2 END, r.id DESC LIMIT 200'
+            sql += (
+                ' ORDER BY CASE r.status WHEN \'Open\' THEN 0 WHEN \'Reviewed\' THEN 1'
+                ' ELSE 2 END, r.id DESC LIMIT ? OFFSET ?'
+            )
+            args.extend([limit, offset])
             return _rows(conn.execute(sql, args))
 
     @app.post('/api/reliability/cbm-recommendations/{recommendation_id}/convert-to-work-order')
