@@ -504,6 +504,16 @@ def init_db(hash_password):
           prev_hash TEXT DEFAULT '', audit_hash TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_audit_chain ON audit_logs(id,audit_hash);
+        CREATE TABLE IF NOT EXISTS kpi_snapshot(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          scope_key TEXT NOT NULL,
+          window_key TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          source_latest_at TEXT,
+          calculated_at TEXT NOT NULL,
+          UNIQUE(scope_key,window_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_kpi_snapshot_scope ON kpi_snapshot(scope_key,calculated_at);
         CREATE TABLE IF NOT EXISTS cbm_recommendations(
           id INTEGER PRIMARY KEY AUTOINCREMENT, recommendation_no TEXT UNIQUE NOT NULL,
           asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,

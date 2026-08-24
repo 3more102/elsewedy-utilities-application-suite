@@ -49,8 +49,11 @@ def test_outage_pagination_is_deterministic_and_additive():
         total = 7
         _seed_outages(client, headers, total, int(asset['id']))
 
-        # Legacy-shaped request (filters only) still works and is bounded by
-        # the same default convention as /api/alarms.
+        # Scope every page to the seeded asset: the shared suite database may
+        # hold newer outages from other fixtures, and pagination must remain
+        # deterministic per filtered scope (filters compose with paging).
+        scope = {'asset_id': int(asset['id'])}
+
         default_view = _paged(client, headers)
         assert len(default_view) <= 200
         seeded_ids = {
@@ -59,15 +62,15 @@ def test_outage_pagination_is_deterministic_and_additive():
         }
         assert seeded_ids.issubset({x['id'] for x in default_view})
 
-        page_one = _paged(client, headers, limit=3, offset=0)
-        page_two = _paged(client, headers, limit=3, offset=3)
+        page_one = _paged(client, headers, **scope, limit=3, offset=0)
+        page_two = _paged(client, headers, **scope, limit=3, offset=3)
         assert len(page_one) == 3 and len(page_two) == 3
 
         ids_one = [x['id'] for x in page_one]
         ids_two = [x['id'] for x in page_two]
         assert not set(ids_one) & set(ids_two)
 
-        full = _paged(client, headers, limit=1000, offset=0)
+        full = _paged(client, headers, **scope, limit=1000, offset=0)
         mine = [x for x in full if x['asset_id'] == asset['id']]
         assert [x['id'] for x in mine] == ids_one + ids_two + [
             x['id'] for x in mine[6:]
@@ -76,6 +79,26 @@ def test_outage_pagination_is_deterministic_and_additive():
         # Deterministic ordering: newest start first, unique id tie-breaker.
         starts = [(x['start_at'], x['id']) for x in mine]
         assert starts == sorted(starts, reverse=True)
+
+
+def test_outage_pagination_is_stable_across_foreign_rows():
+    """Foreign outages must not shift a scoped page's contents."""
+    with TestClient(app) as client:
+        headers = _auth(client)
+        assets = client.get('/api/assets', headers=headers).json()
+        asset = next(x for x in assets)
+        other = next(x for x in assets if x['id'] != asset['id'])
+        with db() as conn:
+            conn.execute('DELETE FROM asset_outages WHERE asset_id=?', (asset['id'],))
+            conn.execute('DELETE FROM asset_outages WHERE asset_id=?', (other['id'],))
+        _seed_outages(client, headers, 2, int(asset['id']))
+
+        before = _paged(client, headers, asset_id=int(asset['id']), limit=1000)
+        _seed_outages(client, headers, 1, int(other['id']))
+        after = _paged(
+            client, headers, asset_id=int(asset['id']), limit=1000
+        )
+        assert [x['id'] for x in after] == [x['id'] for x in before]
 
 
 def test_outage_pagination_validates_bounds():
