@@ -225,6 +225,9 @@ def source_watermark(conn) -> Optional[str]:
              UNION ALL SELECT MAX(start_at) FROM asset_outages
              UNION ALL SELECT MAX(opened_at) FROM operational_alarms
              UNION ALL SELECT MAX(last_seen_at) FROM operational_alarms
+             UNION ALL SELECT MAX(acknowledged_at) FROM operational_alarms
+             UNION ALL SELECT MAX(cleared_at) FROM operational_alarms
+             UNION ALL SELECT MAX(closed_at) FROM operational_alarms
              UNION ALL SELECT MAX(captured_at) FROM telemetry_readings
              UNION ALL SELECT MAX(ingested_at) FROM telemetry_readings
              UNION ALL SELECT MAX(updated_at) FROM telemetry_channels
@@ -696,12 +699,36 @@ def compute_condition_kpis(conn, f: ExecutiveFilters) -> dict:
         ' LEFT JOIN sites s ON s.id=l.site_id WHERE 1=1' + scope_sql + ')',
         scope_args + scope_args).fetchone()[0]
 
+    # Record-level contributors for explanation/adapters: most severe active
+    # alarms first, then by recurrence, then age. One bounded query.
+    contributors = _rows(conn.execute(
+        'SELECT oa.id alarm_id, oa.alarm_no, oa.severity, oa.status,'
+        ' oa.occurrence_count, oa.opened_at, oa.last_seen_at,'
+        ' tc.channel_code, tc.name channel_name,'
+        ' a.id asset_id, a.asset_no, a.name asset_name,'
+        ' s.id site_id, s.site_code, s.name site_name'
+        ' FROM operational_alarms oa JOIN telemetry_channels tc ON tc.id=oa.channel_id'
+        ' JOIN assets a ON a.id=oa.asset_id'
+        ' LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id'
+        ' WHERE ' + active_where + scope_sql +
+        ' ORDER BY CASE oa.severity WHEN \'Critical\' THEN 0 ELSE 1 END,'
+        ' oa.status=\'Open\' DESC, oa.occurrence_count DESC, oa.opened_at DESC'
+        ' LIMIT 10', scope_args))
+    for c_row in contributors:
+        try:
+            opened = datetime.fromisoformat(str(c_row['opened_at'])[:19])
+            c_row['hours_open'] = round(
+                max(0.0, (datetime.now() - opened).total_seconds() / 3600.0), 2)
+        except (TypeError, ValueError):
+            c_row['hours_open'] = None
+
     return {
         'active_alarms': active,
         'critical_active_alarms': critical,
         'unacknowledged_alarms': unacknowledged,
         'alarm_storms': storms,
         'repeated_alarm_assets': repeated_assets,
+        'contributors': contributors,
         'latest_source_timestamp': latest_source,
     }
 
