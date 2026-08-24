@@ -1657,10 +1657,16 @@ def _recalculate_project_progress(conn, project_id:int):
 
 # ---------- projects ----------
 @app.get('/api/projects')
-def list_projects(user=Depends(current_user)):
+def list_projects(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
     with db() as conn:
-        ps=rows(conn.execute('''SELECT p.*,u.full_name manager_name,s.name site_name FROM projects p LEFT JOIN users u ON u.id=p.manager_id LEFT JOIN sites s ON s.id=p.site_id ORDER BY p.id DESC'''))
-        for p in ps:p['tasks']=rows(conn.execute('SELECT t.*,u.full_name owner_name FROM project_tasks t LEFT JOIN users u ON u.id=t.owner_id WHERE project_id=? ORDER BY id',(p['id'],)))
+        ps=rows(conn.execute('''SELECT p.*,u.full_name manager_name,s.name site_name FROM projects p LEFT JOIN users u ON u.id=p.manager_id LEFT JOIN sites s ON s.id=p.site_id ORDER BY p.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
+        if ps:
+            # One batched task fetch per page instead of one query per project.
+            ids=[p['id'] for p in ps];marks=','.join('?'*len(ids))
+            by_project={}
+            for t in rows(conn.execute(f'SELECT t.*,u.full_name owner_name FROM project_tasks t LEFT JOIN users u ON u.id=t.owner_id WHERE t.project_id IN ({marks}) ORDER BY t.id',ids)):
+                by_project.setdefault(t['project_id'],[]).append(t)
+            for p in ps:p['tasks']=by_project.get(p['id'],[])
         return ps
 @app.post('/api/projects')
 def create_project(body:ProjectIn,user=Depends(require_roles(*PROJECT_ROLES))):
@@ -1698,8 +1704,8 @@ def create_vendor(body:VendorIn,user=Depends(require_roles('admin','procurement'
     with db() as conn:
         code=body.vendor_code or next_no(conn,'vendors','vendor_code','VND-',100);cur=conn.execute('INSERT INTO vendors(vendor_code,name,category,contact_person,email,phone,status) VALUES(?,?,?,?,?,?,?)',(code,body.name,body.category,body.contact_person,body.email,body.phone,body.status));audit(conn,user['id'],'CREATE','Vendors',code,'',body.model_dump());return {'id':cur.lastrowid,'vendor_code':code}
 @app.get('/api/contracts')
-def contracts(user=Depends(current_user)):
-    with db() as conn:return rows(conn.execute('SELECT c.*,v.name vendor_name FROM contracts c LEFT JOIN vendors v ON v.id=c.vendor_id ORDER BY c.id DESC'))
+def contracts(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
+    with db() as conn:return rows(conn.execute('SELECT c.*,v.name vendor_name FROM contracts c LEFT JOIN vendors v ON v.id=c.vendor_id ORDER BY c.id DESC LIMIT ? OFFSET ?',(limit,offset)))
 @app.post('/api/contracts')
 def create_contract(body:ContractIn,user=Depends(require_roles('admin','procurement','maintenance_manager'))):
     with db() as conn:
