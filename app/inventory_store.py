@@ -124,6 +124,8 @@ install_approval_routes()
 install_asset_routes()
 from .apm_store import install_apm_routes
 install_apm_routes()
+from .operations_store import install_operations_routes
+install_operations_routes()
 install_reservation_routes()
 install_workflow_transition_routes()
 install_dispatch_assignment_route()
