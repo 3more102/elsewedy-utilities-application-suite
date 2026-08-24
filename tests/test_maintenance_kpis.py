@@ -75,47 +75,80 @@ def test_maintenance_kpi_math_is_exact():
     with TestClient(app):
         suffix = uuid.uuid4().hex[:6]
         with db() as conn:
-            open_normal = _seed_wo(conn, priority='Medium', estimated_hours=8, created_days_ago=3)
-            overdue_emergency = _seed_wo(
-                conn, priority='Emergency', estimated_hours=6,
-                target_finish=(date.today() - timedelta(days=5)).isoformat(), created_days_ago=20,
+            # Dedicated site/asset scope: other suites' work orders cannot
+            # leak into a fully scoped computation.
+            site = conn.execute(
+                '''INSERT INTO sites(site_code,name,region,city,site_type)
+                   VALUES(?,?,?,?,?)''',
+                (f'MKP-{suffix}'.upper(), f'Maint KPI site {suffix}',
+                 'Greater Cairo', 'Cairo', 'Electrical Substation'),
             )
-            overdue_critical = _seed_wo(
-                conn, priority='Critical', estimated_hours=2,
-                target_finish=(date.today() - timedelta(days=2)).isoformat(), created_days_ago=10,
+            site_id = int(site.lastrowid)
+            location = conn.execute(
+                '''INSERT INTO locations(location_code,name,location_type,site_id)
+                   VALUES(?,?,?,?)''',
+                (f'LMKP-{suffix}'.upper(), f'Maint KPI bay {suffix}', 'Area',
+                 int(site.lastrowid)),
+            )
+            stamp = now()
+            asset = conn.execute(
+                '''INSERT INTO assets(asset_no,name,category,criticality,condition,
+                                      status,location_id,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)''',
+                (f'AST-MKP-{suffix.upper()}', f'Maint KPI asset {suffix}',
+                 'Transformer', 'Critical', 'Good', 'Operating',
+                 int(location.lastrowid), stamp, stamp),
+            )
+            asset_id = int(asset.lastrowid)
+
+            def _seed_scoped_wo(**kwargs):
+                wo_id = _seed_wo(conn, **kwargs)
+                conn.execute('UPDATE work_orders SET asset_id=? WHERE id=?',
+                             (asset_id, wo_id))
+                return wo_id
+
+            _seed_scoped_wo(priority='Medium', estimated_hours=8, created_days_ago=3)
+            overdue_emergency = _seed_scoped_wo(
+                priority='Emergency', estimated_hours=6,
+                target_finish=(date.today() - timedelta(days=5)).isoformat(),
+                created_days_ago=20,
+            )
+            overdue_critical = _seed_scoped_wo(
+                priority='Critical', estimated_hours=2,
+                target_finish=(date.today() - timedelta(days=2)).isoformat(),
+                created_days_ago=10,
             )
             # Completed within the window feeds weekly capacity.
-            _seed_wo(conn, status='Completed', actual_hours=30,
-                     actual_finish=now(), created_days_ago=7)
+            _seed_scoped_wo(status='Completed', actual_hours=30,
+                            actual_finish=now(), created_days_ago=7)
 
         with db() as conn:
-            result = compute_maintenance_kpis(conn, period_days=28)
+            result = compute_maintenance_kpis(conn, period_days=28, site_id=site_id)
+
+        kpis = result['kpis']
+        # Scoped computation sees exactly the four probe work orders.
+        assert kpis['open_work_orders']['value'] == 3.0
+        assert kpis['emergency_work_orders']['value'] == 1.0
+        assert kpis['high_criticality_backlog']['value'] == 2.0
+        assert kpis['backlog_hours']['value'] == 16.0
+
+        contributors = {c['wo_no']: c for c in result['contributors']}
+        assert len(result['contributors']) == 2  # exactly the two overdue probes
+        emergency_row = next(c for c in result['contributors']
+                             if c['priority'] == 'Emergency')
+        assert emergency_row['days_overdue'] == 5
+        with db() as conn:
             probe_wos = {
                 conn.execute('SELECT wo_no FROM work_orders WHERE id=?', (i,)).fetchone()[0]
                 for i in (overdue_emergency, overdue_critical)
             }
-
-        kpis = result['kpis']
-        # Baseline counts include seeded catalog data; probe rows must be
-        # reflected exactly in the deltas we control.
-        assert kpis['open_work_orders']['value'] >= 3
-        assert kpis['emergency_work_orders']['value'] >= 1
-        assert kpis['high_criticality_backlog']['value'] >= 2
-        assert kpis['backlog_hours']['value'] >= 16.0
-
-        contributors = {c['wo_no']: c for c in result['contributors']}
-        emergency_row = next(
-            c for c in result['contributors'] if c['priority'] == 'Emergency'
-        )
-        assert emergency_row['days_overdue'] == 5
-        assert set(contributors).issuperset(probe_wos)
-        # Risk-weighted ranking: the emergency job outranks the critical one.
+        assert set(contributors) == probe_wos
+        # Risk-weighted ranking: emergency (25 weight) outranks critical (8).
         priorities = [c['priority'] for c in result['contributors']]
-        if 'Emergency' in priorities and 'Critical' in priorities:
-            assert priorities.index('Emergency') < priorities.index('Critical')
+        assert priorities.index('Emergency') < priorities.index('Critical')
 
-        assert result['weekly_completion_hours'] >= 30 / 4
-        assert result['resolved_in_window'] >= 1
+        assert result['weekly_completion_hours'] == 30 / 4
+        assert result['resolved_in_window'] == 1
 
 
 def test_completion_sla_pct_contract():
