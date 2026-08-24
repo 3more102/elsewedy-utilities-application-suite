@@ -16,7 +16,7 @@ from .audit_verification import AuditIntegrityError, replay_audit_history, verif
 from .auth import hash_password, verify_password, current_user, require_roles
 from .kpi_engine import (KPI_PROVIDERS, DIRECTIONS, evaluate_status, evaluate_kpi, compute_kpi,
                          window_bounds, _sustained_customer_interruptions, _customers_served,
-                         backlog_risk_rows)
+                         backlog_risk_rows, kpi_stale, explain_kpi_variance)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1179,6 +1179,13 @@ def _kpi_payload(conn,d):
     out['active']=bool(out.get('active'))
     snap=_kpi_latest_snapshot(conn,d['id'])
     out['latest']=snap
+    out['stale']=kpi_stale(d,snap)
+    if snap:
+        value=snap['value'];prev=snap['previous_value']
+        out['variance_absolute']=(round(float(value)-float(prev),4) if value is not None and prev is not None else None)
+        out['variance_pct']=snap['change_pct']
+    else:
+        out['variance_absolute']=None;out['variance_pct']=None
     out['source_supported']=d['source_key'] in KPI_PROVIDERS
     return out
 
@@ -1258,6 +1265,19 @@ def kpi_history(kpi_id:int,limit:int=Query(60,ge=1,le=500),user=Depends(require_
         snaps=rows(conn.execute('SELECT * FROM kpi_snapshots WHERE kpi_id=? ORDER BY id DESC LIMIT ?',(kpi_id,limit)))
         return {'kpi':d['code'],'history':snaps}
 
+@app.get('/api/kpis/{kpi_id}/trend')
+def kpi_trend(kpi_id:int,samples:int=Query(30,ge=2,le=200),user=Depends(require_roles(*KPI_READ_ROLES))):
+    """Chronological snapshot samples for dashboard sparklines (oldest first)."""
+    with db() as conn:
+        d=_kpi_or_404(conn,kpi_id)
+        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
+        snaps=rows(conn.execute('''SELECT id,value,status,trend,change_pct,period_start,period_end,calculated_at
+            FROM kpi_snapshots WHERE kpi_id=? ORDER BY id DESC LIMIT ?''',(kpi_id,samples)))
+        series=list(reversed(snaps))
+        values=[s['value'] for s in series if s['value'] is not None]
+        return {'kpi':d['code'],'unit':d['unit'],'direction':d['direction'],'stale':kpi_stale(d,_kpi_latest_snapshot(conn,kpi_id)),
+                'samples':series,'min':min(values) if values else None,'max':max(values) if values else None}
+
 @app.post('/api/kpis/{kpi_id}/recalculate')
 def kpi_recalculate(kpi_id:int,body:Optional[KPIRecalcIn]=None,user=Depends(require_roles(*KPI_RECALC_ROLES))):
     body=body or KPIRecalcIn()
@@ -1307,6 +1327,17 @@ def kpi_drilldown(kpi_id:int,as_of:Optional[str]=None,user=Depends(require_roles
         persisted=_kpi_latest_snapshot(conn,kpi_id)
         return {'kpi':d['code'],'live':{'value':result['value'],'status':evaluate_status(result['value'],d['caution_value'],d['alert_value'],d['direction'])},
                 'last_snapshot':persisted,'drilldown':_kpi_drilldown_payload(conn,d,result)}
+
+@app.get('/api/kpis/{kpi_id}/explanation')
+def kpi_explanation(kpi_id:int,as_of:Optional[str]=None,user=Depends(require_roles(*KPI_READ_ROLES))):
+    """Period-over-period causal evidence: what changed, which records moved."""
+    with db() as conn:
+        d=_kpi_or_404(conn,kpi_id)
+        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
+        try:
+            return explain_kpi_variance(conn,d,as_of=as_of)
+        except ValueError as exc:
+            raise HTTPException(422,str(exc))
 
 # ---------- risk-weighted backlog ----------
 @app.get('/api/backlog/risk-weighted')

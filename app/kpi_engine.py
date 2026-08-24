@@ -648,6 +648,100 @@ def get_snapshot(conn, snapshot_id: int):
     return dict(conn.execute('SELECT * FROM kpi_snapshots WHERE id=?', (snapshot_id,)).fetchone())
 
 
+def kpi_stale(definition, latest_snapshot, now_dt=None):
+    """A KPI is stale when it has never been calculated or its latest result is
+    older than twice its own refresh interval (floor 30 minutes)."""
+    if latest_snapshot is None:
+        return True
+    try:
+        calculated = datetime.fromisoformat(str(latest_snapshot['calculated_at'])[:19])
+    except (TypeError, ValueError):
+        return True
+    now_dt = now_dt or datetime.now()
+    interval_minutes = max(5, int(definition['refresh_minutes'] or 60))
+    age_minutes = (now_dt - calculated).total_seconds() / 60.0
+    return age_minutes > max(30, 2 * interval_minutes)
+
+
+def explain_kpi_variance(conn, definition, as_of: str | None = None):
+    """Explain a KPI's movement against the immediately preceding window.
+
+    Recomputes the metric for the current window and for the equally sized
+    window before it, then diffs contributor records by identity. Point-in-time
+    metrics (backlogs, alarms) are evaluated as-of each window end, so the
+    comparison answers 'what changed between then and now' without fabricating
+    causality: contributors are reported as newly appeared or newly resolved
+    evidence, never as asserted cause.
+    """
+    window_days = int(definition['time_window_days'] or 30)
+    end_day = date.fromisoformat(as_of) if as_of else date.today()
+    cur_start, cur_end = window_bounds(window_days, end_day.isoformat())
+    prev_end_day = end_day - timedelta(days=max(1, window_days))
+    prev_start, prev_end = window_bounds(window_days, prev_end_day.isoformat())
+
+    def _ctx(win_start, win_end):
+        try:
+            scope = json.loads(definition['scope_json'] or '{}')
+        except (TypeError, ValueError):
+            scope = {}
+        return {'source_key': str(definition['source_key']), 'window_days': window_days,
+                'window_start': win_start, 'window_end': win_end,
+                'scope': scope if isinstance(scope, dict) else {}, 'filters': definition.get('filters_json')}
+
+    current = compute_kpi(conn, definition, as_of=cur_end)
+    previous = compute_kpi(conn, definition, as_of=prev_end)
+
+    def _key(c):
+        return (c.get('record_type'), c.get('record_id'), c.get('record_code'))
+
+    cur_map = {_key(c): c for c in current['contributors']}
+    prev_map = {_key(c): c for c in previous['contributors']}
+    new_contributors = [cur_map[k] for k in cur_map if k not in prev_map]
+    resolved_contributors = [prev_map[k] for k in prev_map if k not in cur_map]
+
+    delta = pct_change = None
+    if current['value'] is not None and previous['value'] is not None:
+        delta = round(float(current['value']) - float(previous['value']), 4)
+        if float(previous['value']) != 0:
+            pct_change = round(100.0 * delta / abs(float(previous['value'])), 2)
+    improved = None
+    if delta is not None and delta != 0:
+        moved_up = delta > 0
+        improved = moved_up if definition['direction'] == 'higher_is_better' else not moved_up
+
+    parts = []
+    if delta is None:
+        parts.append('Not enough recorded evidence in one or both windows to compare.')
+    else:
+        verb = 'improved' if improved else 'worsened'
+        parts.append(f"{definition['name']} moved from {previous['value']} to {current['value']} ({delta:+g}) and {verb} against its configured direction.")
+    if new_contributors:
+        parts.append(f"{len(new_contributors)} contributing record(s) appeared versus the previous window.")
+    if resolved_contributors:
+        parts.append(f"{len(resolved_contributors)} contributing record(s) from the previous window are no longer present.")
+    if current.get('denominator') is not None:
+        parts.append(f"Current basis: numerator={current['numerator']} denominator={current['denominator']}.")
+
+    return {
+        'kpi': definition['code'],
+        'direction': definition['direction'],
+        'value': current['value'],
+        'previous_value': previous['value'],
+        'delta': delta,
+        'pct_change': pct_change,
+        'improved': improved,
+        'windows': {'current': {'start': cur_start, 'end': cur_end},
+                    'previous': {'start': prev_start, 'end': prev_end}},
+        'summary': ' '.join(parts),
+        'new_contributors': new_contributors[:50],
+        'resolved_contributors': resolved_contributors[:50],
+        'breakdown_current': current.get('breakdown') or [],
+        'breakdown_previous': previous.get('breakdown') or [],
+        'formula': current.get('formula'),
+        'disclaimer': 'Contributors are evidence observed in each window; correlation is not asserted as cause.',
+    }
+
+
 def evaluate_kpi(conn, definition, actor_id=None, as_of: str | None = None, persist=True):
     result = compute_kpi(conn, definition, as_of=as_of)
     if persist:

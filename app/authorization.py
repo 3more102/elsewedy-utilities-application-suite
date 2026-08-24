@@ -246,6 +246,8 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('GET', '/api/kpis/{kpi_id}'): 'kpi.read',
     ('GET', '/api/kpis/{kpi_id}/history'): 'kpi.read',
     ('GET', '/api/kpis/{kpi_id}/drilldown'): 'kpi.read',
+    ('GET', '/api/kpis/{kpi_id}/trend'): 'kpi.read',
+    ('GET', '/api/kpis/{kpi_id}/explanation'): 'kpi.read',
     ('POST', '/api/kpis'): 'kpi.manage',
     ('PATCH', '/api/kpis/{kpi_id}'): 'kpi.manage',
     ('POST', '/api/kpis/{kpi_id}/recalculate'): 'kpi.recalculate',
