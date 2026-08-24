@@ -117,3 +117,57 @@ def test_restore_accepts_valid_audit_chain(tmp_path: Path):
     finally:
         conn.close()
     assert count == 3
+
+
+def test_restore_cli_removes_stale_wal_sidecars(tmp_path: Path):
+    """A crashed host leaves a WAL sidecar consistent with the pre-restore
+    database; SQLite would replay those frames over the restored image."""
+    import shutil
+
+    good = tmp_path / 'good.db'
+    _make_euas_db(good)
+    bundle = tmp_path / 'wal-bundle.zip'
+    result = _run('backup_sqlite.py', '--db', str(good), '--output', str(bundle))
+    assert result.returncode == 0, result.stderr + result.stdout
+
+    stale = tmp_path / 'stale-seed.db'
+    target = tmp_path / 'live.db'
+    conn = sqlite3.connect(stale)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute(
+            '''CREATE TABLE audit_logs(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER NOT NULL, action TEXT NOT NULL, module TEXT NOT NULL,
+                 record_id TEXT NOT NULL, old_value TEXT DEFAULT '', new_value TEXT DEFAULT '',
+                 created_at TEXT NOT NULL, prev_hash TEXT DEFAULT '', audit_hash TEXT DEFAULT ''
+               )'''
+        )
+        from app.database import audit_digest
+
+        digest = audit_digest('', 1, 'CREATE', 'StaleWAL', 'stale', '', '', '2026-08-01T00:00:00')
+        conn.execute(
+            '''INSERT INTO audit_logs(
+                 user_id,action,module,record_id,old_value,new_value,
+                 created_at,prev_hash,audit_hash
+               ) VALUES(1,'CREATE','StaleWAL','stale','','',?,?,?)''',
+            ('2026-08-01T00:00:00', '', digest),
+        )
+        conn.commit()
+        wal = tmp_path / 'stale-seed.db-wal'
+        assert wal.exists(), 'expected an un-checkpointed WAL sidecar'
+        shutil.copy2(stale, target)
+        shutil.copy2(wal, str(target) + '-wal')
+    finally:
+        conn.close()
+
+    restored = _run('restore_sqlite.py', str(bundle), '--db', str(target), '--force')
+    assert restored.returncode == 0, restored.stderr + restored.stdout
+
+    assert not Path(str(target) + '-wal').exists()
+    conn = sqlite3.connect(target)
+    try:
+        rows = conn.execute("SELECT module FROM audit_logs ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    assert rows == [('DR',), ('DR',), ('DR',)]

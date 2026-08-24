@@ -112,3 +112,97 @@ def test_restore_refuses_to_overwrite_without_force(tmp_path: Path):
         restore_backup(backup, sqlite_target=target)
 
     assert target.read_text(encoding="utf-8") == "do not overwrite"
+
+
+def _plant_stale_wal_target(target):
+    """Leave target.db plus a live-consistent -wal sidecar, as after a crash."""
+    import shutil
+    stale = target.with_name(target.name + ".stale-seed")
+    conn = sqlite3.connect(stale)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sample(value) VALUES ('stale')")
+        conn.commit()
+        wal = Path(str(stale) + "-wal")
+        assert wal.exists(), "expected an un-checkpointed WAL sidecar"
+        shutil.copy2(stale, target)
+        shutil.copy2(wal, str(target) + "-wal")
+    finally:
+        conn.close()
+
+
+def test_restore_removes_stale_wal_sidecars(tmp_path: Path):
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    conn = sqlite3.connect(source)
+    try:
+        conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sample(value) VALUES ('alpha'), ('beta')")
+        conn.commit()
+    finally:
+        conn.close()
+    _plant_stale_wal_target(target)
+    backup = create_backup(
+        tmp_path / "backups",
+        backend="sqlite",
+        sqlite_path=source,
+        include_uploads=False,
+    )
+
+    restore_backup(backup, sqlite_target=target, force=True)
+
+    # The stale WAL frames must not be replayed over the restored database.
+    assert not Path(str(target) + "-wal").exists()
+    conn = sqlite3.connect(target)
+    try:
+        rows = conn.execute("SELECT value FROM sample ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    assert rows == [("alpha",), ("beta",)]
+
+
+def test_postgres_restore_requires_force_before_touching_target(tmp_path: Path, monkeypatch):
+    import hashlib
+
+    import scripts.disaster_recovery as dr
+
+    backup = tmp_path / "pg-backup"
+    backup.mkdir()
+    artifact = backup / "database.pgdump"
+    artifact.write_bytes(b"PGDMP-fake")
+    manifest = {
+        "format_version": 1,
+        "created_at": "2026-08-24T00:00:00+00:00",
+        "application": "EUAS",
+        "app_version": "3.9.0",
+        "schema_version": 10,
+        "database_backend": "postgresql",
+        "artifacts": [
+            {"path": "database.pgdump", "bytes": artifact.stat().st_size,
+             "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
+        ],
+    }
+    (backup / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(dr, "_require_executable", lambda name: f"/fake/{name}")
+
+    def fake_run(command, **kwargs):
+        calls.append(tuple(command))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(dr.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=r"use --force"):
+        dr.restore_backup(
+            backup, target_database_url="postgresql://euas:secret@db-host/euas"
+        )
+
+    # The refusal must happen before pg_restore is ever invoked.
+    result = dr.restore_backup(
+        backup, target_database_url="postgresql://euas:secret@db-host/euas", force=True
+    )
+    assert result["restored"] is True
+    assert any("--clean" in str(args) for args in calls)
