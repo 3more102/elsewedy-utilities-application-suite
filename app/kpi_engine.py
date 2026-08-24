@@ -474,6 +474,104 @@ def _distribution_indices(conn, ctx):
                    formula=f'{formula_base}. CAIDI = customer-interruption hours ÷ total customers interrupted')
 
 
+# ---------- risk-weighted backlog ----------
+
+CRITICALITY_WEIGHT = {'Critical': 1.0, 'High': 0.75, 'Medium': 0.5, 'Low': 0.25}
+PRIORITY_WEIGHT = {'Emergency': 30, 'Critical': 25, 'High': 15, 'Medium': 8, 'Low': 3}
+HIGH_RISK_THRESHOLD = 70
+
+
+def _days_between_dates(start_str, end_day):
+    try:
+        start = date.fromisoformat(str(start_str)[:10])
+    except (TypeError, ValueError):
+        return None
+    return max(0, (end_day - start).days)
+
+
+def backlog_risk_rows(conn, as_of=None, site_id=None, limit=200):
+    """Rank open work orders by operational risk with full factor explainability.
+
+    Risk model (transparent, additive, 0-100):
+      asset criticality x 40, workflow priority, overdue exposure, queue aging,
+      safety requirements, live open alarms on the affected asset.
+    Every contribution is returned so a planner can challenge the ranking.
+    """
+    today = date.fromisoformat(as_of) if as_of else date.today()
+    sql = '''SELECT w.id,w.wo_no,w.title,w.priority,w.status,w.work_type,w.target_finish,w.created_at,
+                    w.safety_requirements,a.asset_no,a.criticality,
+                    (SELECT COUNT(*) FROM operational_alarms al WHERE al.asset_id=w.asset_id
+                       AND al.status IN ('Open','Acknowledged')) AS open_alarms
+             FROM work_orders w
+             LEFT JOIN assets a ON a.id=w.asset_id
+             LEFT JOIN locations l ON l.id=COALESCE(w.location_id,a.location_id)
+             WHERE w.status NOT IN ('Completed','Closed','Cancelled','Rejected')'''
+    args: list = []
+    if site_id:
+        sql += ' AND l.site_id=?'
+        args.append(int(site_id))
+    sql += ' ORDER BY w.id DESC LIMIT 500'
+    scored = []
+    for w in conn.execute(sql, args).fetchall():
+        factors = []
+        crit_weight = CRITICALITY_WEIGHT.get(w['criticality'], 0.5) if w['criticality'] else 0.5
+        factors.append({'factor': 'asset_criticality', 'contribution': round(crit_weight * 40, 1),
+                        'detail': f"asset criticality={w['criticality'] or 'Unknown'}"})
+        prio = PRIORITY_WEIGHT.get(w['priority'], 5)
+        factors.append({'factor': 'priority', 'contribution': prio,
+                        'detail': f"workflow priority={w['priority']}"})
+        days_overdue = _days_between_dates(w['target_finish'], today) if w['target_finish'] else None
+        if days_overdue is None:
+            overdue_pts = 0
+            overdue_detail = 'no target finish date'
+        elif days_overdue > 0:
+            overdue_pts = min(20.0, days_overdue * 4)
+            overdue_detail = f'{days_overdue} day(s) past target finish'
+        else:
+            overdue_pts = 0
+            overdue_detail = 'not yet due'
+        factors.append({'factor': 'delay_exposure', 'contribution': overdue_pts, 'detail': overdue_detail})
+        age_days = _days_between_dates(w['created_at'], today) or 0
+        aging_pts = min(10.0, age_days * 0.5)
+        factors.append({'factor': 'queue_aging', 'contribution': round(aging_pts, 1),
+                        'detail': f'in backlog {age_days} day(s)'})
+        safety_pts = 5 if (w['safety_requirements'] or '').strip() or w['work_type'] == 'Emergency' else 0
+        factors.append({'factor': 'safety', 'contribution': safety_pts,
+                        'detail': 'safety requirements or emergency work recorded' if safety_pts else 'none'})
+        alarm_pts = min(10.0, int(w['open_alarms']) * 5)
+        factors.append({'factor': 'operational_alarms', 'contribution': alarm_pts,
+                        'detail': f"{int(w['open_alarms'])} open alarm(s) on asset"})
+        score = round(min(100.0, sum(f['contribution'] for f in factors)), 1)
+        scored.append({
+            'work_order_id': w['id'], 'wo_no': w['wo_no'], 'title': w['title'],
+            'priority': w['priority'], 'status': w['status'], 'work_type': w['work_type'],
+            'asset_no': w['asset_no'], 'asset_criticality': w['criticality'],
+            'target_finish': w['target_finish'], 'days_overdue': days_overdue,
+            'open_alarms': int(w['open_alarms']),
+            'risk_score': score,
+            'high_risk': score >= HIGH_RISK_THRESHOLD,
+            'factors': [f for f in factors],
+        })
+    scored.sort(key=lambda x: -x['risk_score'])
+    return scored[:limit]
+
+
+@kpi_provider('high_risk_backlog_count')
+def _high_risk_backlog(conn, ctx):
+    scored = backlog_risk_rows(conn, as_of=ctx['window_end'],
+                               site_id=(ctx.get('scope') or {}).get('site_id'))
+    high = [s for s in scored if s['high_risk']]
+    return _result(
+        len(high), numerator=len(high), denominator=len(scored) or None,
+        contributors=[{'record_type': 'work_order', 'record_id': s['work_order_id'],
+                       'record_code': s['wo_no'], 'label': s['title'],
+                       'detail': f"risk={s['risk_score']} ({'; '.join(f['factor'] for f in s['factors'] if f['contribution'])})"}
+                      for s in high],
+        freshness=ctx['window_end'],
+        formula=f'Open work orders scoring >= {HIGH_RISK_THRESHOLD}/100 on the transparent '
+                'risk model (criticality, priority, delay exposure, aging, safety, alarms)')
+
+
 def _breakdown_by_site(row_list, include):
     counts: dict = {}
     for w in row_list:

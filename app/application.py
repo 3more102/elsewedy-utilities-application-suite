@@ -15,7 +15,8 @@ from .database import db, init_db, now, audit_digest
 from .audit_verification import AuditIntegrityError, replay_audit_history, verify_audit_chain_report
 from .auth import hash_password, verify_password, current_user, require_roles
 from .kpi_engine import (KPI_PROVIDERS, DIRECTIONS, evaluate_status, evaluate_kpi, compute_kpi,
-                         window_bounds, _sustained_customer_interruptions, _customers_served)
+                         window_bounds, _sustained_customer_interruptions, _customers_served,
+                         backlog_risk_rows)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1240,6 +1241,22 @@ def kpi_drilldown(kpi_id:int,as_of:Optional[str]=None,user=Depends(require_roles
         persisted=_kpi_latest_snapshot(conn,kpi_id)
         return {'kpi':d['code'],'live':{'value':result['value'],'status':evaluate_status(result['value'],d['caution_value'],d['alert_value'],d['direction'])},
                 'last_snapshot':persisted,'drilldown':_kpi_drilldown_payload(conn,d,result)}
+
+# ---------- risk-weighted backlog ----------
+@app.get('/api/backlog/risk-weighted')
+def backlog_risk_weighted(site_id:Optional[int]=None,limit:int=Query(100,ge=1,le=500),
+                          as_of:Optional[str]=None,user=Depends(current_user)):
+    with db() as conn:
+        scored=backlog_risk_rows(conn,as_of=as_of,site_id=site_id,limit=limit)
+        high=[s for s in scored if s['high_risk']]
+        return {'scope':{'site_id':site_id},'count':len(scored),
+                'high_risk_count':len(high),
+                'total_risk_exposure':round(sum(s['risk_score'] for s in scored),1),
+                'model':'Additive transparent model: asset criticality (max 40), workflow priority '
+                        '(max 30), overdue delay exposure (max 20), queue aging (max 10), safety '
+                        'requirements (5), open alarms on asset (max 10).',
+                'items':scored}
+
 
 
 @app.get('/api/workflow-events')
