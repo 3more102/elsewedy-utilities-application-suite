@@ -1144,14 +1144,14 @@ def add_meter_reading(meter_id:int,body:MeterReadingIn,user=Depends(require_role
 # ---------- work management ----------
 WO_SELECT='''SELECT w.*,a.asset_no,a.name asset_name,l.name location_name,s.name site_name,req.full_name requested_by_name,tech.full_name assigned_to_name,sup.full_name supervisor_name,sl.response_due sla_response_due,sl.resolution_due sla_resolution_due,sl.response_status sla_response_status,sl.resolution_status sla_resolution_status,sl.escalated_level sla_escalated_level FROM work_orders w LEFT JOIN assets a ON a.id=w.asset_id LEFT JOIN locations l ON l.id=w.location_id LEFT JOIN sites s ON s.id=l.site_id LEFT JOIN users req ON req.id=w.requested_by LEFT JOIN users tech ON tech.id=w.assigned_to LEFT JOIN users sup ON sup.id=w.supervisor_id LEFT JOIN work_order_sla sl ON sl.work_order_id=w.id'''
 @app.get('/api/work-orders')
-def list_work(status:str='',priority:str='',q:str='',assigned_to:Optional[int]=None,site_id:Optional[int]=None,user=Depends(current_user)):
+def list_work(status:str='',priority:str='',q:str='',assigned_to:Optional[int]=None,site_id:Optional[int]=None,limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
     sql=WO_SELECT+' WHERE 1=1';args=[]
     if status:sql+=' AND w.status=?';args.append(status)
     if priority:sql+=' AND w.priority=?';args.append(priority)
     if assigned_to:sql+=' AND w.assigned_to=?';args.append(assigned_to)
     if site_id:sql+=' AND s.id=?';args.append(site_id)
     if q:sql+=' AND (w.wo_no LIKE ? OR w.title LIKE ? OR a.asset_no LIKE ? OR a.name LIKE ?)';like=f'%{q}%';args += [like]*4
-    sql+=' ORDER BY CASE w.priority WHEN \'Emergency\' THEN 5 WHEN \'Critical\' THEN 4 WHEN \'High\' THEN 3 WHEN \'Medium\' THEN 2 ELSE 1 END DESC,w.id DESC'
+    sql+=' ORDER BY CASE w.priority WHEN \'Emergency\' THEN 5 WHEN \'Critical\' THEN 4 WHEN \'High\' THEN 3 WHEN \'Medium\' THEN 2 ELSE 1 END DESC,w.id DESC LIMIT ? OFFSET ?';args+=[limit,offset]
     with db() as conn:return rows(conn.execute(sql,args))
 @app.get('/api/work-orders/{wo_id}')
 def get_work(wo_id:int,user=Depends(current_user)):
@@ -1434,12 +1434,19 @@ def reorder_scan(user=Depends(require_roles('admin','storekeeper','maintenance_m
 
 # ---------- procurement ----------
 @app.get('/api/procurement')
-def procurement(user=Depends(current_user)):
+def procurement(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
     with db() as conn:
-        prs=rows(conn.execute('''SELECT pr.*,u.full_name requester,s.name site_name FROM purchase_requisitions pr LEFT JOIN users u ON u.id=pr.requester_id LEFT JOIN sites s ON s.id=pr.site_id ORDER BY pr.id DESC'''))
-        for pr in prs:pr['items']=rows(conn.execute('SELECT x.*,i.item_no FROM purchase_requisition_items x LEFT JOIN inventory_items i ON i.id=x.inventory_item_id WHERE x.pr_id=?',(pr['id'],)))
-        pos=rows(conn.execute('''SELECT po.*,v.name vendor_name,pr.pr_no FROM purchase_orders po JOIN vendors v ON v.id=po.vendor_id LEFT JOIN purchase_requisitions pr ON pr.id=po.pr_id ORDER BY po.id DESC'''))
-        quotes=rows(conn.execute('''SELECT q.*,v.name vendor_name,pr.pr_no FROM quotations q JOIN vendors v ON v.id=q.vendor_id JOIN purchase_requisitions pr ON pr.id=q.pr_id ORDER BY q.id DESC'''))
+        prs=rows(conn.execute('''SELECT pr.*,u.full_name requester,s.name site_name FROM purchase_requisitions pr LEFT JOIN users u ON u.id=pr.requester_id LEFT JOIN sites s ON s.id=pr.site_id ORDER BY pr.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
+        # One batched items query replaces the per-requisition fan-out; the
+        # requisition page bounds it, so the IN-list stays small.
+        if prs:
+            marks=','.join('?'*len(prs))
+            item_rows=rows(conn.execute(f'SELECT x.*,i.item_no FROM purchase_requisition_items x LEFT JOIN inventory_items i ON i.id=x.inventory_item_id WHERE x.pr_id IN ({marks}) ORDER BY x.pr_id,x.id',tuple(pr['id'] for pr in prs)))
+            items_by_pr={};[items_by_pr.setdefault(x['pr_id'],[]).append(x) for x in item_rows]
+        else:items_by_pr={}
+        for pr in prs:pr['items']=items_by_pr.get(pr['id'],[])
+        pos=rows(conn.execute('''SELECT po.*,v.name vendor_name,pr.pr_no FROM purchase_orders po JOIN vendors v ON v.id=po.vendor_id LEFT JOIN purchase_requisitions pr ON pr.id=po.pr_id ORDER BY po.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
+        quotes=rows(conn.execute('''SELECT q.*,v.name vendor_name,pr.pr_no FROM quotations q JOIN vendors v ON v.id=q.vendor_id JOIN purchase_requisitions pr ON pr.id=q.pr_id ORDER BY q.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
         return {'requisitions':prs,'purchase_orders':pos,'quotations':quotes}
 @app.post('/api/procurement/requisitions')
 def create_pr(body:PRIn,user=Depends(require_roles('admin','storekeeper','maintenance_manager','procurement','planner'))):
@@ -1520,14 +1527,14 @@ def create_outage(body:OutageIn,user=Depends(require_roles('admin','asset_manage
 
 # ---------- technician dispatch ----------
 @app.get('/api/dispatch')
-def list_dispatch(status:str='',technician_user_id:Optional[int]=None,user=Depends(current_user)):
+def list_dispatch(status:str='',technician_user_id:Optional[int]=None,limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
     sql="""SELECT d.*,w.wo_no,w.title,w.priority,w.status work_status,a.asset_no,l.name location_name,s.name site_name,u.full_name technician_name,u.username technician_username,byu.full_name dispatched_by_name
       FROM dispatch_assignments d JOIN work_orders w ON w.id=d.work_order_id LEFT JOIN assets a ON a.id=w.asset_id LEFT JOIN locations l ON l.id=w.location_id LEFT JOIN sites s ON s.id=l.site_id
       JOIN users u ON u.id=d.technician_user_id JOIN users byu ON byu.id=d.dispatched_by WHERE 1=1""";args=[]
     if status:sql+=' AND d.status=?';args.append(status)
     if technician_user_id:sql+=' AND d.technician_user_id=?';args.append(technician_user_id)
     if user['role']=='technician':sql+=' AND d.technician_user_id=?';args.append(user['id'])
-    sql+=' ORDER BY CASE d.status WHEN \'On Site\' THEN 0 WHEN \'En Route\' THEN 1 WHEN \'Accepted\' THEN 2 WHEN \'Dispatched\' THEN 3 ELSE 4 END,d.id DESC'
+    sql+=' ORDER BY CASE d.status WHEN \'On Site\' THEN 0 WHEN \'En Route\' THEN 1 WHEN \'Accepted\' THEN 2 WHEN \'Dispatched\' THEN 3 ELSE 4 END,d.id DESC LIMIT ? OFFSET ?';args+=[limit,offset]
     with db() as conn:return rows(conn.execute(sql,args))
 
 @app.get('/api/dispatch/board')
@@ -1589,8 +1596,8 @@ def my_work(user=Depends(current_user)):
 
 # ---------- inspections ----------
 @app.get('/api/inspections')
-def list_inspections(user=Depends(current_user)):
-    with db() as conn:return rows(conn.execute('''SELECT i.*,a.asset_no,a.name asset_name,u.full_name inspector_name,w.wo_no corrective_wo_no FROM inspections i LEFT JOIN assets a ON a.id=i.asset_id LEFT JOIN users u ON u.id=i.inspector_id LEFT JOIN work_orders w ON w.id=i.corrective_wo_id ORDER BY i.id DESC'''))
+def list_inspections(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
+    with db() as conn:return rows(conn.execute('''SELECT i.*,a.asset_no,a.name asset_name,u.full_name inspector_name,w.wo_no corrective_wo_no FROM inspections i LEFT JOIN assets a ON a.id=i.asset_id LEFT JOIN users u ON u.id=i.inspector_id LEFT JOIN work_orders w ON w.id=i.corrective_wo_id ORDER BY i.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
 @app.get('/api/inspections/{inspection_id}')
 def get_inspection(inspection_id:int,user=Depends(current_user)):
     with db() as conn:
@@ -1617,8 +1624,8 @@ def submit_inspection(inspection_id:int,body:InspectionSubmit,user=Depends(requi
 
 # ---------- HSE ----------
 @app.get('/api/hse')
-def list_hse(user=Depends(current_user)):
-    with db() as conn:return rows(conn.execute('''SELECT h.*,s.name site_name,l.name location_name,a.asset_no,u.full_name reported_by_name FROM safety_incidents h LEFT JOIN sites s ON s.id=h.site_id LEFT JOIN locations l ON l.id=h.location_id LEFT JOIN assets a ON a.id=h.asset_id LEFT JOIN users u ON u.id=h.reported_by ORDER BY h.id DESC'''))
+def list_hse(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
+    with db() as conn:return rows(conn.execute('''SELECT h.*,s.name site_name,l.name location_name,a.asset_no,u.full_name reported_by_name FROM safety_incidents h LEFT JOIN sites s ON s.id=h.site_id LEFT JOIN locations l ON l.id=h.location_id LEFT JOIN assets a ON a.id=h.asset_id LEFT JOIN users u ON u.id=h.reported_by ORDER BY h.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
 @app.post('/api/hse')
 def create_hse(body:HSEIn,user=Depends(require_roles(*HSE_ROLES))):
     with db() as conn:
@@ -1700,8 +1707,8 @@ def create_contract(body:ContractIn,user=Depends(require_roles('admin','procurem
 
 # ---------- documents ----------
 @app.get('/api/documents')
-def documents(user=Depends(current_user)):
-    with db() as conn:return rows(conn.execute('''SELECT d.*,a.asset_no,w.wo_no,l.location_code,p.project_no,v.vendor_code,u.full_name uploaded_by_name FROM documents d LEFT JOIN assets a ON a.id=d.asset_id LEFT JOIN work_orders w ON w.id=d.work_order_id LEFT JOIN locations l ON l.id=d.location_id LEFT JOIN projects p ON p.id=d.project_id LEFT JOIN vendors v ON v.id=d.vendor_id JOIN users u ON u.id=d.uploaded_by ORDER BY d.id DESC'''))
+def documents(limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
+    with db() as conn:return rows(conn.execute('''SELECT d.*,a.asset_no,w.wo_no,l.location_code,p.project_no,v.vendor_code,u.full_name uploaded_by_name FROM documents d LEFT JOIN assets a ON a.id=d.asset_id LEFT JOIN work_orders w ON w.id=d.work_order_id LEFT JOIN locations l ON l.id=d.location_id LEFT JOIN projects p ON p.id=d.project_id LEFT JOIN vendors v ON v.id=d.vendor_id JOIN users u ON u.id=d.uploaded_by ORDER BY d.id DESC LIMIT ? OFFSET ?''',(limit,offset)))
 @app.post('/api/documents/upload')
 def upload_document(title:str=Form(...),category:str=Form(...),asset_id:Optional[int]=Form(None),work_order_id:Optional[int]=Form(None),location_id:Optional[int]=Form(None),project_id:Optional[int]=Form(None),vendor_id:Optional[int]=Form(None),file:UploadFile=File(...),user=Depends(require_roles(*DOC_WRITE_ROLES))):
     original=Path(file.filename or 'document').name
