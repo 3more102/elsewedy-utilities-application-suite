@@ -15,7 +15,10 @@ def test_dashboard_intelligence_uses_canonical_kpi_contracts():
     assert "period_end" in js
     assert "site_id" in js
     assert "metric: 'overdue_work_orders'" in js
+    assert "metric: 'emergency_work_orders'" in js
     assert "metric: 'pm_compliance_pct'" in js
+    assert "metric: 'mtbf_hours'" in js
+    assert "metric: 'mttr_hours'" in js
     assert "portfolioOnly: true" in js
     assert "KPI_ROLES" in js
     assert "currentIntelligenceConfig" in js
@@ -29,17 +32,14 @@ def test_dashboard_intelligence_uses_canonical_kpi_contracts():
     assert "style=" not in js
 
 
-def test_dashboard_intelligence_rejects_non_equivalent_legacy_cards():
+def test_dashboard_intelligence_rejects_non_equivalent_or_snapshot_only_cards():
     js = DASHBOARD_JS.read_text(encoding="utf-8")
 
-    # These legacy dashboard cards do not share the same calculation basis as
-    # their similarly named canonical KPI, or are point-in-time state that
-    # cannot support an honest historical trend. They must not be cross-wired.
+    # These cards remain point-in-time state or lack an equivalent canonical
+    # historical adapter for the displayed executive value. They must not be
+    # cross-wired into Trend/WHY merely because a similar KPI name exists.
     unsafe_metric_bindings = (
         "metric: 'open_work_orders'",
-        "metric: 'emergency_work_orders'",
-        "metric: 'mtbf_hours'",
-        "metric: 'mttr_hours'",
         "metric: 'open_incidents'",
         "metric: 'active_alarms'",
         "metric: 'maintenance_cost_window'",
