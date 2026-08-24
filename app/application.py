@@ -1021,6 +1021,24 @@ def kpi_parts_shortages(
     with db() as conn:
         return compute_parts_shortages(conn, f, limit=limit)
 
+@app.get('/api/kpi/pm-risk')
+def kpi_pm_capacity_risk(
+    horizon_days: int = Query(84, ge=14, le=365),
+    site_id: Optional[int] = None,
+    region: Optional[str] = None,
+    user=Depends(require_roles(*_KPI_ROLES)),
+):
+    """High-criticality PMs landing in over-capacity weeks.
+
+    Demand/capacity math is delegated to the canonical maintenance forecast;
+    this endpoint cross-references critical plan due dates against those
+    buckets so scheduling can act before the week arrives.
+    """
+    f = _kpi_filters(site_id=site_id, region=region)
+    from .kpi_service import compute_pm_capacity_risk
+    with db() as conn:
+        return compute_pm_capacity_risk(conn, f, horizon_days=horizon_days)
+
 @app.get('/api/kpi/hse')
 def kpi_hse(
     period_end: Optional[str] = None,

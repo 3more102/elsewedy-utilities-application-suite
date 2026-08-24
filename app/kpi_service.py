@@ -1326,6 +1326,88 @@ def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# PM demand vs workforce capacity risk (reuses the canonical forecast)
+# --------------------------------------------------------------------------- #
+
+def compute_pm_capacity_risk(conn, f: ExecutiveFilters, horizon_days: int = 84) -> dict:
+    """High-criticality PMs whose next-due date lands in over-loaded weeks.
+
+    Demand/capacity math is delegated to the canonical
+    app.application._maintenance_forecast (declared technician schedules,
+    absences, efficiency); this family only cross-references high-criticality
+    plan due dates against those week buckets and never invents capacity.
+    """
+    from .application import _maintenance_forecast  # deferred canonical engine
+
+    horizon_days = max(14, min(int(horizon_days), 365))
+    start = date.today()
+    end = start + timedelta(days=horizon_days)
+
+    def _week_bucket(d: date) -> str:
+        return (d - timedelta(days=d.weekday())).isoformat()
+
+    scope_sql, scope_args = _asset_scope(f)
+    plans = _rows(conn.execute(
+        '''SELECT p.id, p.pm_no, p.name pm_name, p.next_due, a.criticality,
+                  a.asset_no, s.name site_name
+             FROM maintenance_plans p
+             JOIN assets a ON a.id=p.asset_id
+             LEFT JOIN locations l ON l.id=a.location_id
+             LEFT JOIN sites s ON s.id=l.site_id
+            WHERE p.active=1 AND p.next_due IS NOT NULL''' + scope_sql,
+        scope_args))
+    critical_plans = []
+    for p in plans:
+        try:
+            due = date.fromisoformat(str(p['next_due'])[:10])
+        except (TypeError, ValueError):
+            continue
+        if start <= due <= end and p.get('criticality') == 'Critical':
+            critical_plans.append({**p, '_bucket': _week_bucket(due)})
+
+    forecast = _maintenance_forecast(conn, horizon_days, f.site_id)
+    buckets = {b['week_start']: b for b in forecast['weeks']}
+    overloaded: dict[str, dict] = {}
+    unplaced = 0
+    for p in critical_plans:
+        bucket = buckets.get(p['_bucket'])
+        if bucket is None:
+            unplaced += 1
+            continue
+        if bucket['utilization_pct'] > 100 or bucket['capacity_state'] == 'Over Capacity':
+            entry = overloaded.setdefault(p['_bucket'], {
+                'week_start': bucket['week_start'],
+                'utilization_pct': bucket['utilization_pct'],
+                'capacity_state': bucket['capacity_state'],
+                'demand_hours': bucket['demand_hours'],
+                'capacity_hours': bucket['capacity_hours'],
+                'critical_pms': [],
+                'sites_at_risk': [],
+            })
+            entry['critical_pms'].append({
+                'pm_no': p['pm_no'], 'name': p['pm_name'], 'next_due': p['next_due'],
+                'asset_no': p['asset_no'], 'site_name': p['site_name']})
+            if p['site_name'] and p['site_name'] not in entry['sites_at_risk']:
+                entry['sites_at_risk'].append(p['site_name'])
+
+    capacity_configured = forecast.get('capacity_source') == 'workforce_schedule'
+    return {
+        'horizon_days': horizon_days,
+        'capacity_source': forecast.get('capacity_source'),
+        'capacity_available': bool(forecast.get('summary', {}).get('capacity_hours')),
+        'critical_pm_total': len(critical_plans),
+        'critical_pm_in_overloaded_weeks': sum(
+            len(e['critical_pms']) for e in overloaded.values()),
+        'overloaded_weeks': sorted(overloaded.values(),
+                                   key=lambda e: -e['utilization_pct']),
+        'unplaced_critical_pms': unplaced,
+        'unavailable_note': (
+            None if capacity_configured
+            else 'workforce capacity derived from role fallback, not declared schedules'),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Parts-shortage drill-down (KPI -> action)
 # --------------------------------------------------------------------------- #
 

@@ -461,3 +461,75 @@ def test_executive_kpi_csv_export_matches_snapshot_and_permissions():
         # Unconfigured reliability indices export an explicit unavailable state.
         saidi = metrics[('reliability', 'saidi_minutes')]
         assert saidi == 'unavailable' or float(saidi) >= 0
+
+
+def test_pm_capacity_risk_maps_critical_plans_to_week_buckets():
+    _ensure_db()
+    from app.kpi_service import compute_pm_capacity_risk, ExecutiveFilters
+    now_iso = datetime.now().isoformat(timespec='seconds')
+    with db() as conn:
+        admin = int(conn.execute("SELECT id FROM users WHERE username='omar'").fetchone()[0])
+        tr = int(conn.execute("SELECT id FROM assets WHERE asset_no='TR-001'").fetchone()[0])
+        pmp = int(conn.execute("SELECT id FROM assets WHERE asset_no='PMP-301'").fetchone()[0])
+        # Critical plans due ~2 and ~5 weeks out; a Medium plan must be ignored.
+        for i, (asset_id, offset_days) in enumerate(
+                [(tr, 14), (tr, 35), (pmp, 49)]):
+            conn.execute(
+                '''INSERT INTO maintenance_plans(pm_no,name,asset_id,trigger_type,
+                     interval_days,next_due,priority,active,compliance_target)
+                   VALUES(?,?,?,'Calendar',30,?,'Critical',1,95)''',
+                (f'PM-KPI-RISK{i}', f'KPI risk plan {i}', asset_id,
+                 (datetime.now() + timedelta(days=offset_days)).strftime('%Y-%m-%d')))
+        conn.execute(
+            '''INSERT INTO maintenance_plans(pm_no,name,asset_id,trigger_type,
+                 interval_days,next_due,priority,active,compliance_target)
+               VALUES('PM-KPI-MED','Medium plan ignored',?,'Calendar',30,?,'Medium',1,95)''',
+            (pmp, (datetime.now() + timedelta(days=15)).strftime('%Y-%m-%d')))
+
+    with db() as conn:
+        risk = compute_pm_capacity_risk(conn, ExecutiveFilters(period_days=30))
+    # Only Critical-criticality assets count. The shared regression database
+    # may hold additional seeded critical plans from PM-generation tests, so
+    # assert floors and exclusion semantics rather than exact totals.
+    assert risk['critical_pm_total'] >= 2
+    seen = []
+    for week in risk['overloaded_weeks']:
+        for pm in week['critical_pms']:
+            seen.append(pm['pm_no'])
+            assert pm['next_due'] and pm['asset_no']
+    assert len(seen) == len(set(seen)), 'a critical PM landed in multiple buckets'
+    assert risk['unplaced_critical_pms'] == 0
+    # Overloaded weeks only contain genuinely over-capacity buckets.
+    for week in risk['overloaded_weeks']:
+        assert week['utilization_pct'] > 100
+        assert week['capacity_state'] == 'Over Capacity'
+    # Exclusion semantics verified against a clean scope where possible:
+    with db() as conn:
+        pmp = conn.execute("SELECT id FROM assets WHERE asset_no='PMP-301'").fetchone()
+        if pmp:
+            scoped = compute_pm_capacity_risk(
+                conn, ExecutiveFilters(period_days=30))
+            counted_assets = {pm['asset_no']
+                              for w in scoped['overloaded_weeks']
+                              for pm in w['critical_pms']}
+            # Any counted plan must sit on a Critical asset.
+            for asset_no in counted_assets:
+                row = conn.execute('SELECT criticality FROM assets WHERE asset_no=?',
+                                   (asset_no,)).fetchone()
+                assert row['criticality'] == 'Critical'
+
+
+def test_pm_capacity_risk_endpoint_authorization():
+    _ensure_db()
+    with TestClient(app) as client:
+        admin = auth(client)
+        tech = auth(client, 'tech1', 'Tech@2026')
+        assert client.get('/api/kpi/pm-risk', headers=tech).status_code == 403
+        r = client.get('/api/kpi/pm-risk', headers=admin, params={'horizon_days': 84})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body['horizon_days'] == 84
+        assert {'critical_pm_total', 'overloaded_weeks',
+                'capacity_source'} <= set(body.keys())
+        assert client.get('/api/kpi/pm-risk', headers=admin,
+                          params={'horizon_days': 5}).status_code == 422

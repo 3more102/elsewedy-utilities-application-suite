@@ -208,7 +208,7 @@ async function renderAnalytics(){
   if(KPI_STATE.typeId)qp.set('asset_type_id',KPI_STATE.typeId);
   if(KPI_STATE.crit)qp.set('criticality',KPI_STATE.crit);
   if(KPI_STATE.region)qp.set('region',KPI_STATE.region);
-  const [k,deter]=await Promise.all([api('/api/kpi/executive?'+qp),api('/api/kpi/deterioration?'+qp).catch(()=>null)]);
+  const [k,deter,pmrisk]=await Promise.all([api('/api/kpi/executive?'+qp),api('/api/kpi/deterioration?'+qp).catch(()=>null),api('/api/kpi/pm-risk?'+qp).catch(()=>null)]);
   const ref=S.ref||await api('/api/reference');
   const rel=k.reliability,as=k.assets,m=k.maintenance,c=k.condition,ip=k.inventory_procurement,wf=k.workforce,fresh=k.freshness;
   const freshCls=fresh.state==='stale'?'warn':'good';
@@ -352,6 +352,11 @@ async function renderAnalytics(){
     <div class="table-wrap"><table class="data-table"><thead><tr><th>Kind</th><th>Subject</th><th>Recommended action</th><th></th></tr></thead><tbody>
       ${k.hse.recommendations.map(rec=>`<tr><td><span class="status ${rec.kind==='corrective_action_needed'?'Critical':rec.kind==='repeat_incident'?'Warning':'Info'}">${esc(rec.kind)}</span></td><td>${esc(rec.label||'')}</td><td style="font-size:10px">${esc(rec.action)}</td><td>${rec.incident_id&&canWork()?`<button class="btn small" data-hse-wo="${rec.incident_id}" title="Uses the standard Create Work Order flow, prefilled from this incident. Creation stays subject to work-management permissions and audit.">Plan corrective WO</button>`:''}${rec.incident_id?`<button class="btn small" data-hse-view="${rec.incident_id}">View register</button>`:''}</td></tr>`).join('')}
     </tbody></table></div>
+  </div></section>`:''}
+  ${pmrisk&&(pmrisk.critical_pm_total>0||pmrisk.overloaded_weeks.length)?`<section class="panel" style="margin-bottom:14px"><div class="panel-head"><div><h3>Critical PM vs Workforce Capacity</h3><p>High-criticality PMs due in over-loaded weeks (declared schedules only — no invented capacity). Open the planning module to rebalance.</p></div><div><button class="btn small" id="kpi-pm-planning">Open Planning</button></div></div><div class="panel-body">
+    <div class="kpi-grid" style="margin-bottom:10px">${kpiCard('Critical PMs (horizon)',pmrisk.critical_pm_total,'CP','Next '+pmrisk.horizon_days+' days')}${kpiCard('In Overloaded Weeks',pmrisk.critical_pm_in_overloaded_weeks,'OW','Reschedule candidates','warn')}${kpiCard('Capacity Source',pmrisk.capacity_source==='workforce_schedule'?'Declared':'Fallback','CS',pmrisk.capacity_available?'':'No declared capacity',pmrisk.capacity_source==='workforce_schedule'?'good':'warn')}</div>
+    ${pmrisk.overloaded_weeks.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>Week</th><th>Utilization</th><th>Demand / Capacity</th><th>Sites at risk</th><th>Critical PMs due</th></tr></thead><tbody>${pmrisk.overloaded_weeks.slice(0,6).map(w=>`<tr><td>${esc(w.week_start)}</td><td><strong style="color:var(--red)">${fmt(w.utilization_pct)}%</strong></td><td>${fmt(w.demand_hours)} h / ${fmt(w.capacity_hours)} h</td><td style="font-size:10px">${esc((w.sites_at_risk||[]).join(', ')||'—')}</td><td style="font-size:10px">${w.critical_pms.map(p=>`${esc(p.pm_no)} (${esc(p.next_due)})`).join(' · ')}</td></tr>`).join('')}</tbody></table></div>`:empty('All critical PMs fall within capacity for this horizon')}
+    ${pmrisk.capacity_source!=='workforce_schedule'?`<p class="section-sub">${esc(pmrisk.unavailable_note||'')}</p>`:''}
   </div></section>`:''}`;
 
   const reload=()=>render();
@@ -361,6 +366,7 @@ async function renderAnalytics(){
   $('#kpi-type').onchange=e=>{KPI_STATE.typeId=e.target.value;reload()};
   $('#kpi-crit').onchange=e=>{KPI_STATE.crit=e.target.value;reload()};
   if($('#kpi-customers'))$('#kpi-customers').onclick=()=>customersModal(ref.sites);
+  if($('#kpi-pm-planning'))$('#kpi-pm-planning').onclick=()=>go('maintenance');
   const loadShortages=async()=>{
     const sq=new URLSearchParams();if(siteId)sq.set('site_id',siteId);if(KPI_STATE.region)sq.set('region',KPI_STATE.region);
     $('#kpi-shortage-body').innerHTML='<div class="empty">Loading…</div>';
