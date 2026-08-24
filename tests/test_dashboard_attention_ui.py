@@ -16,8 +16,9 @@ def test_dashboard_attention_uses_existing_severity_without_new_kpi_math():
     assert "ATTENTION_LIMIT = 6" in js
     assert "No client-side risk score is calculated" in js
     assert "MODULE_BY_SIGNAL" in js
-    assert "moduleAvailable" in js
+    assert "navButtonFor" in js
     assert "querySelectorAll('.nav-btn')" in js
+    assert "button.click()" in js
     assert "dashboard-kpi-action" in js
     assert "Why?" in js
     assert "/api/" not in js
