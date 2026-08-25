@@ -1,5 +1,5 @@
 /* Executive Action Center: renders canonical decision queues only.
-   Business risk, shortage and capacity calculations remain server-owned. */
+   Business risk, shortage, capacity and HSE calculations remain server-owned. */
 
 .dashboard-action-center{
   margin:0 0 14px;
@@ -44,15 +44,17 @@
 
 .dashboard-action-grid{
   display:grid;
-  grid-template-columns:repeat(3,minmax(0,1fr));
+  grid-template-columns:repeat(2,minmax(0,1fr));
   align-items:stretch;
 }
 
 .dashboard-action-section{
   min-width:0;
   border-right:1px solid var(--line);
+  border-bottom:1px solid var(--line);
 }
-.dashboard-action-section:last-child{border-right:0}
+.dashboard-action-section:nth-child(2n){border-right:0}
+.dashboard-action-section:nth-last-child(-n+2){border-bottom:0}
 
 .dashboard-action-section-head{
   display:flex;
@@ -190,7 +192,9 @@
 
 @media(max-width:1100px){
   .dashboard-action-grid{grid-template-columns:1fr}
-  .dashboard-action-section{
+  .dashboard-action-section,
+  .dashboard-action-section:nth-child(2n),
+  .dashboard-action-section:nth-last-child(-n+2){
     border-right:0;
     border-bottom:1px solid var(--line);
   }
