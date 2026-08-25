@@ -1,4 +1,5 @@
-const CACHE='euas-shell-v3.9.0-ui12';
+// Previous shell cache: euas-shell-v3.9.0-ui12
+const CACHE='euas-shell-v3.9.0-ui13';
 const ASSETS=[
   '/',
   '/static/styles.css',

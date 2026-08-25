@@ -18,7 +18,7 @@ def test_canonical_snapshot_adapter_loads_before_dashboard_intelligence_and_is_c
     assert index.index(script_path) < index.index(intelligence_path)
 
     service_worker = SW.read_text(encoding='utf-8')
-    assert "const CACHE='euas-shell-v3.9.0-ui12'" in service_worker
+    assert "const CACHE='euas-shell-v3.9.0-ui13'" in service_worker
     assert script_path in service_worker
 
 

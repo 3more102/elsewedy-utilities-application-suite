@@ -12,6 +12,8 @@
   ]);
   const BACKLOG_LIMIT = 5;
   const SHORTAGE_LIMIT = 5;
+  const HSE_LIMIT = 5;
+  const ACTION_PERIOD_DAYS = 30;
   const PM_HORIZON_DAYS = 84;
   let generation = 0;
   let lastScope = '';
@@ -126,7 +128,7 @@
   }
 
   function backlogSection(result) {
-    const {section, head, body} = sectionShell('Execution risk', 'Risk-ranked backlog');
+    const {section, body} = sectionShell('Execution risk', 'Risk-ranked backlog');
     if (result.status !== 'fulfilled') {
       emptyState(body, 'Backlog risk is unavailable for this scope.');
       return section;
@@ -241,6 +243,56 @@
     return section;
   }
 
+  function hseSection(result) {
+    const {section, head, body} = sectionShell('Safety watch', 'High-risk HSE actions');
+    if (navButtonFor('hse')) head.append(actionButton('HSE', () => openModule('hse')));
+    if (result.status !== 'fulfilled') {
+      emptyState(body, 'Safety intelligence is unavailable for this scope.');
+      return section;
+    }
+
+    const data = result.value || {};
+    const daysSinceHighRisk = data.days_since_last_high_risk == null
+      ? '—'
+      : `${formatNumber(data.days_since_last_high_risk, 0)}d`;
+    const stats = node('div', 'dashboard-action-metrics');
+    stats.append(
+      metric('Open incidents', formatNumber(data.open_incidents || 0, 0)),
+      metric('High-risk open', formatNumber(data.high_risk_open || 0, 0), Number(data.high_risk_open) ? 'critical' : ''),
+      metric('Since high risk', daysSinceHighRisk)
+    );
+    body.append(stats);
+
+    const recommendations = Array.isArray(data.recommendations)
+      ? data.recommendations.slice(0, HSE_LIMIT)
+      : [];
+    if (!recommendations.length) {
+      body.append(node('p', 'dashboard-action-empty', 'No canonical HSE action recommendations are active for this scope.'));
+      return section;
+    }
+
+    const list = node('div', 'dashboard-action-list');
+    recommendations.forEach(recommendation => {
+      const item = node('article', 'dashboard-action-row');
+      const copy = node('div', 'dashboard-action-row-copy');
+      const label = recommendation.incident_no
+        || recommendation.asset_no
+        || recommendation.label
+        || recommendation.kind
+        || 'Safety signal';
+      copy.append(
+        node('strong', '', label),
+        node('p', '', recommendation.note || 'Canonical HSE action signal')
+      );
+      const severity = recommendation.severity || 'Signal';
+      const tone = severity === 'Critical' ? 'critical' : 'attention';
+      item.append(copy, node('span', `dashboard-action-score ${tone}`, severity));
+      list.append(item);
+    });
+    body.append(list);
+    return section;
+  }
+
   function buildCenter(results) {
     const center = node('section', 'dashboard-action-center');
     center.dataset.executiveActionCenter = 'true';
@@ -251,7 +303,7 @@
     copy.append(
       node('span', 'dashboard-action-eyebrow', 'Canonical operations intelligence'),
       node('h3', '', 'Executive Action Center'),
-      node('p', '', `Decision-ready queues · ${scopeLabel()} · ${PM_HORIZON_DAYS}d PM horizon`)
+      node('p', '', `Decision-ready queues · ${scopeLabel()} · ${ACTION_PERIOD_DAYS}d action window · ${PM_HORIZON_DAYS}d PM horizon`)
     );
     copy.querySelector('h3').id = 'dashboard-action-center-title';
     const refresh = actionButton('Refresh actions', () => loadActionCenter(true));
@@ -259,7 +311,12 @@
     head.append(copy, refresh);
 
     const grid = node('div', 'dashboard-action-grid');
-    grid.append(backlogSection(results[0]), shortageSection(results[1]), pmSection(results[2]));
+    grid.append(
+      backlogSection(results[0]),
+      shortageSection(results[1]),
+      pmSection(results[2]),
+      hseSection(results[3])
+    );
     center.append(head, grid);
     return center;
   }
@@ -285,13 +342,15 @@
     lastScope = signature;
     const run = ++generation;
 
-    const backlog = scopedParams({limit: BACKLOG_LIMIT, period_days: 30}, true);
+    const backlog = scopedParams({limit: BACKLOG_LIMIT, period_days: ACTION_PERIOD_DAYS}, true);
     const shortages = scopedParams({limit: SHORTAGE_LIMIT});
     const pmRisk = scopedParams({horizon_days: PM_HORIZON_DAYS});
+    const hse = scopedParams({period_days: ACTION_PERIOD_DAYS}, true);
     const results = await Promise.allSettled([
       actionApi(`/api/kpi/backlog/risk?${backlog}`),
       actionApi(`/api/kpi/parts/shortages?${shortages}`),
       actionApi(`/api/kpi/pm-risk?${pmRisk}`),
+      actionApi(`/api/kpi/hse?${hse}`),
     ]);
     if (run !== generation || !dashboardVisible()) return;
     placeCenter(buildCenter(results));
