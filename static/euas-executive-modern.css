@@ -1,0 +1,55 @@
+/* EUAS Executive Modern UI layer
+   Adds enterprise dashboard visual hierarchy without replacing existing components.
+*/
+:root {
+  --euas-surface: #ffffff;
+  --euas-panel: #f7f9fc;
+  --euas-border: #dfe5ef;
+  --euas-text: #182230;
+  --euas-muted: #65758b;
+  --euas-accent: #b6242a;
+}
+
+.app .content {
+  background: linear-gradient(180deg, #f7f9fc 0%, #eef2f7 100%);
+}
+
+.card, .panel, .kpi-card, .dashboard-card {
+  border: 1px solid var(--euas-border);
+  border-radius: 18px;
+  background: var(--euas-surface);
+  box-shadow: 0 8px 24px rgba(20, 35, 55, .06);
+  transition: transform .18s ease, box-shadow .18s ease;
+}
+
+.card:hover, .panel:hover, .kpi-card:hover, .dashboard-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 32px rgba(20, 35, 55, .10);
+}
+
+.kpi-value {
+  font-size: 2rem;
+  font-weight: 750;
+  color: var(--euas-text);
+}
+
+.kpi-label {
+  color: var(--euas-muted);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  font-size: .72rem;
+}
+
+.sidebar {
+  backdrop-filter: blur(12px);
+}
+
+.topbar {
+  border-bottom: 1px solid var(--euas-border);
+}
+
+@media (max-width: 900px) {
+  .card, .panel, .kpi-card, .dashboard-card {
+    border-radius: 14px;
+  }
+}
