@@ -37,5 +37,5 @@ def test_help_override_is_last_credential_free_and_precached():
     # stay at zero rather than depending on the guard for current app.js text.
     assert LEGACY_CREDENTIAL_DISPLAY.findall(app_js) == []
 
-    assert "const CACHE='euas-shell-v3.9.0-ui12'" in service_worker
+    assert "const CACHE='euas-shell-v3.9.0-ui13'" in service_worker
     assert "'/static/help-security.js'" in service_worker
