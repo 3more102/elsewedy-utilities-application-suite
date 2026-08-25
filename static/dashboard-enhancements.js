@@ -12,13 +12,13 @@
   ]);
 
   // Wire only cards whose displayed value is semantically equivalent to the
-  // canonical KPI for the same scope/as-of basis. Emergency Work, MTBF and
-  // MTTR are safe here because the executive cards are now populated by the
-  // canonical 30-day snapshot adapter before this intelligence is consumed.
-  // Point-in-time/live-state metrics remain excluded from historical trends.
+  // canonical KPI for the same scope/as-of basis and whose trend samples are
+  // genuinely historical for each requested window. MTBF and MTTR satisfy
+  // both requirements through the forced-outage history adapter. Snapshot-only
+  // backlog/state metrics such as Emergency Work remain excluded until their
+  // historical values and explanation drivers are backed by matching evidence.
   const INTELLIGENCE = new Map([
     ['Overdue Work', {family: 'maintenance', metric: 'overdue_work_orders', periodDays: 30}],
-    ['Emergency Work', {family: 'maintenance', metric: 'emergency_work_orders', periodDays: 30}],
     ['PM Compliance', {
       family: 'maintenance', metric: 'pm_compliance_pct', periodDays: 30,
       portfolioOnly: true,
@@ -393,168 +393,122 @@
     summary.textContent = data.summary || 'No comparison summary is available for this window.';
     body.append(summary);
 
-    const compare = document.createElement('div');
-    compare.className = 'dashboard-intelligence-compare';
-    compare.append(
+    const comparison = document.createElement('div');
+    comparison.className = 'dashboard-intelligence-comparison';
+    comparison.append(
       comparisonItem('Current', formatMagnitude(data.value, data.unit)),
       comparisonItem('Previous', formatMagnitude(data.previous_value, data.unit)),
-      comparisonItem(
-        'Change',
-        data.delta == null
-          ? 'Not comparable'
-          : `${Number(data.delta) > 0 ? '+' : ''}${formatMagnitude(data.delta, data.unit)}`
-      )
+      comparisonItem('Delta', data.delta == null ? '—' : formatMagnitude(data.delta, data.unit))
     );
-    body.append(compare);
+    body.append(comparison);
 
-    const heading = document.createElement('h4');
-    heading.textContent = 'Observed contributors';
-    body.append(heading);
+    const driversTitle = document.createElement('h4');
+    driversTitle.textContent = 'Measured contributors';
+    body.append(driversTitle);
 
     const drivers = Array.isArray(data.drivers) ? data.drivers : [];
     if (!drivers.length) {
-      const emptyState = document.createElement('p');
-      emptyState.className = 'dashboard-intelligence-empty';
-      emptyState.textContent = 'No contributing records were returned by the canonical explanation for this window.';
-      body.append(emptyState);
-    } else {
-      const list = document.createElement('div');
-      list.className = 'dashboard-driver-list';
-      drivers.forEach(driver => {
-        const row = document.createElement('article');
-        row.className = 'dashboard-driver';
-        const copy = document.createElement('div');
-        const name = document.createElement('strong');
-        name.textContent = driver.label || driver.kind || 'Observed record';
-        const meta = document.createElement('p');
-        const evidence = driver.attribution === 'contributor' ? 'Contributor' : 'Correlation';
-        meta.textContent = [
-          evidence,
-          driver.source_type ? String(driver.source_type).replaceAll('_', ' ') : '',
-          driver.magnitude == null ? '' : formatMagnitude(driver.magnitude, driver.unit),
-        ].filter(Boolean).join(' · ');
-        copy.append(name, meta);
-        row.append(copy);
-        const open = driverRecordButton(driver);
-        if (open) row.append(open);
-        list.append(row);
-      });
-      body.append(list);
+      const empty = document.createElement('p');
+      empty.className = 'dashboard-intelligence-empty';
+      empty.textContent = 'No measured contributors are available for this scoped window.';
+      body.append(empty);
+      return;
     }
 
-    const disclaimer = document.createElement('p');
-    disclaimer.className = 'dashboard-intelligence-disclaimer';
-    disclaimer.textContent = data.disclaimer || 'Evidence is observational and is not presented as proof of causation.';
-    body.append(disclaimer);
+    const list = document.createElement('div');
+    list.className = 'dashboard-driver-list';
+    drivers.forEach(driver => {
+      const item = document.createElement('article');
+      item.className = 'dashboard-driver';
+      const copy = document.createElement('div');
+      const label = document.createElement('strong');
+      label.textContent = driver.label || driver.kind || 'Contributor';
+      const meta = document.createElement('span');
+      const attribution = driver.attribution ? ` · ${driver.attribution}` : '';
+      meta.textContent = `${formatMagnitude(driver.magnitude, driver.unit)}${attribution}`;
+      copy.append(label, meta);
+      item.append(copy);
+      const open = driverRecordButton(driver);
+      if (open) item.append(open);
+      list.append(item);
+    });
+    body.append(list);
   }
 
   async function showExplanation(card, config) {
-    const grid = card.closest('.dashboard-kpi-grid');
+    const grid = card.closest('.kpi-grid');
     if (!grid) return;
     const panel = ensureExplanationPanel(grid);
     const title = panel.querySelector('#dashboard-intelligence-title');
     const body = panel.querySelector('.dashboard-intelligence-body');
     const label = text(card.querySelector('.kpi-label'));
-
     panel.hidden = false;
     title.textContent = `${label} — Why?`;
     body.replaceChildren();
     const loading = document.createElement('p');
-    loading.className = 'dashboard-intelligence-loading';
-    loading.textContent = 'Loading scoped canonical evidence…';
+    loading.className = 'dashboard-intelligence-empty';
+    loading.textContent = 'Loading measured contributors…';
     body.append(loading);
-    panel.focus();
+    panel.focus({preventScroll: true});
 
     try {
-      const params = scopeParams(config);
-      const data = await dashboardApi(`/api/kpi/explanation?${params}`);
-      if (!panel.isConnected || !executiveDashboardVisible()) return;
+      const data = await dashboardApi(`/api/kpi/explanation?${scopeParams(config)}`);
       renderExplanation(panel, data);
     } catch (error) {
       body.replaceChildren();
       const failure = document.createElement('p');
       failure.className = 'dashboard-intelligence-error';
-      failure.textContent = `Explanation unavailable: ${error?.message || String(error)}`;
+      failure.textContent = error?.message || 'Unable to load KPI explanation.';
       body.append(failure);
     }
   }
 
-  async function loadTrend(card, config) {
-    const trendNode = card.querySelector('.dashboard-kpi-trend');
-    const labelNode = card.querySelector('.dashboard-kpi-trend-label');
-    if (!trendNode || !labelNode) return;
+  async function hydrateTrend(card, config) {
+    const trend = card.querySelector('.dashboard-kpi-trend');
+    const trendLabel = card.querySelector('.dashboard-kpi-trend-label');
+    if (!trend || !trendLabel) return;
 
     try {
-      const params = scopeParams(config, true);
-      const data = await dashboardApi(`/api/kpi/trend?${params}`);
-      if (!card.isConnected || !executiveDashboardVisible()) return;
-
-      const values = (Array.isArray(data.samples) ? data.samples : [])
-        .filter(sample => sample && sample.value != null)
+      const data = await dashboardApi(`/api/kpi/trend?${scopeParams(config, true)}`);
+      const values = (data.samples || [])
+        .filter(sample => sample.value != null)
         .map(sample => Number(sample.value))
         .filter(Number.isFinite);
       const state = trendState(data, values);
-      trendNode.classList.remove('good', 'bad', 'neutral');
-      trendNode.classList.add(state.className);
-      labelNode.textContent = state.label;
-
-      const oldSpark = trendNode.querySelector('.dashboard-kpi-sparkline');
-      if (oldSpark) oldSpark.remove();
-      const graph = sparkline(
-        values,
-        `${data.label || text(card.querySelector('.kpi-label'))} canonical trend: ${values.join(', ')}`
-      );
-      if (graph) trendNode.prepend(graph);
+      trend.classList.remove('neutral', 'good', 'bad');
+      trend.classList.add(state.className);
+      trendLabel.textContent = state.label;
+      const line = sparkline(values, `${data.label || 'KPI'} canonical trend: ${values.map(formatNumber).join(', ')}`);
+      if (line) trend.prepend(line);
     } catch (error) {
-      if (!card.isConnected) return;
-      trendNode.classList.remove('good', 'bad');
-      trendNode.classList.add('neutral');
-      labelNode.textContent = 'Canonical trend unavailable';
-      trendNode.title = error?.message || String(error);
+      trend.classList.add('neutral');
+      trendLabel.textContent = 'Canonical trend unavailable';
+      trend.title = error?.message || '';
     }
   }
 
-  async function loadTrends(grid) {
-    const jobs = [...grid.querySelectorAll(':scope > .kpi.kpi-explainable')]
-      .map(card => {
-        const config = currentIntelligenceConfig(text(card.querySelector('.kpi-label')));
-        return config ? {card, config} : null;
-      })
-      .filter(Boolean);
-
-    const queue = [...jobs];
-    const workers = Array.from({length: Math.min(3, queue.length)}, async () => {
-      while (queue.length) {
-        const job = queue.shift();
-        if (!job) return;
-        await loadTrend(job.card, job.config);
-      }
+  function hydrateIntelligence(grid) {
+    const cards = [...grid.querySelectorAll(':scope > .kpi-explainable')];
+    cards.forEach(card => {
+      const label = text(card.querySelector('.kpi-label'));
+      const config = currentIntelligenceConfig(label);
+      if (config) hydrateTrend(card, config);
     });
-    await Promise.all(workers);
   }
 
-  function decorateDashboard() {
+  function enhance() {
     if (!executiveDashboardVisible()) return;
-    const grid = content.querySelector('.kpi-grid:not(.strip-kpis)');
-    if (!grid || grid.dataset.dashboardIntelligence === 'ready') return;
-
-    grid.dataset.dashboardIntelligence = 'ready';
+    const grid = content.querySelector('.kpi-grid');
+    if (!grid || grid.dataset.euasEnhanced === 'true') return;
+    ensureStylesheet();
+    grid.dataset.euasEnhanced = 'true';
     const counts = decorateKpis(grid);
-    addDashboardSummary(grid, counts);
-    ensureExplanationPanel(grid);
     decorateCharts();
-
-    const schedule = window.requestIdleCallback || (callback => setTimeout(callback, 0));
-    schedule(() => loadTrends(grid));
+    addDashboardSummary(grid, counts);
+    hydrateIntelligence(grid);
   }
 
-  document.addEventListener('keydown', event => {
-    if (event.key !== 'Escape') return;
-    const panel = content.querySelector('.dashboard-intelligence-panel');
-    if (panel && !panel.hidden) panel.hidden = true;
-  });
-
-  ensureStylesheet();
-  new MutationObserver(() => queueMicrotask(decorateDashboard)).observe(content, {childList: true});
-  decorateDashboard();
+  const observer = new MutationObserver(enhance);
+  observer.observe(content, {childList: true, subtree: true});
+  enhance();
 })();
