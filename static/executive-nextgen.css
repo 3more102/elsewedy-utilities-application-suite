@@ -1,0 +1,31 @@
+/* EUAS Executive Next Generation visual layer */
+
+.dashboard-kpi-grid > .kpi {
+  transition: transform .18s ease, box-shadow .18s ease;
+}
+
+.dashboard-kpi-grid > .kpi:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 24px rgba(16,24,40,.10);
+}
+
+.dashboard-intelligence-panel {
+  backdrop-filter: blur(4px);
+}
+
+.dashboard-driver-list .dashboard-driver {
+  position: relative;
+}
+
+.dashboard-driver-list .dashboard-driver::before {
+  content: "";
+  width: 3px;
+  position: absolute;
+  inset: 8px auto 8px 0;
+  border-radius: 4px;
+  background: var(--red);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-kpi-grid > .kpi { transition: none; }
+}
