@@ -8,7 +8,7 @@ reported as observed evidence (correlation/contributor), never asserted cause.
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from fastapi import HTTPException
 
@@ -147,6 +147,12 @@ _TREND_FAMILIES: dict[str, dict] = {
                                          'unit': 'incidents',
                                          'direction': 'lower_is_better',
                                          'path': 'high_risk_open'},
+            # Genuinely as-of: compute_hse_kpis anchors the gap at the
+            # requested period end and bounds incidents to that day.
+            'days_since_last_high_risk': {
+                'label': 'Days Since Last High-Risk Incident', 'unit': 'days',
+                'direction': 'higher_is_better',
+                'path': 'days_since_last_high_risk'},
         },
     },
     # Cost is genuinely window-based: compute_cost_kpis sums immutable
@@ -427,6 +433,61 @@ def _maintenance_cost_drivers(conn, f, limit: int = 10) -> list[dict]:
     return drivers
 
 
+def _hse_days_since_drivers(conn, f, *, current: dict,
+                            limit: int = 5) -> list[dict]:
+    """Recent high-risk incidents standing behind the days-since gap.
+
+    The first driver is the literal determinant of the metric — the most
+    recent high-risk incident at or before the anchor date (``contributor``
+    attribution). Older high-risk records follow as ``correlation`` context.
+    """
+    from .kpi_service import _asset_scope, _rows, HSE_HIGH_RISK_SCORE
+
+    anchor_str = str(current.get('days_since_anchor') or '')
+    try:
+        anchor = date.fromisoformat(anchor_str[:10])
+    except (TypeError, ValueError):
+        return []
+    scope_sql, scope_args = _asset_scope(f, alias_a='a')
+    rows_ = _rows(conn.execute(
+        'SELECT h.id, h.incident_no, h.incident_type, h.title,'
+        ' COALESCE(h.occurred_at,h.created_at) occurred_at'
+        ' FROM safety_incidents h'
+        ' LEFT JOIN sites s ON s.id=h.site_id'
+        ' LEFT JOIN locations l ON l.id=h.location_id'
+        ' LEFT JOIN assets a ON a.id=h.asset_id'
+        ' WHERE 1=1' + scope_sql +
+        ' AND h.risk_score>=? AND COALESCE(h.occurred_at,h.created_at)<=?'
+        ' ORDER BY COALESCE(h.occurred_at,h.created_at) DESC, h.id DESC'
+        ' LIMIT ?',
+        list(scope_args) + [HSE_HIGH_RISK_SCORE,
+                            anchor_str + 'T23:59:59', limit]))
+    drivers: list[dict] = []
+    for index, row in enumerate(rows_):
+        try:
+            days_before_anchor = max(
+                0, (anchor -
+                    datetime.fromisoformat(str(row['occurred_at'])[:19]).date()).days)
+        except (TypeError, ValueError):
+            continue
+        drivers.append({
+            'kind': 'high_risk_incident',
+            'label': (
+                f"{row['incident_no']} {row['incident_type']} on "
+                f"{str(row['occurred_at'])[:10]}"
+            ),
+            'magnitude': days_before_anchor,
+            'unit': 'days before anchor',
+            'attribution': ('contributor' if index == 0
+                            else 'correlation'),
+            'source_type': 'safety_incident',
+            'source_id': int(row['id']),
+            'drill': {'module': 'hse', 'record': row['incident_no'],
+                      'id': int(row['id'])},
+        })
+    return drivers
+
+
 def _inventory_stockout_drivers(conn, f, *, current: dict,
                                 limit: int = 10) -> list[dict]:
     """Stocked-out lines composing ``inventory/stockout_lines``.
@@ -583,6 +644,8 @@ def explain_metric(conn, f, *, family: str, metric: str) -> dict:
     elif family == 'hse' and metric in {'open_incidents',
                                         'high_risk_incidents_open'}:
         drivers = _hse_incident_drivers(conn, f, metric=metric)
+    elif family == 'hse' and metric == 'days_since_last_high_risk':
+        drivers = _hse_days_since_drivers(conn, f, current=current)
     elif family == 'cost':
         drivers = _maintenance_cost_drivers(conn, f)
     elif family == 'workforce' and metric == 'unassigned_critical_work':

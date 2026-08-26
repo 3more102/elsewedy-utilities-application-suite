@@ -1274,7 +1274,6 @@ def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
         ' AND h.created_at>=? AND h.created_at<?',
         scope_args + cur_args))
     weekly: dict[str, dict] = {}
-    today_d = date.today()
     for r in trend_rows:
         try:
             d = datetime.fromisoformat(str(r['created_at'])[:19]).date()
@@ -1291,14 +1290,23 @@ def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
         b['period'] = key
         trend.append(b)
 
-    # Days since last high-risk incident (occurrence date preferred).
+    # Days since the last high-risk incident (occurrence date preferred),
+    # evaluated as of the requested period end: historical windows report
+    # the gap that genuinely stood on that day instead of today's, which is
+    # what makes the metric honestly registrable on /api/kpi/trend. With no
+    # explicit period_end the anchor is today — unchanged default behavior.
+    anchor_d = w['period_end']
     last_high = conn.execute(
         'SELECT MAX(COALESCE(h.occurred_at,h.created_at))' + base +
-        ' AND h.risk_score>=?', scope_args + [HSE_HIGH_RISK_SCORE]).fetchone()[0]
+        ' AND h.risk_score>=? AND COALESCE(h.occurred_at,h.created_at)<=?',
+        scope_args + [HSE_HIGH_RISK_SCORE,
+                      anchor_d + 'T23:59:59']).fetchone()[0]
     days_since_high = None
     if last_high:
         try:
-            days_since_high = (today_d - datetime.fromisoformat(str(last_high)[:19]).date()).days
+            days_since_high = max(
+                0, (date.fromisoformat(anchor_d)
+                    - datetime.fromisoformat(str(last_high)[:19]).date()).days)
         except (TypeError, ValueError):
             days_since_high = None
 
@@ -1385,6 +1393,8 @@ def compute_hse_kpis(conn, f: ExecutiveFilters) -> dict:
         'high_risk_previous': high_risk_previous,
         'high_risk_delta': high_risk_current - high_risk_previous,
         'days_since_last_high_risk': days_since_high,
+        'days_since_anchor': anchor_d,
+        'last_high_risk_at': last_high,
         'severity_distribution_window': severity_distribution,
         'risk_band_distribution': risk_bands,
         'trend': trend,

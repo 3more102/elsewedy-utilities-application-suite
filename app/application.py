@@ -46,7 +46,18 @@ logger = logging.getLogger('euas')
 
 @app.middleware('http')
 async def security_headers(request: Request, call_next):
-    request_id = request.headers.get('x-request-id') or uuid.uuid4().hex
+    # Echo a caller-supplied correlation id only after stripping everything
+    # outside safe printable ASCII; the raw header must never be reflected
+    # into response headers unbounded.
+    supplied_id = request.headers.get('x-request-id', '')[:128]
+    request_id = (
+        ''.join(
+            ch
+            for ch in supplied_id
+            if 32 <= ord(ch) < 127 and ch not in '"\\<>'
+        )
+        or uuid.uuid4().hex
+    )
     started = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - started) * 1000
@@ -709,8 +720,27 @@ def notify_once(conn,title,message,severity='Info',user_id=None,role_code=None,m
     if existing:return False
     notify(conn,title,message,severity,user_id,role_code,module,record_id);return True
 
+_CSV_FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
+
+
+def _csv_safe_cell(value):
+    """Neutralize spreadsheet formula injection in exported cells.
+
+    User-controlled strings (asset names, work-order titles, notes, ...) are
+    echoed into CSV downloads that operators open with spreadsheet
+    applications. A leading =, +, - or @ would be evaluated as a formula by
+    Excel/LibreOffice, so such cells are prefixed with a single quote. The
+    cell stays readable and no legitimate value is silently altered.
+    """
+    if not isinstance(value, str) or not value.startswith(_CSV_FORMULA_PREFIXES):
+        return value
+    return "'" + value
+
+
 def csv_response(filename, headers, data_rows):
-    buf=io.StringIO();w=csv.writer(buf);w.writerow(headers);w.writerows(data_rows)
+    buf=io.StringIO();w=csv.writer(buf)
+    w.writerow([_csv_safe_cell(h) for h in headers])
+    w.writerows([[_csv_safe_cell(cell) for cell in row] for row in data_rows])
     return StreamingResponse(iter([buf.getvalue()]),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="{filename}"'})
 
 def _generate_due_pm(conn, actor_id:int, target:date):
@@ -804,7 +834,12 @@ async def _automation_loop():
         await asyncio.sleep(max(60,AUTOMATION_INTERVAL_MINUTES*60))
 
 # ---------- request models ----------
-class LoginIn(BaseModel): username:str; password:str
+class LoginIn(BaseModel):
+    # Bounded before any password hashing work happens: every failed login
+    # runs two 600,000-round PBKDF2 verifications, so unbounded pre-auth
+    # fields turn each request into a CPU amplification vector.
+    username: str = Field(min_length=1, max_length=150)
+    password: str = Field(min_length=1, max_length=1024)
 class AssetIn(BaseModel):
     asset_no: Optional[str]=None; name:str; description:str=''; asset_type_id:Optional[int]=None; category:str
     manufacturer:str=''; model:str=''; serial_no:str=''; installation_date:Optional[str]=None; commissioning_date:Optional[str]=None
@@ -844,7 +879,7 @@ class InspectionSubmit(BaseModel): responses:list[dict]; remarks:str=''; create_
 class HSEIn(BaseModel): incident_type:str; title:str; site_id:Optional[int]=None; location_id:Optional[int]=None; asset_id:Optional[int]=None; severity:int=Field(ge=1,le=5); probability:int=Field(ge=1,le=5); description:str; corrective_action:str=''; occurred_at:Optional[str]=None
 class ProjectIn(BaseModel): name:str; manager_id:Optional[int]=None; site_id:Optional[int]=None; start_date:Optional[str]=None; finish_date:Optional[str]=None; budget:float=0; status:str='Active'
 class MeterReadingIn(BaseModel): reading:float
-class UserIn(BaseModel): username:str; password:str=Field(min_length=8); full_name:str; email:Optional[str]=None; role_code:str; department:str=''; phone:str=''
+class UserIn(BaseModel): username:str=Field(min_length=1,max_length=150); password:str=Field(min_length=8,max_length=128); full_name:str; email:Optional[str]=None; role_code:str; department:str=''; phone:str=''
 class ProfilePatch(BaseModel):
     full_name: Optional[str]=Field(default=None,min_length=2,max_length=120)
     email: Optional[str]=Field(default=None,max_length=180)
@@ -1952,12 +1987,45 @@ def upload_document(title:str=Form(...),category:str=Form(...),asset_id:Optional
         raise
     with db() as conn:
         no=next_no(conn,'documents','document_no','DOC-',6001);cur=conn.execute('''INSERT INTO documents(document_no,title,category,file_name,stored_name,mime_type,asset_id,work_order_id,location_id,project_id,vendor_id,uploaded_by,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(no,title,category,original,stored,file.content_type or '',asset_id,work_order_id,location_id,project_id,vendor_id,user['id'],now()));audit(conn,user['id'],'UPLOAD','Documents',no,'',original);return {'id':cur.lastrowid,'document_no':no,'size_bytes':size}
+# Media types are derived from the server-generated stored-file suffix, never
+# from the client-supplied upload Content-Type, so a hostile client cannot
+# have EUAS serve attacker-chosen active content types (e.g. text/html) from
+# the document store. Anything unmapped falls back to inert octet-stream.
+_DOCUMENT_MEDIA_TYPES = {
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.txt': 'text/plain',
+    '.csv': 'text/csv',
+    '.doc': 'application/msword',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xls': 'application/vnd.ms-excel',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.zip': 'application/zip',
+}
+
+
+def _document_media_type(stored_name: str) -> str:
+    suffix = Path(stored_name or '').suffix.lower()
+    return _DOCUMENT_MEDIA_TYPES.get(suffix, 'application/octet-stream')
+
+
+def _document_download_name(file_name: str) -> str:
+    # Strip header-breaking control characters and quotes before the value is
+    # echoed into the Content-Disposition response header.
+    cleaned = ''.join('_' if (ord(ch) < 32 or ord(ch) > 126 or ch in '"\\') else ch for ch in str(file_name or ''))[:150]
+    return cleaned.strip() or 'document'
+
+
 @app.get('/api/documents/{doc_id}/download')
 def download_document(doc_id:int,user=Depends(current_user)):
     with db() as conn:d=get_or_404(conn,'SELECT * FROM documents WHERE id=?',(doc_id,),'Document not found')
     p=UPLOAD_DIR/d['stored_name']
     if not p.exists():raise HTTPException(404,'Stored file missing')
-    return FileResponse(p,filename=d['file_name'],media_type=d['mime_type'] or 'application/octet-stream')
+    safe_name=_document_download_name(d['file_name'])
+    return FileResponse(p,filename=safe_name,media_type=_document_media_type(d['stored_name']),content_disposition_type='attachment')
 
 # ---------- service levels / integration events ----------
 @app.get('/api/sla/summary')
