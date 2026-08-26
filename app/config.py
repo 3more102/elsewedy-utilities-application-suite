@@ -39,9 +39,9 @@ ALLOWED_HOSTS = tuple(
 EVENT_WEBHOOK_URL = os.getenv('EUAS_EVENT_WEBHOOK_URL', '').strip()
 EVENT_WEBHOOK_SECRET = os.getenv('EUAS_EVENT_WEBHOOK_SECRET', '').strip()
 OUTBOX_MAX_ATTEMPTS = max(1, int(os.getenv('EUAS_OUTBOX_MAX_ATTEMPTS', '5')))
-# Claims are committed before outbound I/O. Keep the lease comfortably above
-# the fixed five-second webhook timeout so healthy senders cannot be reclaimed
-# while their request is still in flight.
 OUTBOX_LEASE_SECONDS = max(10, int(os.getenv('EUAS_OUTBOX_LEASE_SECONDS', '30')))
+TELEMETRY_MAX_FUTURE_SKEW_SECONDS = max(
+    0, int(os.getenv('EUAS_TELEMETRY_MAX_FUTURE_SKEW_SECONDS', '300'))
+)
 
 SCHEMA_VERSION = 12

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 import sys
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from . import application as _application
@@ -111,6 +113,30 @@ def _remove_route(path: str, methods: set[str]) -> None:
             and bool(methods.intersection(set(getattr(route, 'methods', set()) or set())))
         )
     ]
+
+
+def _json_safe(value):
+    """Make request-validation error payloads JSON-encodable.
+
+    FastAPI's default 422 handler echoes the rejected input back to the client,
+    but ``json.dumps`` cannot encode NaN/Infinity, so a non-finite measurement
+    would otherwise crash the error path itself and surface as HTTP 500.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def sanitized_validation_error_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={'detail': [_json_safe(error) for error in exc.errors()]},
+    )
 
 
 # Replace only routes whose semantics depend on hardened security/session or

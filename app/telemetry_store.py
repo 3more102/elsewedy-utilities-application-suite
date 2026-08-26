@@ -9,6 +9,7 @@ from fastapi import Depends, HTTPException
 from . import application as _application
 from .audit_store import append_audit
 from .auth import require_roles
+from .config import TELEMETRY_MAX_FUTURE_SKEW_SECONDS
 from .database import db, now
 
 
@@ -359,10 +360,12 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
     Delayed or explicit equal-time readings remain queryable in
     telemetry_readings but cannot regress telemetry_channels.last_* or mutate
     active alarm state. Untimestamped readings preserve legacy arrival-order
-    behavior. All participating channels are locked in canonical ID order
-    before any mutation, and telemetry alarm mutation coordinates with the
-    manual lifecycle through locked reloads, keeping the invariants
-    deterministic under concurrent PostgreSQL ingestion.
+    behavior. Readings carrying a client_ref are idempotent: a redelivery with
+    an already-persisted (channel, client_ref) pair is acknowledged as a
+    duplicate without side effects. All participating channels are locked in
+    canonical ID order before any mutation, and telemetry alarm mutation
+    coordinates with the manual lifecycle through locked reloads, keeping
+    the invariants deterministic under concurrent PostgreSQL ingestion.
     """
     normalized: list[tuple[object, str, str | None]] = []
     for reading in body.readings:
@@ -393,6 +396,7 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
     summary = {
         'accepted': 0,
         'historical': 0,
+        'duplicates': 0,
         'alarms_opened': 0,
         'alarms_updated': 0,
         'alarms_cleared': 0,
@@ -408,10 +412,11 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
             else _implicit_capture_after(channel.get('last_reading_at'))
         )
         source = reading.source or channel['source_system'] or 'Manual'
-        conn.execute(
-            '''INSERT INTO telemetry_readings(
-                 channel_id,value,quality,source,captured_at,ingested_at,ingested_by
-               ) VALUES(?,?,?,?,?,?,?)''',
+        client_ref = (reading.client_ref or '').strip() or None
+        inserted = conn.execute(
+            '''INSERT OR IGNORE INTO telemetry_readings(
+                 channel_id,value,quality,source,captured_at,ingested_at,ingested_by,client_ref
+               ) VALUES(?,?,?,?,?,?,?,?)''',
             (
                 channel['id'],
                 reading.value,
@@ -420,8 +425,25 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
                 captured,
                 now(),
                 user['id'],
+                client_ref,
             ),
         )
+        if client_ref is not None and int(inserted.rowcount or 0) != 1:
+            # A retried delivery for an already-persisted client reference is
+            # acknowledged but must not re-advance channel state or duplicate
+            # alarm side effects.
+            summary['duplicates'] += 1
+            summary['results'].append(
+                {
+                    'channel_code': channel['channel_code'],
+                    'value': reading.value,
+                    'action': 'duplicate',
+                    'alarm_id': None,
+                    'alarm_no': None,
+                    'severity': None,
+                }
+            )
+            continue
         summary['accepted'] += 1
 
         if not _is_temporally_current(
@@ -482,6 +504,7 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
         {
             'accepted': summary['accepted'],
             'historical': summary['historical'],
+            'duplicates': summary['duplicates'],
             'alarms_opened': summary['alarms_opened'],
             'alarms_updated': summary['alarms_updated'],
             'alarms_cleared': summary['alarms_cleared'],
@@ -497,6 +520,7 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
         {
             'accepted': summary['accepted'],
             'historical': summary['historical'],
+            'duplicates': summary['duplicates'],
             'alarms_opened': summary['alarms_opened'],
             'alarms_cleared': summary['alarms_cleared'],
         },
