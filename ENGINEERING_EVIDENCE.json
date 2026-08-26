@@ -1,6 +1,6 @@
 {
-  "api_route_methods": 211,
-  "api_routes": 193,
+  "api_route_methods": 215,
+  "api_routes": 196,
   "application_version": "3.9.0",
   "database_backend": "sqlite",
   "explicit_indexes": 45,
