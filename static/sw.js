@@ -1,8 +1,9 @@
-const CACHE='euas-shell-v3.9.0-ui12';
+const CACHE='euas-shell-v3.9.0-ui13';
 const ASSETS=[
   '/',
   '/static/styles.css',
   '/static/ui-refresh.css',
+  '/static/enterprise-ui.css',
   '/static/ux-enhancements.css',
   '/static/productivity-enhancements.css',
   '/static/operational-enhancements.css',

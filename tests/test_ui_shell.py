@@ -298,7 +298,7 @@ def test_ui_refresh_includes_responsive_and_motion_safety_rules():
     assert "aria-describedby" in shortcut_js
     assert "Browser Back / Forward" in shortcut_js
 
-    assert "euas-shell-v3.9.0-ui12" in service_worker
+    assert "euas-shell-v3.9.0-ui13" in service_worker
     assert "'/static/command-palette.css'" in service_worker
     assert "'/static/command-palette.js'" in service_worker
     assert "'/static/shortcut-center.css'" in service_worker

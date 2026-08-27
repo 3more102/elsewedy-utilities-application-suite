@@ -116,11 +116,34 @@
     const kicker = document.createElement('div');
     kicker.className = 'dashboard-section-kicker';
     kicker.textContent = counts.critical
-      ? `Portfolio signals · ${counts.critical} critical`
+      ? `Portfolio signals \u00b7 ${counts.critical} critical`
       : 'Portfolio signals';
 
     grid.parentNode.insertBefore(strip, grid);
     grid.parentNode.insertBefore(kicker, grid);
+  }
+
+  function enhanceKpiCards(grid) {
+    grid.querySelectorAll('.kpi').forEach(card => {
+      const ico = card.querySelector('.kpi-ico');
+      if (!ico) return;
+      const iconMap = {
+        'Assets': '\u25A1', 'Open Work': '\u2713', 'PM Compliance': '\u2261',
+        'HP': '\u2665', 'OT': '\u26A0', 'AL': '\u26A0', 'MT': '\u25CF',
+        'TC': '\u263C', 'AV': '\u2713', 'DP': '\u2192', 'WO': '\u2713',
+        'CH': '\u2261', 'LW': '\u2264', 'CR': '\u2022',
+        'HS': '\u2020', 'HR': '\u26A0', 'DS': '\u2022', 'CW': '\u2261',
+        'PM': '\u2261', 'OD': '\u26A0', '90': '\u2261', 'DH': '\u2261',
+        'PS': '\u26A0', 'IV': '\u00A4', 'IT': '\u2261', 'LO': '\u26A0',
+        'WH': '\u25A1', 'PR': '\u2261', 'AP': '\u2261', 'OK': '\u2713',
+        'RJ': '\u2717', 'DG': '\u2194', 'SL': '\u26A0', 'EV': '\u2192',
+        'CL': '\u2713', 'OA': '\u26A0', 'PJ': '\u25A1', 'BG': '\u00A4',
+        'AC': '\u00A4', 'BF': '\u221E', 'TR': '\u21BB', 'CP': '\u2261',
+        'TM': '\u2261', '!!': '\u26A0', 'ST': '\u26A0', 'UT': '\u25CF',
+      };
+      const key = text(ico);
+      if (iconMap[key]) ico.textContent = iconMap[key];
+    });
   }
 
   function decorateDashboard() {
@@ -131,6 +154,7 @@
     const counts = decorateKpis(grid);
     addDashboardSummary(grid, counts);
     decorateCharts();
+    enhanceKpiCards(grid);
   }
 
   new MutationObserver(() => queueMicrotask(decorateDashboard)).observe(content, {childList: true});
