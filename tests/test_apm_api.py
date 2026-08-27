@@ -452,12 +452,14 @@ def test_bad_actors_ranking_and_anonymous_denial():
     with TestClient(app) as client:
         ranking = client.get('/api/reliability/bad-actors?limit=5', headers=headers)
         assert ranking.status_code == 200, ranking.text
-        entries = ranking.json()
+        payload = ranking.json()
+        assert isinstance(payload, dict)
+        entries = payload['assets']
         assert isinstance(entries, list)
-        points = [e['bad_actor_points'] for e in entries]
+        points = [e['evidence_share'] for e in entries]
         assert points == sorted(points, reverse=True)
         for entry in entries:
-            assert 'mtbf_hours' in entry and 'drivers' in entry
+            assert 'bad_actor' in entry and 'reasons' in entry
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +745,23 @@ def test_reliability_reads_honor_site_scope():
         chan_b = _make_channel(conn, 'TEL-SCOPE-B', asset_b, warning_high=80)
         _add_readings(conn, chan_a, [55, 62, 68, 75, 82, 86])
         _add_readings(conn, chan_b, [55, 62, 68, 75, 82, 86])
+        from datetime import datetime, timedelta
+        finish_a = (datetime.now() - timedelta(days=10)).isoformat(timespec='seconds')
+        conn.execute(
+            '''INSERT INTO work_orders(wo_no,title,priority,status,work_type,asset_id,
+               failure_code,actual_finish,actual_hours,actual_cost,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+            ('WO-SCOPE-A-1', 'Scoped corrective A', 'High', 'Completed',
+             'Corrective Maintenance', asset_a, 'MECH', finish_a, 4.0, 500.0, now(), now()),
+        )
+        finish_b = (datetime.now() - timedelta(days=20)).isoformat(timespec='seconds')
+        conn.execute(
+            '''INSERT INTO work_orders(wo_no,title,priority,status,work_type,asset_id,
+               failure_code,actual_finish,actual_hours,actual_cost,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+            ('WO-SCOPE-B-1', 'Scoped corrective B', 'Medium', 'Completed',
+             'Corrective Maintenance', asset_b, 'ELEC', finish_b, 2.0, 100.0, now(), now()),
+        )
         conn.commit()
     try:
         with TestClient(app) as client:
@@ -767,7 +786,7 @@ def test_reliability_reads_honor_site_scope():
                 headers=headers,
             )
             assert actors_a.status_code == 200, actors_a.text
-            actor_assets = {entry['asset_no'] for entry in actors_a.json()}
+            actor_assets = {entry['asset_no'] for entry in actors_a.json()['assets']}
             assert 'AST-SCOPE-A' in actor_assets
             assert 'AST-SCOPE-B' not in actor_assets
 
@@ -795,6 +814,7 @@ def test_reliability_reads_honor_site_scope():
                 conn.execute('DELETE FROM telemetry_readings WHERE channel_id=?', (channel,))
                 conn.execute('DELETE FROM telemetry_channels WHERE id=?', (channel,))
             for asset_id in (asset_a, asset_b):
+                conn.execute("DELETE FROM work_orders WHERE asset_id=? AND wo_no LIKE 'WO-SCOPE%'", (asset_id,))
                 conn.execute('DELETE FROM assets WHERE id=?', (asset_id,))
             for site_id in (site_a, site_b):
                 conn.execute('DELETE FROM locations WHERE site_id=?', (site_id,))

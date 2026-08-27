@@ -9,3 +9,19 @@ uploads/*
 !uploads/.gitkeep
 .env
 .DS_Store
+
+# Database backups
+*.bak
+
+# Local worktree metadata
+.worktrees/
+
+# Generated pytest/temp output
+failure_summary.txt
+full_suite_failures.txt
+pytest_baseline.txt
+pytest_current.txt
+pytest_final.txt
+pytest_final_final.txt
+pytest_final_regression.txt
+pytest_true_baseline.txt

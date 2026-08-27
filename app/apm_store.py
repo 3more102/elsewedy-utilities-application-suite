@@ -1251,7 +1251,13 @@ def install_apm_routes() -> None:
         user=Depends(current_user),
     ):
         with db() as conn:
-            return bad_actors_view(conn, window_days=window_days, limit=limit, site_id=site_id)
+            actors, summary = _application._bad_actor_rows(conn, window_days, site_id, limit)
+            return {
+                'period_days': window_days,
+                'scope': {'site_id': site_id},
+                'summary': summary,
+                'assets': actors,
+            }
 
     @app.get('/api/work-orders/{wo_id}/effectiveness')
     def wo_effectiveness_route(

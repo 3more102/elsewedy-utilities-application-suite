@@ -124,6 +124,7 @@ def db():
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA foreign_keys=ON')
         conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=5000')
     try:
         yield conn
         conn.commit()
@@ -174,7 +175,6 @@ def _ensure_telemetry_idempotency(conn):
     conn.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_readings_client_ref
                     ON telemetry_readings(channel_id,client_ref)
                     WHERE client_ref IS NOT NULL''')
->>>>>>> oxalpha/telemetry-hardening
 
 def _backfill_audit_chain(conn):
     prev=''
@@ -590,27 +590,16 @@ def init_db(hash_password):
           updated_at TEXT NOT NULL, approved_by INTEGER REFERENCES users(id), approved_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_fmea_asset ON fmea_records(asset_id,status);
-        CREATE TABLE IF NOT EXISTS kpi_definitions(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
-          description TEXT DEFAULT '', category TEXT DEFAULT 'general', domain TEXT DEFAULT 'maintenance',
-          unit TEXT DEFAULT '', value_type TEXT NOT NULL DEFAULT 'rate', aggregation TEXT NOT NULL DEFAULT 'ratio',
-          source_key TEXT NOT NULL, formula TEXT DEFAULT '', filters_json TEXT NOT NULL DEFAULT '{}',
-          scope_json TEXT NOT NULL DEFAULT '{}', time_window_days INTEGER NOT NULL DEFAULT 30,
-          refresh_minutes INTEGER NOT NULL DEFAULT 60, owner_user_id INTEGER REFERENCES users(id),
-          visibility_roles TEXT DEFAULT '', target_value REAL, caution_value REAL, alert_value REAL,
-          direction TEXT NOT NULL DEFAULT 'higher_is_better', active INTEGER NOT NULL DEFAULT 1,
-          version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_kpi_definitions_active ON kpi_definitions(active,category);
-        CREATE TABLE IF NOT EXISTS kpi_snapshots(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, kpi_id INTEGER NOT NULL REFERENCES kpi_definitions(id) ON DELETE CASCADE,
-          period_start TEXT NOT NULL, period_end TEXT NOT NULL, value REAL, previous_value REAL,
-          trend TEXT, change_pct REAL, status TEXT NOT NULL DEFAULT 'UNKNOWN',
-          target_value REAL, caution_value REAL, alert_value REAL,
-          numerator REAL, denominator REAL, contributors_json TEXT DEFAULT '[]', data_freshness_at TEXT,
-          provenance_json TEXT DEFAULT '{}', calculated_at TEXT NOT NULL, calculated_by INTEGER REFERENCES users(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_kpi_snapshots_kpi ON kpi_snapshots(kpi_id,id);
+        CREATE INDEX IF NOT EXISTS idx_alarms_channel_status ON operational_alarms(channel_id,status,opened_at);
+        CREATE INDEX IF NOT EXISTS idx_alarms_site_status ON operational_alarms(site_id,status,severity);
+        CREATE INDEX IF NOT EXISTS idx_wo_priority_status ON work_orders(priority,status);
+        CREATE INDEX IF NOT EXISTS idx_wo_work_type_status ON work_orders(work_type,status,asset_id);
+        CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
+        CREATE INDEX IF NOT EXISTS idx_approval_record ON approval_requests(module,record_type,record_id,status);
+        CREATE INDEX IF NOT EXISTS idx_locations_site ON locations(site_id);
+        CREATE INDEX IF NOT EXISTS idx_pm_asset_active ON maintenance_plans(asset_id,active);
+        CREATE INDEX IF NOT EXISTS idx_audit_user_time ON audit_logs(user_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_asset_parent ON assets(parent_asset_id);
         ''')
         _ensure_schema_columns(conn)
         _backfill_audit_chain(conn)
@@ -627,31 +616,6 @@ def init_db(hash_password):
                 f'Database schema version {db_version} is newer than application schema version '
                 f'{_euas_config.SCHEMA_VERSION}; refusing to start. Upgrade the application before using this database.'
             )
-
-        seed_kpis=[
-              ('KPI-PM-COMP','PM Compliance','Preventive maintenance work orders completed on or before their target finish date.','maintenance','Preventive maintenance work orders completed on/before target finish ÷ PM work orders due in window × 100','pm_compliance','%','rate','ratio',30,'higher_is_better',90,85,75),
-              ('KPI-OVERDUE-WO','Overdue Work Orders','Open work orders past their target finish date.','work','Open work orders with target finish before window end','overdue_work_orders','count','count','count',30,'lower_is_better',None,5,10),
-              ('KPI-BACKLOG-OPEN','Open Maintenance Backlog','All open work orders regardless of due state.','work','Open work orders at window end','backlog_open','count','count','count',30,'lower_is_better',None,None,None),
-              ('KPI-BACKLOG-CRIT','Critical Backlog','Open emergency/critical priority work or work on critical assets.','work','Open work orders with Emergency/Critical priority or on Critical assets','critical_backlog','count','count','count',30,'lower_is_better',None,3,6),
-              ('KPI-SCHED-COMP','Schedule Compliance','Work completed on or before target finish within the window.','work','Work orders finished on/before target ÷ completions in window × 100','schedule_compliance','%','rate','ratio',30,'higher_is_better',90,80,65),
-              ('KPI-EMERG-PCT','Emergency Work %','Share of newly created work that is emergency priority.','work','Emergency-priority work orders created ÷ all work orders created in window × 100','emergency_work_pct','%','rate','ratio',30,'lower_is_better',None,5,10),
-              ('KPI-REACTIVE-PCT','Reactive Work %','Share of newly created corrective/breakdown work.','work','Corrective/breakdown work created ÷ all work created in window × 100','reactive_work_pct','%','rate','ratio',30,'lower_is_better',None,40,60),
-              ('KPI-MTTR','MTTR (Repair Hours)','Mean repair hours of completed corrective work.','reliability','Mean(actual finish − actual start) hours for corrective completions','mttr_hours','h','duration','avg',90,'lower_is_better',None,24,48),
-              ('KPI-MTBF','MTBF (Exposure Hours)','Scoped asset exposure hours per recorded failure.','reliability','Exposure hours ÷ recorded failures in window','mtbf_hours','h','duration','ratio',90,'higher_is_better',720,240,120),
-              ('KPI-AVAIL','Asset Availability','Availability across scoped assets from recorded outages.','reliability','(Exposure − outage hours) ÷ exposure × 100 over scoped assets','availability_pct','%','rate','ratio',30,'higher_is_better',99,95,90),
-              ('KPI-DOWN-FORCED','Forced Downtime Hours','Unplanned (forced) outage hours inside the window.','reliability','Sum of forced-outage overlap hours in window','unplanned_downtime_hours','h','duration','sum',30,'lower_is_better',None,8,24),
-              ('KPI-ALARM-CRIT','Active Critical Alarms','Critical operational alarms currently open or acknowledged.','operations','Open/acknowledged critical operational alarms at window end','active_critical_alarms','count','count','count',7,'lower_is_better',0,2,5),
-              ('KPI-SAIDI','SAIDI','System Average Interruption Duration Index from recorded outage customer impacts.','reliability','Sustained customer-interruption hours ÷ customers served (site_reliability_config)','saidi','h/cust','duration','ratio',365,'lower_is_better',None,None,None),
-              ('KPI-SAIFI','SAIFI','System Average Interruption Frequency Index from recorded outage customer impacts.','reliability','Total customers interrupted across sustained outages ÷ customers served','saifi','int/cust','rate','ratio',365,'lower_is_better',None,None,None),
-              ('KPI-CAIDI','CAIDI','Customer Average Interruption Duration Index: mean restoration time per interrupted customer.','reliability','Customer-interruption hours ÷ total customers interrupted','caidi','h','duration','ratio',365,'lower_is_better',None,None,None),
-              ('KPI-RISK-BACKLOG','High-Risk Backlog','Open work orders scoring at least 70/100 on the transparent risk model.','work','Open work orders with risk score >= 70 (criticality, priority, delay exposure, aging, safety, alarms)','high_risk_backlog_count','count','count','count',30,'lower_is_better',None,3,8)]
-        # Idempotent per code so databases created before a definition existed
-        # still receive new seeds without touching admin-edited rows.
-        for code,name,desc,cat,formula,key,unit,vtype,agg,window,direction,target,caution,alert in seed_kpis:
-            conn.execute('''INSERT OR IGNORE INTO kpi_definitions(code,name,description,category,domain,unit,value_type,aggregation,
-                source_key,formula,time_window_days,direction,target_value,caution_value,alert_value,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (code,name,desc,cat,('Maintenance' if cat=='maintenance' else 'Work Management' if cat=='work' else 'Reliability' if cat=='reliability' else 'Operations'),unit,vtype,agg,key,formula,window,direction,target,caution,alert,now(),now()))
 
         if conn.execute('SELECT COUNT(*) FROM roles').fetchone()[0] == 0:
             roles=[

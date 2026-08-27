@@ -53,7 +53,7 @@ def test_bad_actor_flagging_and_evidence():
                                  days_ago=20, cost=50)
 
         report = client.get('/api/reliability/bad-actors', headers=admin,
-                            params={'period_days': 365}).json()
+                            params={'period_days': 365, 'limit': 100}).json()
         assert report['summary']['methodology']
         assets = {a['asset_no']: a for a in report['assets']}
         hvac, cb = assets['HVAC-401'], assets['CB-101']

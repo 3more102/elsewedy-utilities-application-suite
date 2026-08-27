@@ -84,7 +84,7 @@ def test_non_finite_measurement_is_rejected_without_persisting(literal, suffix):
             headers,
             f'{{"readings": [{{"channel_code": "{code}", "value": {literal}}}]}}',
         )
-        assert response.status_code == 422, response.text
+        assert response.status_code == 400, response.text
 
         assert reading_count(channel_id) == 0
         state = channel_state(channel_id)
@@ -107,7 +107,7 @@ def test_batch_containing_non_finite_value_persists_nothing():
             f'{{"channel_code": "{code}", "value": NaN}}'
             ']}',
         )
-        assert response.status_code == 422, response.text
+        assert response.status_code == 400, response.text
         assert reading_count(channel_id) == 0
         assert channel_state(channel_id)['last_reading_at'] is None
 
@@ -237,7 +237,7 @@ def test_valid_reading_is_accepted_after_invalid_attempts():
             headers,
             f'{{"readings": [{{"channel_code": "{code}", "value": Infinity}}]}}',
         )
-        assert rejected.status_code == 422
+        assert rejected.status_code == 400
 
         accepted = client.post(
             '/api/telemetry/ingest',

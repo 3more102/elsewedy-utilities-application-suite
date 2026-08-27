@@ -381,11 +381,25 @@ def ingest_telemetry_atomic(conn, body, user: dict) -> dict:
         explicit_capture = reading.captured_at
         if explicit_capture is not None:
             try:
-                _event_instant(explicit_capture)
+                instant = _event_instant(explicit_capture)
             except (TypeError, ValueError):
                 raise HTTPException(
                     400,
                     f'Invalid captured_at for telemetry channel {code}',
+                )
+            now_utc = datetime.now(timezone.utc)
+            if instant.tzinfo is not None:
+                now_utc_local = now_utc.astimezone()
+            else:
+                now_utc_local = now_utc.replace(tzinfo=timezone.utc).astimezone()
+            max_future = datetime.fromtimestamp(
+                now_utc_local.timestamp() + TELEMETRY_MAX_FUTURE_SKEW_SECONDS,
+                tz=timezone.utc,
+            )
+            if instant.replace(tzinfo=timezone.utc) > max_future:
+                raise HTTPException(
+                    400,
+                    f'future timestamp beyond allowed skew for telemetry channel {code}',
                 )
         normalized.append((reading, code, explicit_capture))
 

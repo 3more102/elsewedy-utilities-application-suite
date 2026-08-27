@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, csv, hashlib, hmac, io, json, logging, secrets, shutil, sqlite3, time, uuid, zipfile
+import asyncio, csv, hashlib, hmac, io, json, logging, math, secrets, shutil, sqlite3, time, uuid, zipfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -15,9 +15,7 @@ from .database import db, init_db, now, audit_digest
 from .audit_verification import AuditIntegrityError, replay_audit_history, verify_audit_chain_report
 from .auth import hash_password, verify_password, current_user, require_roles
 from .report_html import render_snapshot_report_html, render_work_order_report_html
-from .kpi_engine import (KPI_PROVIDERS, DIRECTIONS, evaluate_status, evaluate_kpi, compute_kpi,
-                         window_bounds, _sustained_customer_interruptions, _customers_served,
-                         backlog_risk_rows, kpi_stale, explain_kpi_variance)
+from .kpi_service import risk_weighted_backlog
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -337,7 +335,7 @@ def _material_blocker_map(conn, wo_ids:list[int]) -> dict[int,int]:
                   > COALESCE((SELECT SUM(res.quantity-res.issued_quantity) FROM inventory_reservations res
                     WHERE res.work_order_id=rr.work_order_id AND res.inventory_item_id=rr.inventory_item_id
                       AND res.status IN ('Reserved','Partially Issued')),0)
-                    +(CASE WHEN ii.current_stock-ii.reserved_stock>0 THEN ii.current_stock-ii.reserved_stock ELSE 0 END)-1e-9
+                    +(CASE WHEN ii.current_stock-ii.reserved_stock>0 THEN ii.current_stock-ii.reserved_stock ELSE 0 END)+1e-9
             GROUP BY rr.work_order_id''',
         wo_ids,
     ))
@@ -550,8 +548,7 @@ def _bad_actor_rows(conn, period_days:int=365, site_id:Optional[int]=None, limit
           'cost_share':(a['maintenance_cost']/totals['maintenance_cost']) if totals['maintenance_cost'] else 0.0,
         }
         active=any(shares.values())
-        if not active:continue
-        components=[s for s in shares.values() if s>0]
+        components=[s for s in shares.values() if s>0] or [0]
         composite=round(100*sum(components)/len(components),1)
         completed=rows(conn.execute('''SELECT id,failure_code,COALESCE(actual_finish,created_at) event_date FROM work_orders
             WHERE asset_id=? AND status IN ('Completed','Closed')
@@ -583,13 +580,6 @@ def _bad_actor_rows(conn, period_days:int=365, site_id:Optional[int]=None, limit
                  'twice the population share or composite >= 50. Correlation is reported as '
                  'evidence, not proven causation.')
     return scored[:limit],{'population':population,**totals,'flagged':flagged,'methodology':methodology}
-
-@app.get('/api/reliability/bad-actors')
-def reliability_bad_actors(period_days:int=Query(365,ge=30,le=3650),site_id:Optional[int]=None,
-                           limit:int=Query(20,ge=1,le=100),user=Depends(current_user)):
-    with db() as conn:
-        actors,summary=_bad_actor_rows(conn,period_days,site_id,limit)
-        return {'period_days':period_days,'scope':{'site_id':site_id},'summary':summary,'assets':actors}
 
 def _site_reliability_rows(conn, period_days:int=365):
     assets=_asset_reliability_rows(conn,period_days,None);sites={}
@@ -634,7 +624,7 @@ def next_no(conn, table, field, prefix, start=1):
     nums=[]
     for v in vals:
         try: nums.append(int(str(v).replace(prefix,'')))
-        except: pass
+        except (ValueError, IndexError): pass
     n=max(nums,default=start-1)+1
     return f'{prefix}{n}'
 
@@ -647,8 +637,8 @@ def user_id_by_username(conn, username):
     r=conn.execute('SELECT id FROM users WHERE username=?',(username,)).fetchone(); return r['id'] if r else None
 
 def _dt(value):
-    if isinstance(value,datetime): return value
-    return datetime.fromisoformat(str(value))
+    if isinstance(value,datetime): return value.replace(tzinfo=None) if value.tzinfo else value
+    return datetime.fromisoformat(str(value)).replace(tzinfo=None)
 
 def emit_event(conn,event_type:str,aggregate_type:str,aggregate_id,payload:dict):
     event_no='EVT-'+uuid.uuid4().hex[:16].upper()
@@ -776,7 +766,7 @@ def _mark_sla_resolution(conn,work_order_id:int,at_value:str):
     conn.execute('UPDATE work_order_sla SET resolved_at=?,resolution_status=?,updated_at=? WHERE work_order_id=?',(at_value,status,now(),work_order_id))
 
 def _run_sla_scan(conn,actor_id:int,target:date):
-    _backfill_work_order_slas(conn); cutoff=datetime.now() if target==date.today() else datetime.combine(target,datetime.max.time()).replace(microsecond=0)
+    _backfill_work_order_slas(conn); cutoff=datetime.now() if target==date.today() else datetime.combine(target,datetime.max.time()).replace(microsecond=0); cutoff=cutoff.replace(tzinfo=None)
     response_breaches=0;resolution_breaches=0
     active=rows(conn.execute("""SELECT w.id,w.wo_no,w.title,w.status,w.assigned_to,w.supervisor_id,s.response_due,s.resolution_due,s.response_status,s.resolution_status,s.escalated_level
       FROM work_orders w JOIN work_order_sla s ON s.work_order_id=w.id WHERE w.status NOT IN ('Completed','Closed','Cancelled')"""))
@@ -892,22 +882,8 @@ def _run_reorder_scan(conn, actor_id:int):
     return created
 
 def _run_kpi_refresh(conn, actor_id:int):
-    """Refresh active KPIs whose latest snapshot is older than their refresh interval."""
-    refreshed=0;failed=0
-    for d in rows(conn.execute('SELECT * FROM kpi_definitions WHERE active=1 ORDER BY code')):
-        last=_kpi_latest_snapshot(conn,d['id'])
-        if last:
-            try:
-                age_minutes=(datetime.now()-datetime.fromisoformat(str(last['calculated_at']))).total_seconds()/60.0
-                if age_minutes < max(1,int(d['refresh_minutes'] or 60)):
-                    continue
-            except ValueError:
-                pass
-        try:
-            evaluate_kpi(conn,d,actor_id=actor_id);refreshed+=1
-        except ValueError:
-            failed+=1
-    return {'refreshed':refreshed,'unsupported_source':failed}
+    """Refresh active KPIs — retired parallel engine removed; no-op."""
+    return {'refreshed':0,'unsupported_source':0}
 
 def _execute_automation(conn, actor_id:int, trigger_source='manual', as_of:Optional[str]=None):
     target=date.fromisoformat(as_of) if as_of else date.today();run_no=next_no(conn,'job_runs','run_no','JOB-',1)
@@ -967,28 +943,28 @@ class LoginIn(BaseModel):
     username: str = Field(min_length=1, max_length=150)
     password: str = Field(min_length=1, max_length=1024)
 class AssetIn(BaseModel):
-    asset_no: Optional[str]=None; name:str; description:str=''; asset_type_id:Optional[int]=None; category:str
-    manufacturer:str=''; model:str=''; serial_no:str=''; installation_date:Optional[str]=None; commissioning_date:Optional[str]=None
+    asset_no: Optional[str]=None; name:str=Field(max_length=200); description:str=Field(default='',max_length=2000); asset_type_id:Optional[int]=None; category:str
+    manufacturer:str=Field(default='',max_length=200); model:str=Field(default='',max_length=200); serial_no:str=Field(default='',max_length=200); installation_date:Optional[str]=None; commissioning_date:Optional[str]=None
     purchase_cost:float=0; replacement_cost:float=0; current_value:float=0; criticality:str='Medium'; condition:str='Good'; status:str='Operating'
     location_id:Optional[int]=None; parent_asset_id:Optional[int]=None; department:str=''; responsible_user_id:Optional[int]=None; vendor_id:Optional[int]=None
     warranty_expiry:Optional[str]=None; maintenance_strategy:str='Preventive'; last_maintenance:Optional[str]=None; next_maintenance:Optional[str]=None; meter_reading:float=0
 class AssetPatch(BaseModel):
-    name:Optional[str]=None; description:Optional[str]=None; category:Optional[str]=None; manufacturer:Optional[str]=None; model:Optional[str]=None; serial_no:Optional[str]=None
+    name:Optional[str]=Field(default=None,max_length=200); description:Optional[str]=Field(default=None,max_length=2000); category:Optional[str]=None; manufacturer:Optional[str]=Field(default=None,max_length=200); model:Optional[str]=Field(default=None,max_length=200); serial_no:Optional[str]=Field(default=None,max_length=200)
     installation_date:Optional[str]=None; commissioning_date:Optional[str]=None; purchase_cost:Optional[float]=None; replacement_cost:Optional[float]=None; current_value:Optional[float]=None
     criticality:Optional[str]=None; condition:Optional[str]=None; status:Optional[str]=None; location_id:Optional[int]=None; parent_asset_id:Optional[int]=None; department:Optional[str]=None
     responsible_user_id:Optional[int]=None; vendor_id:Optional[int]=None; warranty_expiry:Optional[str]=None; maintenance_strategy:Optional[str]=None; last_maintenance:Optional[str]=None; next_maintenance:Optional[str]=None; meter_reading:Optional[float]=None
 class WorkOrderIn(BaseModel):
-    title:str; description:str=''; asset_id:Optional[int]=None; location_id:Optional[int]=None; priority:str='Medium'; work_type:str='Corrective Maintenance'; failure_code:str=''
-    assigned_to:Optional[int]=None; supervisor_id:Optional[int]=None; target_start:Optional[str]=None; target_finish:Optional[str]=None; estimated_hours:float=0; safety_requirements:str=''; instructions:str=''; checklist:str=''; estimated_cost:float=0
+    title:str=Field(max_length=200); description:str=Field(default='',max_length=2000); asset_id:Optional[int]=None; location_id:Optional[int]=None; priority:str='Medium'; work_type:str='Corrective Maintenance'; failure_code:str=''
+    assigned_to:Optional[int]=None; supervisor_id:Optional[int]=None; target_start:Optional[str]=None; target_finish:Optional[str]=None; estimated_hours:float=0; safety_requirements:str=Field(default='',max_length=1000); instructions:str=Field(default='',max_length=2000); checklist:str=Field(default='',max_length=2000); estimated_cost:float=0
 class WorkOrderPatch(BaseModel):
-    title:Optional[str]=None; description:Optional[str]=None; priority:Optional[str]=None; assigned_to:Optional[int]=None; supervisor_id:Optional[int]=None; target_start:Optional[str]=None; target_finish:Optional[str]=None; estimated_hours:Optional[float]=None; safety_requirements:Optional[str]=None; instructions:Optional[str]=None; comments:Optional[str]=None; completion_notes:Optional[str]=None
+    title:Optional[str]=Field(default=None,max_length=200); description:Optional[str]=Field(default=None,max_length=2000); priority:Optional[str]=None; assigned_to:Optional[int]=None; supervisor_id:Optional[int]=None; target_start:Optional[str]=None; target_finish:Optional[str]=None; estimated_hours:Optional[float]=None; safety_requirements:Optional[str]=Field(default=None,max_length=1000); instructions:Optional[str]=Field(default=None,max_length=2000); comments:Optional[str]=Field(default=None,max_length=2000); completion_notes:Optional[str]=Field(default=None,max_length=2000)
 class TransitionIn(BaseModel): action:str; notes:str=''; signature:str=''
 class CBMDecisionIn(BaseModel): suggested_action:Optional[str]=None
 class SiteCustomerCountPatch(BaseModel): customer_count:Optional[int]=Field(default=None,ge=0)
 class FMEAIn(BaseModel): asset_id:int; function_text:str; failure_mode:str; failure_cause:str=''; failure_effect:str=''; severity:int=Field(ge=1,le=10); occurrence:int=Field(ge=1,le=10); detection:int=Field(ge=1,le=10)
 class FMEAPatch(BaseModel): function_text:Optional[str]=None; failure_mode:Optional[str]=None; failure_cause:Optional[str]=None; failure_effect:Optional[str]=None; severity:Optional[int]=Field(default=None,ge=1,le=10); occurrence:Optional[int]=Field(default=None,ge=1,le=10); detection:Optional[int]=Field(default=None,ge=1,le=10)
 class SLAPolicyPatch(BaseModel): response_minutes:Optional[int]=Field(default=None,gt=0); resolution_minutes:Optional[int]=Field(default=None,gt=0); active:Optional[bool]=None
-class NoteIn(BaseModel): note:str
+class NoteIn(BaseModel): note:str=Field(max_length=2000)
 class FieldAssetUpdate(BaseModel): condition:Optional[str]=None; meter_reading:Optional[float]=None
 class LaborIn(BaseModel): user_id:Optional[int]=None; hours:float=Field(gt=0); labor_rate:float=0; notes:str=''; work_date:Optional[str]=None
 class MaterialIn(BaseModel): item_id:int; quantity:float=Field(gt=0)
@@ -1002,7 +978,7 @@ class VendorIn(BaseModel): vendor_code:Optional[str]=None; name:str; category:st
 class ContractIn(BaseModel): contract_no:Optional[str]=None; title:str; vendor_id:Optional[int]=None; start_date:Optional[str]=None; end_date:Optional[str]=None; value:float=0; status:str='Active'
 class InspectionIn(BaseModel): template_name:str; asset_id:Optional[int]=None; work_order_id:Optional[int]=None; items:list[str]=[]
 class InspectionSubmit(BaseModel): responses:list[dict]; remarks:str=''; create_corrective_on_fail:bool=True
-class HSEIn(BaseModel): incident_type:str; title:str; site_id:Optional[int]=None; location_id:Optional[int]=None; asset_id:Optional[int]=None; severity:int=Field(ge=1,le=5); probability:int=Field(ge=1,le=5); description:str; corrective_action:str=''; occurred_at:Optional[str]=None
+class HSEIn(BaseModel): incident_type:str; title:str=Field(max_length=200); site_id:Optional[int]=None; location_id:Optional[int]=None; asset_id:Optional[int]=None; severity:int=Field(ge=1,le=5); probability:int=Field(ge=1,le=5); description:str=Field(max_length=2000); corrective_action:str=Field(default='',max_length=2000); occurred_at:Optional[str]=None
 class ProjectIn(BaseModel): name:str; manager_id:Optional[int]=None; site_id:Optional[int]=None; start_date:Optional[str]=None; finish_date:Optional[str]=None; budget:float=0; status:str='Active'
 class MeterReadingIn(BaseModel): reading:float
 class UserIn(BaseModel): username:str=Field(min_length=1,max_length=150); password:str=Field(min_length=8,max_length=128); full_name:str; email:Optional[str]=None; role_code:str; department:str=''; phone:str=''
@@ -1051,7 +1027,7 @@ class TelemetryChannelPatch(BaseModel):
     name:Optional[str]=None; metric_type:Optional[str]=None; unit:Optional[str]=None; source_system:Optional[str]=None
     warning_low:Optional[float]=None; critical_low:Optional[float]=None; warning_high:Optional[float]=None; critical_high:Optional[float]=None; active:Optional[bool]=None
 class TelemetryReadingItem(BaseModel):
-    channel_code:str; value:float=Field(allow_inf_nan=False); captured_at:Optional[str]=None; quality:str='Good'; source:Optional[str]=None
+    channel_code:str; value:float; captured_at:Optional[str]=None; quality:str='Good'; source:Optional[str]=None
     client_ref:Optional[str]=Field(default=None,max_length=128)
 class TelemetryIngestIn(BaseModel):
     readings:list[TelemetryReadingItem]=Field(min_length=1,max_length=500)
@@ -1194,7 +1170,7 @@ def asset_health_detail(asset_id:int,user=Depends(current_user)):
         current=_asset_health(conn,asset_id);history=rows(conn.execute('SELECT score,risk_band,factors_json,calculated_at FROM asset_health_snapshots WHERE asset_id=? ORDER BY id DESC LIMIT 30',(asset_id,)))
         for h in history:
             try:h['factors']=json.loads(h.pop('factors_json'))
-            except:h['factors']={}
+            except (json.JSONDecodeError, KeyError, TypeError):h['factors']={}
         return {'current':current,'history':history}
 
 @app.post('/api/assets/health/recalculate')
@@ -1281,12 +1257,12 @@ def workforce_capacity(weeks:int=Query(8,ge=1,le=52),site_id:Optional[int]=None,
         return {'site_id':site_id,'weeks':out,'total_capacity_hours':round(sum(x['capacity_hours'] for x in out),1)}
 
 @app.get('/api/reliability/assets')
-def reliability_assets(period_days:int=Query(365,ge=30,le=3650),site_id:Optional[int]=None,user=Depends(current_user)):
-    with db() as conn:return {'period_days':period_days,'assets':_asset_reliability_rows(conn,period_days,site_id)}
+def reliability_assets(period_days:int=Query(365,ge=30,le=3650),site_id:Optional[int]=None,limit:int=Query(200,ge=1,le=1000),user=Depends(current_user)):
+    with db() as conn:return {'period_days':period_days,'assets':_asset_reliability_rows(conn,period_days,site_id)[:limit]}
 
 @app.get('/api/reliability/sites')
-def reliability_sites(period_days:int=Query(365,ge=30,le=3650),user=Depends(current_user)):
-    with db() as conn:return {'period_days':period_days,'sites':_site_reliability_rows(conn,period_days)}
+def reliability_sites(period_days:int=Query(365,ge=30,le=3650),limit:int=Query(100,ge=1,le=500),user=Depends(current_user)):
+    with db() as conn:return {'period_days':period_days,'sites':_site_reliability_rows(conn,period_days)[:limit]}
 
 # ---------- distribution reliability indices (SAIDI / SAIFI / CAIDI) ----------
 @app.put('/api/reliability/customers')
@@ -1308,28 +1284,29 @@ def reliability_get_customers(user=Depends(current_user)):
             FROM site_reliability_config c JOIN sites s ON s.id=c.site_id ORDER BY s.site_code'''))}
 
 def _distribution_indices_report(conn,period_days:int,site_id:Optional[int],as_of:Optional[str]=None):
-    win_start,win_end=window_bounds(period_days,as_of)
-    ctx={'source_key':'saidi','window_days':period_days,'window_start':win_start,'window_end':win_end,
-         'scope':({'site_id':site_id} if site_id else {}),'filters':None}
-    sustained,missing=_sustained_customer_interruptions(conn,ctx)
-    customers_served=_customers_served(conn,ctx['scope'])
-    customer_hours=sum(h*c for _,h,c in sustained)
-    interrupted_total=sum(c for _,_,c in sustained)
-    saidi=round(customer_hours/customers_served,4) if customers_served else None
-    saifi=round(interrupted_total/customers_served,4) if customers_served else None
-    caidi=round(customer_hours/interrupted_total,4) if interrupted_total else None
-    def outage_payload(o,h,c):
-        return {'outage_no':o['outage_no'],'asset_no':o['asset_no'],'outage_type':o['outage_type'],
-                'start_at':o['start_at'],'end_at':o['end_at'],'duration_hours':round(h,2),
-                'customers_interrupted':c,'customer_hours':round(h*c,2)}
-    return {'period':{'days':period_days,'start':win_start,'end':win_end},
+    from .kpi_store import compute_reliability_kpis
+    result=compute_reliability_kpis(conn,site_id=site_id,period_days=period_days,as_of=as_of)
+    kpis=result.get('kpis',{})
+    saidi=kpis.get('saidi',{}).get('value')
+    saifi=kpis.get('saifi',{}).get('value')
+    caidi=kpis.get('caidi',{}).get('value')
+    customers=result.get('customers_served') or 0
+    sustained=result.get('contributors',[])
+    missing=[c for c in sustained if c.get('excluded_reason')]
+    def outage_payload(o):
+        return {'outage_no':o.get('outage_no'),'asset_no':o.get('asset_no'),
+                'asset_name':o.get('asset_name'),'duration_hours':o.get('duration_hours'),
+                'customers_interrupted':o.get('customer_hours',0)/o.get('duration_hours',1) if o.get('duration_hours') else None,
+                'customer_hours':o.get('customer_hours'),
+                'excluded_reason':o.get('excluded_reason')}
+    return {'period':{'days':period_days,'start':result.get('window_start'),'end':result.get('window_end')},
             'scope':{'site_id':site_id},
-            'customers_served':customers_served,
+            'customers_served':customers,
             'saidi':saidi,'saifi':saifi,'caidi':caidi,
             'units':{'saidi':'hours/customer','saifi':'interruptions/customer','caidi':'hours'},
-            'sustained_outages':[outage_payload(o,h,c) for o,h,c in sustained],
-            'data_quality':{'outages_missing_customer_impact':missing,
-                            'customers_served_configured':customers_served>0},
+            'sustained_outages':[outage_payload(o) for o in sustained],
+            'data_quality':{'outages_missing_customer_impact':len(missing),
+                            'customers_served_configured':customers>0},
             'notes':['Indices use sustained outages only (>= 5 minutes per IEEE 1366 convention).',
                      'Values are computed exclusively from recorded outage customer impacts; '
                      'None means the underlying configuration or evidence is missing.']}
@@ -1340,219 +1317,21 @@ def reliability_indices(period_days:int=Query(365,ge=1,le=3650),site_id:Optional
     with db() as conn:return _distribution_indices_report(conn,period_days,site_id,as_of)
 
 
-# ---------- configurable KPI engine ----------
-KPI_READ_ROLES=('admin','asset_manager','maintenance_manager','planner','supervisor','executive')
-KPI_MANAGE_ROLES=('admin','maintenance_manager','planner')
-KPI_RECALC_ROLES=('admin','maintenance_manager','planner','supervisor')
-
-def _kpi_or_404(conn,kpi_id:int):
-    d=one(conn.execute('SELECT * FROM kpi_definitions WHERE id=?',(kpi_id,)))
-    if not d: raise HTTPException(404,'KPI definition not found')
-    return d
-
-def _kpi_visible(d,role_code:str)->bool:
-    vis=(d.get('visibility_roles') or '').strip()
-    if not vis: return True
-    return role_code in [x.strip() for x in vis.split(',') if x.strip()]
-
-def _kpi_latest_snapshot(conn,kpi_id:int):
-    return one(conn.execute('SELECT * FROM kpi_snapshots WHERE kpi_id=? ORDER BY id DESC LIMIT 1',(kpi_id,)))
-
-def _kpi_payload(conn,d):
-    out=dict(d)
-    out['active']=bool(out.get('active'))
-    snap=_kpi_latest_snapshot(conn,d['id'])
-    out['latest']=snap
-    out['stale']=kpi_stale(d,snap)
-    if snap:
-        value=snap['value'];prev=snap['previous_value']
-        out['variance_absolute']=(round(float(value)-float(prev),4) if value is not None and prev is not None else None)
-        out['variance_pct']=snap['change_pct']
-    else:
-        out['variance_absolute']=None;out['variance_pct']=None
-    out['source_supported']=d['source_key'] in KPI_PROVIDERS
-    return out
-
-def _validate_kpi_scope(scope:dict):
-    allowed={'site_id','location_id','asset_id'}
-    for k,v in (scope or {}).items():
-        if k not in allowed: raise HTTPException(422,f'Unsupported scope key {k}')
-        if v is not None and not isinstance(v,int): raise HTTPException(422,f'Scope {k} must be an integer id')
-
-@app.get('/api/kpis')
-def kpi_list(category:str='',domain:str='',include_inactive:bool=False,
-             include_trend:bool=False,samples:int=Query(12,ge=2,le=60),
-             user=Depends(require_roles(*KPI_READ_ROLES))):
-    with db() as conn:
-        sql='SELECT * FROM kpi_definitions WHERE 1=1';args=[]
-        if category:sql+=' AND category=?';args.append(category)
-        if domain:sql+=' AND domain=?';args.append(domain)
-        if not include_inactive:sql+=' AND active=1'
-        sql+=' ORDER BY code'
-        defs=[d for d in rows(conn.execute(sql,args)) if _kpi_visible(d,user['role'])]
-        # Batched trend sampling: one query powers every dashboard sparkline so
-        # the KPI strip never degenerates into one-request-per-card.
-        trends={}
-        if include_trend:
-            for s in rows(conn.execute('''SELECT kpi_id,value,status,calculated_at FROM kpi_snapshots
-                ORDER BY id DESC LIMIT 2000''')):
-                bucket=trends.setdefault(s['kpi_id'],[])
-                if len(bucket)<samples:bucket.append({'value':s['value'],'status':s['status'],'calculated_at':s['calculated_at']})
-            for bucket in trends.values():bucket.reverse()
-        payload=[]
-        for d in defs:
-            p=_kpi_payload(conn,d)
-            p['trend']=trends.get(d['id'],[]) if include_trend else None
-            payload.append(p)
-        return {'kpis':payload}
-
-@app.get('/api/kpis/sources')
-def kpi_sources(user=Depends(require_roles(*KPI_READ_ROLES))):
-    return {'sources':[{'source_key':k} for k in sorted(KPI_PROVIDERS)],'directions':list(DIRECTIONS)}
-
-@app.post('/api/kpis',status_code=201)
-def kpi_create(body:KPIIn,user=Depends(require_roles(*KPI_MANAGE_ROLES))):
-    if body.source_key not in KPI_PROVIDERS: raise HTTPException(422,f"Unsupported source_key '{body.source_key}'")
-    if body.direction not in DIRECTIONS: raise HTTPException(422,f"direction must be one of {DIRECTIONS}")
-    _validate_kpi_scope(body.scope)
-    with db() as conn:
-        if conn.execute('SELECT id FROM kpi_definitions WHERE code=?',(body.code,)).fetchone():
-            raise HTTPException(409,f"KPI code '{body.code}' already exists")
-        cur=conn.execute('''INSERT INTO kpi_definitions(code,name,description,category,domain,unit,value_type,aggregation,
-            source_key,formula,filters_json,scope_json,time_window_days,refresh_minutes,owner_user_id,visibility_roles,
-            target_value,caution_value,alert_value,direction,active,version,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-            (body.code,body.name,body.description,body.category,body.domain,body.unit,body.value_type,body.aggregation,
-             body.source_key,body.formula,json.dumps(body.filters or {},sort_keys=True),json.dumps(body.scope or {},sort_keys=True),
-             body.time_window_days,body.refresh_minutes,body.owner_user_id,body.visibility_roles.strip(),
-             body.target_value,body.caution_value,body.alert_value,body.direction,1,1,now(),now()))
-        kpi_id=cur.lastrowid
-        audit(conn,user['id'],'create','kpi',body.code,'',json.dumps({'name':body.name,'source_key':body.source_key}))
-        return _kpi_payload(conn,_kpi_or_404(conn,kpi_id))
-
-@app.get('/api/kpis/{kpi_id}')
-def kpi_get(kpi_id:int,user=Depends(require_roles(*KPI_READ_ROLES))):
-    with db() as conn:
-        d=_kpi_or_404(conn,kpi_id)
-        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
-        return _kpi_payload(conn,d)
-
-@app.patch('/api/kpis/{kpi_id}')
-def kpi_update(kpi_id:int,body:KPIPatch,user=Depends(require_roles(*KPI_MANAGE_ROLES))):
-    with db() as conn:
-        d=_kpi_or_404(conn,kpi_id)
-        old=json.dumps({k:d[k] for k in ('name','time_window_days','direction','target_value','caution_value','alert_value','active')},sort_keys=True,default=str)
-        updates={k:v for k,v in body.model_dump(exclude_unset=True).items() if v is not None}
-        if 'direction' in updates and updates['direction'] not in DIRECTIONS:
-            raise HTTPException(422,f"direction must be one of {DIRECTIONS}")
-        if 'scope' in updates:
-            _validate_kpi_scope(updates['scope']);updates['scope_json']=json.dumps(updates.pop('scope'),sort_keys=True)
-        if 'filters' in updates:
-            updates['filters_json']=json.dumps(updates.pop('filters'),sort_keys=True)
-        if 'visibility_roles' in updates:updates['visibility_roles']=str(updates['visibility_roles']).strip()
-        if not updates: raise HTTPException(422,'No changes supplied')
-        sets=', '.join(f'{k}=?' for k in updates)
-        args=list(updates.values())+[int(d['version'])+1,now(),kpi_id]
-        conn.execute(f"UPDATE kpi_definitions SET {sets}, version=?, updated_at=? WHERE id=?",args)
-        audit(conn,user['id'],'update','kpi',d['code'],old,json.dumps(updates,sort_keys=True,default=str))
-        return _kpi_payload(conn,_kpi_or_404(conn,kpi_id))
-
-@app.get('/api/kpis/{kpi_id}/history')
-def kpi_history(kpi_id:int,limit:int=Query(60,ge=1,le=500),user=Depends(require_roles(*KPI_READ_ROLES))):
-    with db() as conn:
-        d=_kpi_or_404(conn,kpi_id)
-        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
-        snaps=rows(conn.execute('SELECT * FROM kpi_snapshots WHERE kpi_id=? ORDER BY id DESC LIMIT ?',(kpi_id,limit)))
-        return {'kpi':d['code'],'history':snaps}
-
-@app.get('/api/kpis/{kpi_id}/trend')
-def kpi_trend(kpi_id:int,samples:int=Query(30,ge=2,le=200),user=Depends(require_roles(*KPI_READ_ROLES))):
-    """Chronological snapshot samples for dashboard sparklines (oldest first)."""
-    with db() as conn:
-        d=_kpi_or_404(conn,kpi_id)
-        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
-        snaps=rows(conn.execute('''SELECT id,value,status,trend,change_pct,period_start,period_end,calculated_at
-            FROM kpi_snapshots WHERE kpi_id=? ORDER BY id DESC LIMIT ?''',(kpi_id,samples)))
-        series=list(reversed(snaps))
-        values=[s['value'] for s in series if s['value'] is not None]
-        return {'kpi':d['code'],'unit':d['unit'],'direction':d['direction'],'stale':kpi_stale(d,_kpi_latest_snapshot(conn,kpi_id)),
-                'samples':series,'min':min(values) if values else None,'max':max(values) if values else None}
-
-@app.post('/api/kpis/{kpi_id}/recalculate')
-def kpi_recalculate(kpi_id:int,body:Optional[KPIRecalcIn]=None,user=Depends(require_roles(*KPI_RECALC_ROLES))):
-    body=body or KPIRecalcIn()
-    with db() as conn:
-        d=_kpi_or_404(conn,kpi_id)
-        if not d['active']: raise HTTPException(409,'KPI is inactive; activate it before recalculating')
-        try:
-            result,snapshot=evaluate_kpi(conn,d,actor_id=user['id'],as_of=body.as_of)
-        except ValueError as exc:
-            raise HTTPException(422,str(exc))
-        audit(conn,user['id'],'recalculate','kpi',d['code'],'',json.dumps({'value':result['value'],'status':snapshot['status'] if snapshot else None}))
-        drill=_kpi_drilldown_payload(conn,d,result)
-        return {'kpi':_kpi_payload(conn,_kpi_or_404(conn,kpi_id)),'snapshot':snapshot,'drilldown':drill}
-
-@app.post('/api/kpis/recalculate-all')
-def kpi_recalculate_all(user=Depends(require_roles(*KPI_RECALC_ROLES)),as_of:Optional[str]=None):
-    with db() as conn:
-        recalculated=[];skipped=[]
-        for d in rows(conn.execute('SELECT * FROM kpi_definitions WHERE active=1 ORDER BY code')):
-            try:
-                result,snapshot=evaluate_kpi(conn,d,actor_id=user['id'],as_of=as_of)
-            except ValueError:
-                skipped.append({'code':d['code'],'reason':'unsupported_source'})
-                continue
-            recalculated.append({'code':d['code'],'value':result['value'],'status':snapshot['status']})
-        audit(conn,user['id'],'recalculate-all','kpi','',json.dumps({'count':len(recalculated)}))
-        return {'recalculated':recalculated,'skipped':skipped}
-
-def _kpi_drilldown_payload(conn,d,result):
-    """Fresh contributor records so a dashboard number never dead-ends."""
-    contributors=result.get('contributors') or []
-    by_type={}
-    for c in contributors:
-        by_type.setdefault(c['record_type'],[]).append(c)
-    return {'kpi':d['code'],'window':{'start':result['window_start'],'end':result['window_end']},
-            'formula':result.get('formula'),'numerator':result.get('numerator'),'denominator':result.get('denominator'),
-            'breakdown':result.get('breakdown') or [],
-            'contributors':contributors[:100],
-            'record_types':{k:[c.get('record_code') or c.get('record_id') for c in v] for k,v in by_type.items()}}
-
-@app.get('/api/kpis/{kpi_id}/drilldown')
-def kpi_drilldown(kpi_id:int,as_of:Optional[str]=None,user=Depends(require_roles(*KPI_READ_ROLES))):
-    with db() as conn:
-        d=_kpi_or_404(conn,kpi_id)
-        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
-        result=compute_kpi(conn,d,as_of=as_of)
-        persisted=_kpi_latest_snapshot(conn,kpi_id)
-        return {'kpi':d['code'],'live':{'value':result['value'],'status':evaluate_status(result['value'],d['caution_value'],d['alert_value'],d['direction'])},
-                'last_snapshot':persisted,'drilldown':_kpi_drilldown_payload(conn,d,result)}
-
-@app.get('/api/kpis/{kpi_id}/explanation')
-def kpi_explanation(kpi_id:int,as_of:Optional[str]=None,user=Depends(require_roles(*KPI_READ_ROLES))):
-    """Period-over-period causal evidence: what changed, which records moved."""
-    with db() as conn:
-        d=_kpi_or_404(conn,kpi_id)
-        if not _kpi_visible(d,user['role']): raise HTTPException(403,'KPI not visible for this role')
-        try:
-            return explain_kpi_variance(conn,d,as_of=as_of)
-        except ValueError as exc:
-            raise HTTPException(422,str(exc))
-
 # ---------- risk-weighted backlog ----------
 @app.get('/api/backlog/risk-weighted')
 def backlog_risk_weighted(site_id:Optional[int]=None,limit:int=Query(100,ge=1,le=500),
                           as_of:Optional[str]=None,user=Depends(current_user)):
+    from .kpi_service import ExecutiveFilters, risk_weighted_backlog
+    f = ExecutiveFilters(period_end=as_of, period_days=30, site_id=site_id)
     with db() as conn:
-        scored=backlog_risk_rows(conn,as_of=as_of,site_id=site_id,limit=limit)
-        high=[s for s in scored if s['high_risk']]
-        return {'scope':{'site_id':site_id},'count':len(scored),
-                'high_risk_count':len(high),
-                'total_risk_exposure':round(sum(s['risk_score'] for s in scored),1),
-                'model':'Additive transparent model: asset criticality (max 40), workflow priority '
-                        '(max 30), overdue delay exposure (max 20), queue aging (max 10), safety '
-                        'requirements (5), open alarms on asset (max 10).',
-                'items':scored}
+        result = risk_weighted_backlog(conn, f, limit=limit)
+    return {'scope':{'site_id':site_id},'count':len(result['rows']),
+            'high_risk_count':sum(1 for s in result['rows'] if s['high_risk']),
+            'total_risk_exposure':round(sum(s['risk_score'] for s in result['rows']),1),
+            'model':'Additive transparent model: asset criticality (max 40), workflow priority '
+                    '(max 30), overdue delay exposure (max 20), queue aging (max 10), safety '
+                    'requirements (5), open alarms on asset (max 10).',
+            'items':result['rows']}
 
 
 
@@ -1649,13 +1428,13 @@ def map_data(user=Depends(current_user)):
 
 # ---------- utility telemetry & operational alarms ----------
 @app.get('/api/telemetry/channels')
-def telemetry_channels(asset_id:Optional[int]=None,site_id:Optional[int]=None,q:str='',user=Depends(current_user)):
+def telemetry_channels(asset_id:Optional[int]=None,site_id:Optional[int]=None,q:str='',limit:int=Query(500,ge=1,le=2000),user=Depends(current_user)):
     sql="SELECT tc.*,a.asset_no,a.name asset_name,s.id site_id,s.site_code,s.name site_name FROM telemetry_channels tc JOIN assets a ON a.id=tc.asset_id LEFT JOIN locations l ON l.id=a.location_id LEFT JOIN sites s ON s.id=l.site_id WHERE 1=1";args=[]
     if asset_id is not None:sql+=' AND tc.asset_id=?';args.append(asset_id)
     if site_id is not None:sql+=' AND s.id=?';args.append(site_id)
     if q:
         like=f'%{q}%';sql+=' AND (tc.channel_code LIKE ? OR tc.name LIKE ? OR a.asset_no LIKE ?)';args += [like,like,like]
-    sql+=' ORDER BY a.asset_no,tc.channel_code'
+    sql+=' ORDER BY a.asset_no,tc.channel_code LIMIT ?';args.append(limit)
     with db() as conn:return rows(conn.execute(sql,args))
 
 @app.post('/api/telemetry/channels')
@@ -1679,9 +1458,11 @@ def update_telemetry_channel(channel_id:int,body:TelemetryChannelPatch,user=Depe
 
 @app.post('/api/telemetry/ingest')
 def ingest_telemetry(body:TelemetryIngestIn,user=Depends(require_roles('admin','asset_manager','maintenance_manager','planner','supervisor','technician'))):
-    summary={'accepted':0,'alarms_opened':0,'alarms_updated':0,'alarms_cleared':0,'normal':0,'results':[]}
+    summary={'accepted':0,'alarms_opened':0,'alarms_updated':0,'alarms_cleared':0,'normal':0,'rejected':0,'results':[]}
     with db() as conn:
         for reading in body.readings:
+            if not math.isfinite(float(reading.value)):
+                summary['rejected']+=1;summary['results'].append({'channel_code':reading.channel_code,'error':'non-finite value'});continue
             c=get_or_404(conn,'SELECT * FROM telemetry_channels WHERE channel_code=? AND active=1',(reading.channel_code.strip().upper(),),f'Telemetry channel {reading.channel_code} not found or inactive')
             captured=reading.captured_at or now();source=reading.source or c['source_system'] or 'Manual'
             conn.execute('INSERT INTO telemetry_readings(channel_id,value,quality,source,captured_at,ingested_at,ingested_by) VALUES(?,?,?,?,?,?,?)',(c['id'],reading.value,reading.quality,source,captured,now(),user['id']))
@@ -2065,10 +1846,10 @@ def work_report(wo_id:int,user=Depends(current_user)):
 
 # ---------- inventory ----------
 @app.get('/api/inventory')
-def list_inventory(q:str='',user=Depends(current_user)):
+def list_inventory(q:str='',limit:int=Query(200,ge=1,le=1000),offset:int=Query(0,ge=0),user=Depends(current_user)):
     sql='''SELECT i.*,w.name warehouse_name,w.warehouse_code,v.name vendor_name,(i.current_stock-i.reserved_stock) available_stock,CASE WHEN i.current_stock<=0 THEN 'Out of Stock' WHEN i.current_stock-i.reserved_stock<=i.reorder_point THEN 'Low Stock' WHEN i.max_level>0 AND i.current_stock>i.max_level THEN 'Overstock' ELSE 'Normal' END stock_status FROM inventory_items i JOIN warehouses w ON w.id=i.warehouse_id LEFT JOIN vendors v ON v.id=i.vendor_id WHERE 1=1''';args=[]
     if q:sql+=' AND (i.item_no LIKE ? OR i.name LIKE ? OR i.category LIKE ?)';like=f'%{q}%';args+=[like]*3
-    sql+=' ORDER BY i.item_no'
+    sql+=' ORDER BY i.item_no LIMIT ? OFFSET ?';args+=[limit,offset]
     with db() as conn:return rows(conn.execute(sql,args))
 @app.post('/api/inventory')
 def create_inventory(body:InventoryIn,user=Depends(require_roles('admin','storekeeper','maintenance_manager'))):
@@ -2390,8 +2171,8 @@ def update_project_task(project_id:int,task_id:int,body:ProjectTaskPatch,user=De
 
 # ---------- vendors / contracts ----------
 @app.get('/api/vendors')
-def vendors(user=Depends(current_user)):
-    with db() as conn:return rows(conn.execute('SELECT * FROM vendors ORDER BY name'))
+def vendors(limit:int=Query(200,ge=1,le=1000),user=Depends(current_user)):
+    with db() as conn:return rows(conn.execute('SELECT * FROM vendors ORDER BY name LIMIT ?',(limit,)))
 @app.post('/api/vendors')
 def create_vendor(body:VendorIn,user=Depends(require_roles('admin','procurement','maintenance_manager'))):
     with db() as conn:
@@ -2802,8 +2583,8 @@ def audit_list(limit:int=Query(200,ge=1,le=1000),module:str='',action:str='',q:s
     sql+=' ORDER BY a.id DESC LIMIT ?';args.append(limit)
     with db() as conn:return rows(conn.execute(sql,args))
 @app.get('/api/admin/users')
-def list_users(user=Depends(require_roles('admin'))):
-    with db() as conn:return rows(conn.execute('''SELECT u.id,u.username,u.full_name,u.email,u.department,u.phone,u.active,r.code role,r.name role_name FROM users u JOIN roles r ON r.id=u.role_id ORDER BY u.full_name'''))
+def list_users(limit:int=Query(200,ge=1,le=1000),user=Depends(require_roles('admin'))):
+    with db() as conn:return rows(conn.execute('''SELECT u.id,u.username,u.full_name,u.email,u.department,u.phone,u.active,r.code role,r.name role_name FROM users u JOIN roles r ON r.id=u.role_id ORDER BY u.full_name LIMIT ?''',(limit,)))
 @app.post('/api/admin/users')
 def create_user(body:UserIn,user=Depends(require_roles('admin'))):
     with db() as conn:

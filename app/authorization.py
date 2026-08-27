@@ -191,6 +191,18 @@ PERMISSION_CATALOG: dict[str, tuple[str, tuple[str, ...]]] = {
         'Configure customers-served figures used by SAIDI/SAIFI/CAIDI',
         ('admin', 'maintenance_manager', 'planner'),
     ),
+    'reliability.cbm.manage': (
+        'Run condition-based maintenance evaluation',
+        ('admin', 'asset_manager', 'maintenance_manager', 'planner'),
+    ),
+    'reliability.cbm.decide': (
+        'Decide condition-based maintenance recommendations',
+        ('admin', 'asset_manager', 'maintenance_manager'),
+    ),
+    'reliability.fmea.manage': (
+        'Manage FMEA records',
+        ('admin', 'asset_manager', 'maintenance_manager'),
+    ),
 }
 
 # FastAPI's matched route template is used for parameterized paths. Each entry
@@ -242,16 +254,23 @@ ROUTE_PERMISSION_OVERLAY: dict[tuple[str, str], str] = {
     ('PATCH', '/api/sla/policies/{policy_id}'): 'sla.policy.manage',
     ('PATCH', '/api/governance/retention/{policy_id}'): 'governance.retention.manage',
     ('POST', '/api/events/outbox/{event_id}/retry'): 'integrations.outbox.retry',
-    ('GET', '/api/kpis'): 'kpi.read',
-    ('GET', '/api/kpis/{kpi_id}'): 'kpi.read',
-    ('GET', '/api/kpis/{kpi_id}/history'): 'kpi.read',
-    ('GET', '/api/kpis/{kpi_id}/drilldown'): 'kpi.read',
-    ('GET', '/api/kpis/{kpi_id}/trend'): 'kpi.read',
-    ('GET', '/api/kpis/{kpi_id}/explanation'): 'kpi.read',
-    ('POST', '/api/kpis'): 'kpi.manage',
-    ('PATCH', '/api/kpis/{kpi_id}'): 'kpi.manage',
-    ('POST', '/api/kpis/{kpi_id}/recalculate'): 'kpi.recalculate',
-    ('POST', '/api/kpis/recalculate-all'): 'kpi.recalculate',
+    ('GET', '/api/kpis/reliability'): 'kpi.read',
+    ('GET', '/api/kpis/inventory'): 'kpi.read',
+    ('GET', '/api/kpis/maintenance'): 'kpi.read',
+    ('GET', '/api/kpis/workforce'): 'kpi.read',
+    ('GET', '/api/kpis/reliability.csv'): 'kpi.read',
+    ('GET', '/api/kpis/inventory.csv'): 'kpi.read',
+    ('GET', '/api/kpis/maintenance.csv'): 'kpi.read',
+    ('GET', '/api/kpis/workforce.csv'): 'kpi.read',
+    ('GET', '/api/kpis/inventory.csv'): 'kpi.read',
+    ('GET', '/api/kpis/maintenance.csv'): 'kpi.read',
+    ('GET', '/api/kpis/workforce.csv'): 'kpi.read',
+    ('POST', '/api/reliability/cbm-evaluation'): 'reliability.cbm.manage',
+    ('POST', '/api/reliability/cbm-recommendations/{recommendation_id}/convert-to-work-order'): 'reliability.cbm.manage',
+    ('POST', '/api/reliability/cbm-recommendations/{recommendation_id}/{action}'): 'reliability.cbm.decide',
+    ('POST', '/api/reliability/fmea'): 'reliability.fmea.manage',
+    ('PATCH', '/api/reliability/fmea/{fmea_id}'): 'reliability.fmea.manage',
+    ('POST', '/api/reliability/fmea/{fmea_id}/approve'): 'reliability.fmea.manage',
     ('PUT', '/api/reliability/customers'): 'reliability.customers.manage',
 }
 

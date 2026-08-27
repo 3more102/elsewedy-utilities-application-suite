@@ -42,7 +42,9 @@
     editSlaPolicy:'n',
     retryOutbox:'n',
     editRetention:'n',
-    toggleUser:'nn'
+    toggleUser:'nn',
+    closeModal:'n',
+    recalcOne:'n'
   });
 
   const CALL=/^\s*([A-Za-z_$][\w$]*)\((.*)\)\s*$/s;

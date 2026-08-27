@@ -681,9 +681,9 @@ async function renderIntelligence(){
   const order={RED:0,AMBER:1,GREEN:2,UNKNOWN:3};
   const strip=[...kpis].sort((a,b)=>((order[a.latest?.status]??3)-(order[b.latest?.status]??3)));
   const staleCount=strip.filter(k=>k.stale).length;
-  $('#content').innerHTML=`<div class="hero"><div><h1>Operational Intelligence</h1><p>${S.siteId?'KPI command center for the selected site.':'Portfolio-wide KPI command center.'} Every number drills down to its source records.</p></div><div class="hero-actions"><button class="btn" id="intel-recalc">Recalculate All</button></div></div>${staleCount?`<div class="panel" style="margin-bottom:12px"><div class="panel-body">${empty(staleCount+' KPI(s) have no fresh calculation yet. Use Recalculate All or wait for the scheduled automation refresh.')}</div></div>`:''}<div class="kpi-grid intel-strip">${strip.map(intelKpiCard).join('')}</div>
-<div class="panel-grid" style="margin-top:14px">
-<section class="panel"><div class="panel-head"><div><h3>Risk-Weighted Backlog</h3><p>${esc(backlog.model||'Transparent risk model')}</p></div></div><div class="panel-body">${backlog.items?.length?table(['WO','Title','Priority','Risk','Exposure','Asset'],backlog.items.map(i=>[`<a href="#" onclick="workDetail(${i.work_order_id});return false">${i.wo_no}</a>`,esc(i.title),status(i.priority),`<span class="risk-bar"><span style="width:${Math.min(100,i.risk_score)}%"></span></span> ${fmt(i.risk_score)}`,i.days_overdue?`${i.days_overdue}d overdue`:'-',i.asset_no||'-'])):empty('No open work in scope.')}</div></section>
+  $('#content').innerHTML=`<div class="hero"><div><h1>Operational Intelligence</h1><p>${S.siteId?'KPI command center for the selected site.':'Portfolio-wide KPI command center.'} Every number drills down to its source records.</p></div><div class="hero-actions"><button class="btn" id="intel-recalc">Recalculate All</button></div></div>${staleCount?`<div class="panel" data-csp-style="mt14"><div class="panel-body">${empty(staleCount+' KPI(s) have no fresh calculation yet. Use Recalculate All or wait for the scheduled automation refresh.')}</div></div>`:''}<div class="kpi-grid intel-strip">${strip.map(intelKpiCard).join('')}</div>
+<div class="panel-grid" data-csp-style="mt14">
+<section class="panel"><div class="panel-head"><div><h3>Risk-Weighted Backlog</h3><p>${esc(backlog.model||'Transparent risk model')}</p></div></div><div class="panel-body">${backlog.items?.length?table(['WO','Title','Priority','Risk','Exposure','Asset'],backlog.items.map(i=>[`<a href="#" onclick="workDetail(${i.work_order_id});return false">${i.wo_no}</a>`,esc(i.title),status(i.priority),`<span class="risk-bar"><progress class="project-progress" max="100" value="${Math.min(100,i.risk_score)}"></progress></span> ${fmt(i.risk_score)}`,i.days_overdue?`${i.days_overdue}d overdue`:'-',i.asset_no||'-'])):empty('No open work in scope.')}</div></section>
 <section class="panel"><div class="panel-head"><div><h3>Bad Actors</h3><p>Assets disproportionately driving failures, downtime and cost</p></div></div><div class="panel-body">${actors.assets?.length?table(['Asset','Name','Failures','Downtime h','Cost','Evidence','Flagged'],actors.assets.map(a=>[`<a href="#" onclick="assetDetail(${a.asset_id});return false">${a.asset_no}</a>`,esc(a.name),fmt(a.failures),fmt(a.downtime_hours),fmtMoney(a.maintenance_cost),`${fmt(a.evidence_share)}%`,a.bad_actor?status('Bad Actor'):'-'])):empty(actors.summary?.methodology||'No failure evidence in the window.')}</div></section>
 </div>`;
   $$('.intel-kpi').forEach(c=>c.onclick=()=>kpiDetail(Number(c.dataset.kpi)));
@@ -720,12 +720,12 @@ async function kpiDetail(id){
       <p class="formula">${esc(expl.formula||k.formula||'')}</p>
       <h4>New contributor records vs previous window</h4>
       ${newRows.length?table(['Type','Record','Label','Evidence'],newRows):empty('No new contributing records versus the previous window.')}
-      <h4 style="margin-top:10px">Current source records behind this value</h4>
+      <h4 data-csp-style="mt15">Current source records behind this value</h4>
       ${rows.length?table(['Type','Record','Label','Detail'],rows):empty('No individual source records; metric has no drill-down evidence.')}
       <p class="disclaimer">${esc(expl.disclaimer||'')}</p>
       <div class="action-row">
-        <button class="btn small" onclick="closeModal();go('work')">Open Work Management</button>
-        <button class="btn small" onclick="closeModal();go('operations')">Open Operations</button>
+        <button class="btn small" onclick="go('work')">Open Work Management</button>
+        <button class="btn small" onclick="go('operations')">Open Operations</button>
         <button class="btn small" onclick="recalcOne(${id})">Recalculate</button>
       </div>`;
     $$('#modal-body a[href="#"]').forEach(a=>a.onclick=e=>{e.preventDefault()});

@@ -133,9 +133,14 @@ def _json_safe(value):
 
 @app.exception_handler(RequestValidationError)
 async def sanitized_validation_error_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    is_telemetry_finite = any(
+        error.get('type') == 'finite_number' for error in errors
+    )
+    status_code = 400 if is_telemetry_finite else 422
     return JSONResponse(
-        status_code=422,
-        content={'detail': [_json_safe(error) for error in exc.errors()]},
+        status_code=status_code,
+        content={'detail': [_json_safe(error) for error in errors]},
     )
 
 

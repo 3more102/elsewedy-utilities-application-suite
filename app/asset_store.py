@@ -259,9 +259,11 @@ def export_assets_csv(conn) -> StreamingResponse:
         'criticality', 'condition', 'status', 'site_name', 'location_name',
         'department', 'responsible_person', 'current_value', 'next_maintenance',
     ]
-    w = csv.DictWriter(out, fieldnames=fields, extrasaction='ignore')
-    w.writeheader()
-    w.writerows(data)
+    writer = csv.writer(out)
+    writer.writerow([_application._csv_safe_cell(h) for h in fields])
+    for row_dict in data:
+        safe_row = [_application._csv_safe_cell(row_dict.get(f)) for f in fields]
+        writer.writerow(safe_row)
     return StreamingResponse(
         iter([out.getvalue()]),
         media_type='text/csv',

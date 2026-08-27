@@ -81,4 +81,4 @@ def test_authenticated_document_download_route_remains_reachable_through_boundar
     application_source = (ROOT / 'app' / 'application.py').read_text(encoding='utf-8')
     assert "@app.get('/api/documents/{doc_id}/download')" in application_source
     assert 'user=Depends(current_user)' in application_source
-    assert "return FileResponse(p,filename=d['file_name']" in application_source
+    assert "return FileResponse(p,filename=safe_name" in application_source

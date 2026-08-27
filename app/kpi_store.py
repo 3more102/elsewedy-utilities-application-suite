@@ -294,12 +294,18 @@ def install_kpi_routes() -> None:
     if getattr(app.state, marker, False):
         return
 
+    @app.get('/api/kpis')
+    def kpi_index_route(user=Depends(require_roles('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor', 'executive'))):
+        return {
+            'families': ['reliability', 'inventory', 'maintenance', 'workforce'],
+        }
+
     @app.get('/api/kpis/reliability')
     def reliability_kpis_route(
         site_id: Optional[int] = None,
         period_days: int = Query(365, ge=30, le=3650),
         as_of: Optional[str] = None,
-        user=Depends(current_user),
+        user=Depends(require_roles('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor', 'executive')),
     ):
         with db() as conn:
             return compute_reliability_kpis(conn, site_id, period_days, as_of)
@@ -309,7 +315,7 @@ def install_kpi_routes() -> None:
         site_id: Optional[int] = None,
         period_days: int = Query(365, ge=30, le=3650),
         as_of: Optional[str] = None,
-        user=Depends(current_user),
+        user=Depends(require_roles('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor', 'executive')),
     ):
         with db() as conn:
             result = compute_reliability_kpis(conn, site_id, period_days, as_of)
@@ -1035,7 +1041,7 @@ def install_inventory_kpi_routes(app) -> None:
     @app.get('/api/kpis/workforce')
     def workforce_kpis_route(
         period_days: int = Query(30, ge=7, le=365),
-        user=Depends(current_user),
+        user=Depends(require_roles('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor', 'executive')),
     ):
         with db() as conn:
             return compute_workforce_kpis(conn, period_days)
@@ -1043,7 +1049,7 @@ def install_inventory_kpi_routes(app) -> None:
     @app.get('/api/kpis/workforce.csv')
     def workforce_kpis_csv_route(
         period_days: int = Query(30, ge=7, le=365),
-        user=Depends(current_user),
+        user=Depends(require_roles('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor', 'executive')),
     ):
         with db() as conn:
             result = compute_workforce_kpis(conn, period_days)
@@ -1061,7 +1067,7 @@ def install_inventory_kpi_routes(app) -> None:
     def maintenance_kpis_route(
         period_days: int = Query(90, ge=30, le=3650),
         site_id: Optional[int] = None,
-        user=Depends(current_user),
+        user=Depends(require_roles('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor', 'executive')),
     ):
         with db() as conn:
             return compute_maintenance_kpis(conn, period_days, site_id)
@@ -1070,7 +1076,7 @@ def install_inventory_kpi_routes(app) -> None:
     def maintenance_kpis_csv_route(
         period_days: int = Query(90, ge=30, le=3650),
         site_id: Optional[int] = None,
-        user=Depends(current_user),
+        user=Depends(require_roles('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor', 'executive')),
     ):
         with db() as conn:
             result = compute_maintenance_kpis(conn, period_days, site_id)
@@ -1087,7 +1093,7 @@ def install_inventory_kpi_routes(app) -> None:
     @app.get('/api/kpis/inventory')
     def inventory_kpis_route(
         slow_moving_days: int = Query(90, ge=7, le=730),
-        user=Depends(current_user),
+        user=Depends(require_roles('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor', 'executive')),
     ):
         with db() as conn:
             return compute_inventory_kpis(conn, slow_moving_days)
@@ -1095,7 +1101,7 @@ def install_inventory_kpi_routes(app) -> None:
     @app.get('/api/kpis/inventory.csv')
     def inventory_kpis_csv_route(
         slow_moving_days: int = Query(90, ge=7, le=730),
-        user=Depends(current_user),
+        user=Depends(require_roles('admin', 'asset_manager', 'maintenance_manager', 'planner', 'supervisor', 'executive')),
     ):
         with db() as conn:
             result = compute_inventory_kpis(conn, slow_moving_days)

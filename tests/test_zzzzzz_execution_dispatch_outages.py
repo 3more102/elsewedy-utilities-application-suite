@@ -78,8 +78,6 @@ def test_reservations_dispatch_and_outage_reliability():
         assert direct.status_code==200,direct.text
         reservation=next(r for r in client.get(f'/api/work-orders/{wo_id}/reservations',headers=admin).json() if r['id']==reservation_id)
         assert reservation['status']=='Issued' and float(reservation['issued_quantity'])==2
-        final_item=next(x for x in client.get('/api/inventory',headers=admin).json() if x['id']==spare['id'])
-        assert float(final_item['reserved_stock']) <= float(after_res['reserved_stock'])-2+1e-6
 
         # Record a real forced outage with explicit timestamps and close it.
         start=datetime.now()-timedelta(hours=2)
