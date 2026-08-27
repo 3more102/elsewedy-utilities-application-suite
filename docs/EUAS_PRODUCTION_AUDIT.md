@@ -3,7 +3,7 @@
 Audit date: 2026-08-27
 Repository: `C:\Users\omar\elsewedy-utilities-application-suite`
 Canonical branch: `oxalpha/session-hardening-wave`
-Canonical HEAD: `6fc1aea`
+Canonical HEAD: `cf175d2` (pre-commit baseline; hardening commit pending)
 Application version: 3.9.0
 
 ## Security Headers

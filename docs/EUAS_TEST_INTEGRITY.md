@@ -127,7 +127,6 @@ All critical KPI computation, reliability index, risk/backlog, authorization, an
 
 ## Verification
 
-- **Test suite:** 540 passed, 0 failed, 1 warning
+- **Test suite:** 553 passed, 0 failed, 1 warning
 - **Routes:** 225
 - **Branch:** `oxalpha/session-hardening-wave`
-- **Previous HEAD:** `6fc1aea`

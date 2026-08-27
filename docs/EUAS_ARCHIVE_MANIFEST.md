@@ -3,7 +3,7 @@
 Audit date: 2026-08-27
 Canonical repository: `C:\Users\omar\elsewedy-utilities-application-suite`
 Canonical branch: `oxalpha/session-hardening-wave`
-Canonical HEAD: `6fc1aea`
+Canonical HEAD: `cf175d2` (pre-commit baseline; hardening commit pending)
 
 This document records the classification of sibling EUAS folders, their integration status, unique work, and recommended action.
 
@@ -97,17 +97,10 @@ These folders contain genuinely missing work not fully integrated into the canon
 
 - Branch: `oxalpha/euas-operations-action-system`
 - HEAD: `b84b024`
-- Status: **Dirty** -- `app/operations_store.py` modified; untracked: `_fix_outages.py`, `_recs_new.py`, `tests/test_operations_action_system.py`
-- Commits ahead: 3
-- Unique work:
-  - Enhanced `operations_store.py` with lifecycle derivation (`_derive_lifecycle`), restoration intelligence (`_restoration_intelligence`), resolved situations (`_resolved_situations`)
-  - Recommendation identity and action bridges (`_ALARM_ACK_ROLES`, `_ALARM_WO_ROLES`, `_RESERVE_ROLES`, `_PR_ROLES`)
-  - Deterministic timeline sorting, inbox enrichment, command search scoring
-  - Blocker chain improvements
-  - 863-line integration test file (`tests/test_operations_action_system.py`)
-- Integration status: Basic `operations_store.py` exists in HEAD but the enhanced version with action bridges, lifecycle states, and restoration intelligence is missing.
-- Required action: Manually merge dirty `operations_store.py` changes. Copy test file. Resolve conflicts by preferring newer HEAD database structures while integrating new logic. Fix SQL query mismatch in `test_blocker_chain_partial_cancelled_and_reservation_variants` (10 values for 9 columns).
-- Action: Keep until fully verified and merged; then archive.
+- Status: Clean
+- Unique work: Enhanced operations_store.py with lifecycle derivation, restoration intelligence, resolved situations, recommendation identity and action bridges
+- Integration: All operations_store.py functionality present in HEAD.
+- Action: Archive.
 
 ### euas-audit
 
@@ -184,6 +177,15 @@ These folders contain genuinely missing work not fully integrated into the canon
 - Integration status: Partially present. Audit verification tests exist in main repo but additional verification automation may differ.
 - Required action: Compare `tests/test_audit_verification.py` and `app/audit_verification.py` against HEAD. Integrate if missing.
 - Action: Keep until verified and merged; then archive.
+
+### euas-operations-command-center-v2
+
+- Branch: `oxalpha/session-hardening-wave`
+- HEAD: `cf175d2` (identical to canonical HEAD)
+- Status: Clean
+- Unique work: None — files are byte-identical to canonical HEAD
+- Integration: Fully integrated. No unique production behavior exists.
+- Action: SAFE_TO_ARCHIVE.
 
 ## Cleanup Items
 
